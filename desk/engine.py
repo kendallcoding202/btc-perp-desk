@@ -191,10 +191,12 @@ class Desk:
         d = pos.side.sign
         if (bar.close - pos.best_close) * d > 0:
             pos.best_close = bar.close
-        trail = pos.best_close - d * s.trail_atr * a
+        trail_atr = s.short_stop_atr if (d < 0 and s.short_stop_atr) else s.trail_atr
+        trail = pos.best_close - d * trail_atr * a
         if (trail - pos.stop) * d > 0:
             self.broker.update_stop(trail)
-        if s.exit_on_trend_flip and (ef - es) * d < 0:
+        counter_trend = pos.setup == "failed_breakout"   # opened against the trend on purpose
+        if s.exit_on_trend_flip and not counter_trend and (ef - es) * d < 0:
             self.say(bar.ts + f.bar_ms, "risk", f"trend flipped against the {pos.side.value}. out.")
             return [Order("close", pos.side, pos.qty, "trend_flip")]
         return []

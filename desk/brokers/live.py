@@ -149,7 +149,8 @@ class LiveBroker:
         fill = float(res.get("average") or res.get("price") or price)
         fee = float((res.get("fee") or {}).get("cost") or qty * fill * self.p.costs.taker_fee_bps / 1e4)
         self.fees_total += fee
-        self.position = Position(o.side, qty, fill, ts, stop=o.stop or 0.0, best_close=fill, fees_paid=fee)
+        self.position = Position(o.side, qty, fill, ts, stop=o.stop or 0.0, best_close=fill, fees_paid=fee,
+                                 setup=o.reason)
         self.orders_filled += 1
         self.last_fill = {"action": "open", "side": o.side.value, "qty": qty, "price": fill, "fee": fee, "ts": ts,
                           "reason": o.reason}
@@ -233,7 +234,7 @@ class LiveBroker:
             "position": None if pos is None else {
                 "side": pos.side.value, "qty": pos.qty, "entry_price": pos.entry_price, "entry_ts": pos.entry_ts,
                 "stop": pos.stop, "best_close": pos.best_close, "fees_paid": pos.fees_paid,
-                "funding_paid": pos.funding_paid},
+                "funding_paid": pos.funding_paid, "setup": pos.setup},
             "trades": [t.as_dict() for t in self.trades[-500:]],
         }))
 
@@ -245,7 +246,8 @@ class LiveBroker:
         pd = d.get("position")
         if pd:
             self.position = Position(Side(pd["side"]), pd["qty"], pd["entry_price"], pd["entry_ts"], pd["stop"],
-                                     pd["best_close"], pd.get("fees_paid", 0.0), pd.get("funding_paid", 0.0))
+                                     pd["best_close"], pd.get("fees_paid", 0.0), pd.get("funding_paid", 0.0),
+                                     setup=pd.get("setup", ""))
         self.trades = [Trade(Side(t["side"]), t["qty"], t["entry_ts"], t["entry_price"], t["exit_ts"],
                              t["exit_price"], t["reason"], t["gross_pnl"], t["fees"], t["funding"])
                        for t in d.get("trades", [])]

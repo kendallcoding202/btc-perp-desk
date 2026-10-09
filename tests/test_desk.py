@@ -182,6 +182,36 @@ def test_summary_and_promotion_are_well_formed(tmp_path):
     assert len(bt.promotion_check(s, P)) == 5
 
 
+def _trap_series():
+    """Flat range around 100, a breakout to 106, then a fall back through the old high."""
+    t0 = 1_600_000_000_000 - 1_600_000_000_000 % H4
+    closes = [100 + (k % 5) * 0.2 for k in range(300)] + [106, 105, 100.5, 99.0, 98.0]
+    bars = [Bar(t0 + k * H4, c, c + 0.3, c - 0.3, c) for k, c in enumerate(closes)]
+    return bars
+
+
+def test_bull_trap_short_fires_once_on_the_failure_bar():
+    from desk.filter import _short_setup
+
+    p = P.with_(strategy={"allow_shorts": True, "short_mode": "failed_breakout", "trap_window_bars": 6})
+    bars = _trap_series()
+    f = ind.compute(bars, [], p)
+    fired = [i for i in range(301, len(bars)) if _short_setup(p.strategy, f, i, Side.LONG)[0] == "failed_breakout"]
+    assert fired == [len(bars) - 3]          # the first close back below the broken high, and only that one
+
+
+def test_counter_trend_short_is_not_closed_by_the_trend_flip_exit():
+    p = P.with_(strategy={"allow_shorts": True, "short_mode": "failed_breakout"})
+    bars = _trap_series()
+    f = ind.compute(bars, [], p)
+    b = SimBroker(p)
+    desk = Desk(p, b)
+    b.submit(Order("open", Side.SHORT, 1.0, "failed_breakout", stop=200.0))
+    b.fill_pending(bars[-2].open, bars[-2].ts)
+    assert f.ema_fast[-1] > f.ema_slow[-1]   # still an uptrend: a with-trend short would be flipped out here
+    assert desk._manage(f, len(bars) - 1) == []
+
+
 # ---------------------------------------------------------------- paper ledger
 
 class FakeFeed:

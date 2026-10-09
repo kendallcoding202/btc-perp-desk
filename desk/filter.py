@@ -74,6 +74,65 @@ def _soft(name, value, thr, op, owner, margin, note="") -> GateResult:
     return GateResult(name, v, value, thr, op, owner, note)
 
 
+def _trend_setup(s, f: ind.Features, i: int, direction: Side) -> tuple[str | None, GateResult]:
+    """With-trend entries: a breakout of the N-bar extreme, and/or a pullback through the fast EMA."""
+    close, a, ef, es = f.bars[i].close, f.atr[i], f.ema_fast[i], f.ema_slow[i]
+    d = direction.sign
+    level = f.don_hi[i] if d > 0 else f.don_lo[i]
+    broke = (close > level) if d > 0 else (close < level)
+    dip_level = ef - d * s.pullback_atr * a
+    dipped = ((close < dip_level) if d > 0 else (close > dip_level)) and \
+        (not s.pullback_hold_slow or (close - es) * d > 0)
+    modes = {"breakout": ("breakout",), "pullback": ("pullback",), "both": ("breakout", "pullback")}[s.entry_mode]
+    hit = [m for m in modes if (broke if m == "breakout" else dipped)]
+    hi_lo = "high" if d > 0 else "low"
+    if hit and hit[0] == "breakout":
+        return "breakout", GateResult("setup", Verdict.PASS, close, level, "min" if d > 0 else "max", "scan",
+                                      f"breakout: {s.breakout_bars}-bar {hi_lo} taken out")
+    if hit:
+        return "pullback", GateResult("setup", Verdict.PASS, close, dip_level, "max" if d > 0 else "min", "scan",
+                                      f"pullback: {s.pullback_atr:g} ATR through the {s.ema_fast}-EMA, trend intact")
+    want = []
+    if "breakout" in modes:
+        want.append(f"a close {'above' if d > 0 else 'below'} the {s.breakout_bars}-bar {hi_lo} ${level:,.0f}")
+    if "pullback" in modes:
+        want.append(f"a dip to ${dip_level:,.0f}")
+    thr = level if "breakout" in modes else dip_level
+    op = ("min" if d > 0 else "max") if "breakout" in modes else ("max" if d > 0 else "min")
+    return None, GateResult("setup", Verdict.WAIT, close, thr, op, "scan", "waiting for " + " or ".join(want))
+
+
+def _short_setup(s, f: ind.Features, i: int, trend: Side) -> tuple[str | None, GateResult]:
+    """Counter-move shorts. Both fire only on the bar the failure happens, never again while price stays down."""
+    bars, a = f.bars, f.atr[i]
+    close, prev = bars[i].close, bars[i - 1].close
+    modes = {"failed_rally": ("failed_rally",), "failed_breakout": ("failed_breakout",),
+             "both_failed": ("failed_breakout", "failed_rally")}[s.short_mode]
+    if "failed_breakout" in modes:
+        # a close above the prior N-bar high in the last few bars, and now the first close back below that level
+        for j in range(i - 1, max(0, i - s.trap_window_bars) - 1, -1):
+            lvl = f.don_hi[j]
+            if lvl is not None and bars[j].close > lvl:
+                line = lvl - s.trap_atr * a
+                if close < line <= prev:
+                    return "failed_breakout", GateResult(
+                        "setup", Verdict.PASS, close, line, "max", "scan",
+                        f"bull trap: broke the {s.breakout_bars}-bar high {i - j} bars ago, now back below ${lvl:,.0f}")
+                break
+    if "failed_rally" in modes and trend is Side.SHORT:
+        lo = max(1, i - s.rally_window_bars)
+        touched = any(f.ema_fast[j] is not None and bars[j].high >= f.ema_fast[j] for j in range(lo, i + 1))
+        line = f.ema_fast[i] - s.rally_reject_atr * a
+        prev_line = (f.ema_fast[i - 1] or 0) - s.rally_reject_atr * (f.atr[i - 1] or 0)
+        if touched and close < line and prev >= prev_line:
+            return "failed_rally", GateResult("setup", Verdict.PASS, close, line, "max", "scan",
+                                              f"failed rally: bounce rejected at the {s.ema_fast}-EMA")
+    note = "waiting for " + " or ".join(
+        {"failed_breakout": f"a {s.breakout_bars}-bar breakout to fail", "failed_rally": "a downtrend bounce to fail"}[m]
+        for m in modes)
+    return None, GateResult("setup", Verdict.WAIT, close, None, "", "scan", note)
+
+
 def evaluate_entry(p: Params, f: ind.Features, i: int, *, equity: float, kills: list[GateResult],
                    ctx: MarketContext | None = None, now_ms: int | None = None, jev=None,
                    jev_enabled: bool = True) -> EntryDecision:
@@ -97,7 +156,6 @@ def evaluate_entry(p: Params, f: ind.Features, i: int, *, equity: float, kills: 
     if not ready:
         return EntryDecision(None, direction, gates)
 
-    d = direction.sign
     atr_pct = a / close * 100
 
     # 3. HARD
@@ -107,35 +165,20 @@ def evaluate_entry(p: Params, f: ind.Features, i: int, *, equity: float, kills: 
     gates.append(_hard("spread_bps", ctx.spread_bps if ctx else None, h.max_spread_bps, "max", "fills"))
     gates.append(_hard("depth_usd", ctx.depth_usd if ctx else None, h.min_depth_usd, "min", "fills"))
 
-    # 4. SCAN — the setup: a breakout, a pullback inside the trend, or either (strategy.entry_mode)
-    level = f.don_hi[i] if d > 0 else f.don_lo[i]
-    broke = (close > level) if d > 0 else (close < level)
-    dip_level = ef - d * s.pullback_atr * a
-    dipped = ((close < dip_level) if d > 0 else (close > dip_level)) and \
-        (not s.pullback_hold_slow or (close - es) * d > 0)
-    modes = {"breakout": ("breakout",), "pullback": ("pullback",), "both": ("breakout", "pullback")}[s.entry_mode]
-    hit = [m for m in modes if (broke if m == "breakout" else dipped)]
-    hi_lo = "high" if d > 0 else "low"
-    setup = None
-    if direction is Side.SHORT and not s.allow_shorts:
-        gates.append(GateResult("setup", Verdict.WAIT, close, level, "", "scan", "shorts disabled"))
-    elif hit:
-        setup = hit[0]
-        if setup == "breakout":
-            gates.append(GateResult("setup", Verdict.PASS, close, level, "min" if d > 0 else "max", "scan",
-                                    f"breakout: {s.breakout_bars}-bar {hi_lo} taken out"))
-        else:
-            gates.append(GateResult("setup", Verdict.PASS, close, dip_level, "max" if d > 0 else "min", "scan",
-                                    f"pullback: {s.pullback_atr:g} ATR through the {s.ema_fast}-EMA, trend intact"))
-    else:
-        want = []
-        if "breakout" in modes:
-            want.append(f"a close {'above' if d > 0 else 'below'} the {s.breakout_bars}-bar {hi_lo} ${level:,.0f}")
-        if "pullback" in modes:
-            want.append(f"a dip to ${dip_level:,.0f}")
-        thr = level if "breakout" in modes else dip_level
-        op = ("min" if d > 0 else "max") if "breakout" in modes else ("max" if d > 0 else "min")
-        gates.append(GateResult("setup", Verdict.WAIT, close, thr, op, "scan", "waiting for " + " or ".join(want)))
+    # 4. SCAN — with-trend setups (strategy.entry_mode), then the optional counter-trend shorts
+    setup, scan_gate = None, None
+    if direction is Side.LONG or (s.allow_shorts and s.short_mode == "breakdown"):
+        setup, scan_gate = _trend_setup(s, f, i, direction)
+    elif not s.allow_shorts:
+        scan_gate = GateResult("setup", Verdict.WAIT, close, f.don_lo[i], "", "scan", "shorts disabled")
+    if setup is None and s.allow_shorts and s.short_mode != "breakdown":
+        short_setup, short_gate = _short_setup(s, f, i, direction)
+        if short_setup is not None:
+            setup, scan_gate, direction = short_setup, short_gate, Side.SHORT
+        elif scan_gate is None:
+            scan_gate = short_gate
+    gates.append(scan_gate)
+    d = direction.sign
 
     # 5. SOFT
     scores = {
@@ -150,7 +193,8 @@ def evaluate_entry(p: Params, f: ind.Features, i: int, *, equity: float, kills: 
     gates.append(_soft("crowding", scores["crowding"], so.max_crowding, "max", "crowd", so.mark_margin))
 
     # 6. SIZE
-    stop = close - d * s.stop_atr * a
+    stop_atr = s.short_stop_atr if (d < 0 and s.short_stop_atr) else s.stop_atr
+    stop = close - d * stop_atr * a
     risk_per_unit = abs(close - stop)
     qty = equity * z.risk_per_trade / risk_per_unit if risk_per_unit > 0 else 0.0
     qty = min(qty, equity * z.max_leverage / close) if equity > 0 else 0.0

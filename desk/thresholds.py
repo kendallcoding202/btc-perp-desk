@@ -30,6 +30,14 @@ class Strategy:
     ema_slow: int = 400                 # (~33 days)
     atr_bars: int = 28                  # volatility yardstick for stops and sizing (~2.3 days)
     allow_shorts: bool = False          # shorts added nothing 2020-23 and doubled drawdown (see reports/)
+    short_mode: str = "breakdown"       # with allow_shorts: "breakdown" (mirror of the long breakout),
+                                        # "failed_rally" (downtrend bounce rejected at the fast EMA),
+                                        # "failed_breakout" (bull trap: new high, then back below it), "both_failed"
+    trap_window_bars: int = 6           # failed_breakout: the breakout happened within the last 6 bars (12h)...
+    trap_atr: float = 0.0               # ...and price just closed this many ATRs back below the breakout level
+    rally_window_bars: int = 6          # failed_rally: a high touched the fast EMA within the last 6 bars...
+    rally_reject_atr: float = 0.5       # ...and price just closed this many ATRs back below it
+    short_stop_atr: float | None = None  # shorts' stop/trail width in ATRs (None = same as stop_atr/trail_atr)
     entry_mode: str = "breakout"        # "breakout" | "pullback" (buy dips in the trend) | "both"
     pullback_atr: float = 1.0           # pullback = close at least this many ATRs on the wrong side of the fast EMA...
     pullback_hold_slow: bool = True     # ...while still on the right side of the slow EMA (trend intact)

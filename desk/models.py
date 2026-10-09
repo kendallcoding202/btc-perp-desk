@@ -82,6 +82,7 @@ class Position:
     fees_paid: float = 0.0
     funding_paid: float = 0.0
     take_profit: float | None = None
+    setup: str = ""            # which SCAN setup opened it ("breakout", "failed_breakout", ...)
 
     def notional(self, price: float) -> float:
         return self.qty * price

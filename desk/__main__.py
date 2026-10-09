@@ -80,9 +80,10 @@ def cmd_backtest(args) -> int:
     if args.research:
         from . import research
 
-        print("  research: sensitivity, ablation, trade sooner, take profit, sizing, costs" + (", jev" if _jev(p) else ""))
+        print("  research: sensitivity, ablation, trade sooner, shorts, take profit, sizing, costs" + (", jev" if _jev(p) else ""))
         parts = [research.sensitivity(bars, funding, p), research.ablation(bars, funding, p),
-                 research.trade_sooner(bars, funding, p), research.take_profit(bars, funding, p),
+                 research.trade_sooner(bars, funding, p), research.shorts(bars, funding, p),
+                 research.take_profit(bars, funding, p),
                  research.sizing(bars, funding, p),
                  research.costs(bars, funding, p)]
         client = _jev(p.with_(jev={"mode": "advisory"}))

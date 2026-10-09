@@ -1,6 +1,6 @@
 # Backtest — BTC perp, 2h bars
 
-2020-01-01 → 2026-10-01 (6.7 years). Generated 2026-10-09T23:15:13+00:00.
+2020-01-01 → 2026-10-01 (6.7 years). Generated 2026-10-09T23:20:20+00:00.
 Costs charged: taker fee 4.5 bps + slippage 3.0 bps per side, plus real funding prints. Start equity $50, risk 5.0%/trade, max 5x.
 
 | | Desk | Buy & hold BTC |
@@ -66,21 +66,34 @@ Full-period total return / max drawdown / profit factor.
 | + extension only | +41.1% | 1.51 | +110.9% | 2.38 | 27 | no |
 | + crowding only  ← default | +689.6% | 2.97 | +99.5% | 1.45 | 56 | no |
 
-## Trade sooner? — pullback entries and shorts
+## Trade sooner? — pullback entries
 
 Breakouts can mean days without a trade. These variants trade more often; chosen on in-sample only.
 
 | entries | trades/yr | in-sample return | out-of-sample return | max drawdown | hit drawdown halt |
 |---|---|---|---|---|---|
 | breakouts only ← default | 17 | +690% | +99% | 28% | no |
-| breakouts, longs + shorts | 31 | +698% | +59% | 40% | yes, 2026-04-18 |
 | pullbacks only, 0.5 ATR dip | 16 | -26% | +0% | 41% | yes, 2023-10-11 |
 | pullbacks only, 1 ATR dip | 24 | +36% | +13% | 41% | yes, 2026-01-19 |
 | pullbacks only, 2 ATR dip | 7 | -22% | +0% | 40% | yes, 2023-10-11 |
 | breakouts + 0.5 ATR pullbacks | 30 | +465% | +10% | 40% | yes, 2024-10-09 |
 | breakouts + 1 ATR pullbacks | 27 | +652% | +14% | 40% | yes, 2024-10-14 |
 | breakouts + 2 ATR pullbacks | 20 | +461% | +17% | 40% | yes, 2024-10-07 |
-| breakouts + 1 ATR pullbacks + shorts | 8 | +4% | +0% | 40% | yes, 2020-10-19 |
+
+## Shorts — three designs
+
+Each design is added to the longs. 'Short PF' = what the short trades won ÷ what they lost (above 1.00 = the shorts made money).
+
+| shorts | total return | max drawdown | hit drawdown halt | short trades | short PF in / out of sample |
+|---|---|---|---|---|---|
+| no shorts ← default | +1475% | 28% | no | 0 | — / — |
+| breakdown (mirror of the long breakout) | +1172% | 40% | yes, 2026-04-18 | 101 | 1.02 / 0.77 |
+| failed rally, 0 ATR rejection | +126% | 40% | yes, 2023-01-11 | 79 | 1.04 / — |
+| failed rally, 0.5 ATR rejection | +56% | 40% | yes, 2022-12-12 | 86 | 0.83 / — |
+| bull trap, 12h window | +1047% | 40% | yes, 2025-01-20 | 95 | 0.94 / 1.00 |
+| bull trap, 0.5 ATR, 12h window | +1220% | 40% | yes, 2026-07-06 | 98 | 0.85 / 0.91 |
+| bull trap, 24h window | +989% | 40% | yes, 2024-10-18 | 112 | 1.04 / 0.86 |
+| both failed setups | +73% | 41% | yes, 2022-11-24 | 126 | 0.95 / — |
 
 ## Take profit — sell when it's up, or let the trailing stop do it?
 

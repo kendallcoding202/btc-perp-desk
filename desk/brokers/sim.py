@@ -61,7 +61,7 @@ class SimBroker:
         self.cash -= fee
         self.fees_total += fee
         self.position = Position(o.side, o.qty, fill, ts, stop=o.stop or 0.0, best_close=fill, fees_paid=fee,
-                                 take_profit=o.meta.get("take_profit"))
+                                 take_profit=o.meta.get("take_profit"), setup=o.reason)
         self.orders_filled += 1
         self.last_fill = {"action": "open", "side": o.side.value, "qty": o.qty, "price": fill, "fee": fee,
                           "ts": ts, "reason": o.reason}
@@ -138,7 +138,7 @@ class SimBroker:
             "position": None if pos is None else {
                 "side": pos.side.value, "qty": pos.qty, "entry_price": pos.entry_price, "entry_ts": pos.entry_ts,
                 "stop": pos.stop, "best_close": pos.best_close, "fees_paid": pos.fees_paid,
-                "funding_paid": pos.funding_paid, "take_profit": pos.take_profit,
+                "funding_paid": pos.funding_paid, "take_profit": pos.take_profit, "setup": pos.setup,
             },
             "trades": [t.as_dict() for t in self.trades],
             "pending": [{"action": o.action, "side": o.side.value, "qty": o.qty, "reason": o.reason, "stop": o.stop}
@@ -155,7 +155,7 @@ class SimBroker:
         pd = d.get("position")
         self.position = None if pd is None else Position(
             Side(pd["side"]), pd["qty"], pd["entry_price"], pd["entry_ts"], pd["stop"], pd["best_close"],
-            pd.get("fees_paid", 0.0), pd.get("funding_paid", 0.0), pd.get("take_profit"))
+            pd.get("fees_paid", 0.0), pd.get("funding_paid", 0.0), pd.get("take_profit"), pd.get("setup", ""))
         self.trades = [Trade(Side(t["side"]), t["qty"], t["entry_ts"], t["entry_price"], t["exit_ts"],
                              t["exit_price"], t["reason"], t["gross_pnl"], t["fees"], t["funding"])
                        for t in d.get("trades", [])]

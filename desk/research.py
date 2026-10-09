@@ -97,15 +97,12 @@ def sizing(bars, funding, p: Params) -> str:
 
 def trade_sooner(bars, funding, p: Params) -> str:
     """'Can it trade more often?' — tested: pullback (buy-the-dip) entries, alone and alongside breakouts."""
-    variants = [("breakouts only ← default", {"entry_mode": "breakout"}),
-                ("breakouts, longs + shorts", {"entry_mode": "breakout", "allow_shorts": True})]
+    variants = [("breakouts only ← default", {"entry_mode": "breakout"})]
     for k in (0.5, 1.0, 2.0):
         variants.append((f"pullbacks only, {k:g} ATR dip", {"entry_mode": "pullback", "pullback_atr": k}))
     for k in (0.5, 1.0, 2.0):
         variants.append((f"breakouts + {k:g} ATR pullbacks", {"entry_mode": "both", "pullback_atr": k}))
-    variants.append(("breakouts + 1 ATR pullbacks + shorts", {"entry_mode": "both", "pullback_atr": 1.0,
-                                                             "allow_shorts": True}))
-    lines = ["## Trade sooner? — pullback entries and shorts", "",
+    lines = ["## Trade sooner? — pullback entries", "",
              "Breakouts can mean days without a trade. These variants trade more often; chosen on in-sample only.", "",
              "| entries | trades/yr | in-sample return | out-of-sample return | max drawdown | hit drawdown halt |",
              "|---|---|---|---|---|---|"]
@@ -114,6 +111,41 @@ def trade_sooner(bars, funding, p: Params) -> str:
         full, a, b = _row(r)
         lines.append(f"| {name} | {full['trades'] / full['years']:.0f} | {a['return']:+.0%} | {b['return']:+.0%} | "
                      f"{full['max_drawdown']:.0%} | {'yes, ' + _halt_date(r) if full['halted'] else 'no'} |")
+    return "\n".join(lines)
+
+
+def shorts(bars, funding, p: Params) -> str:
+    """Three short designs added to the longs. Profit factor of the short trades alone, in and out of sample."""
+    split = _split_ms()
+    variants = [
+        ("no shorts ← default", {}),
+        ("breakdown (mirror of the long breakout)", {"allow_shorts": True, "short_mode": "breakdown"}),
+        ("failed rally, 0 ATR rejection", {"allow_shorts": True, "short_mode": "failed_rally", "rally_reject_atr": 0.0}),
+        ("failed rally, 0.5 ATR rejection", {"allow_shorts": True, "short_mode": "failed_rally", "rally_reject_atr": 0.5}),
+        ("bull trap, 12h window", {"allow_shorts": True, "short_mode": "failed_breakout", "trap_window_bars": 6}),
+        ("bull trap, 0.5 ATR, 12h window", {"allow_shorts": True, "short_mode": "failed_breakout",
+                                            "trap_atr": 0.5, "trap_window_bars": 6}),
+        ("bull trap, 24h window", {"allow_shorts": True, "short_mode": "failed_breakout", "trap_window_bars": 12}),
+        ("both failed setups", {"allow_shorts": True, "short_mode": "both_failed"}),
+    ]
+
+    def pf(ts):
+        won = sum(t.net_pnl for t in ts if t.net_pnl > 0)
+        lost = -sum(t.net_pnl for t in ts if t.net_pnl <= 0)
+        return f"{won / lost:.2f}" if lost > 0 else "—"
+
+    lines = ["## Shorts — three designs", "",
+             "Each design is added to the longs. 'Short PF' = what the short trades won ÷ what they lost "
+             "(above 1.00 = the shorts made money).", "",
+             "| shorts | total return | max drawdown | hit drawdown halt | short trades | short PF in / out of sample |",
+             "|---|---|---|---|---|---|"]
+    for name, ov in variants:
+        r = bt.run(bars, funding, p.with_(strategy=ov) if ov else p)
+        full = bt.summarize(r)["full"]
+        sh = [t for t in r.broker.trades if t.side.value == "short"]
+        ins, oos = [t for t in sh if t.entry_ts < split], [t for t in sh if t.entry_ts >= split]
+        lines.append(f"| {name} | {full['return']:+.0%} | {full['max_drawdown']:.0%} | "
+                     f"{'yes, ' + _halt_date(r) if full['halted'] else 'no'} | {len(sh)} | {pf(ins)} / {pf(oos)} |")
     return "\n".join(lines)
 
 

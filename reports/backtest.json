@@ -1,5 +1,5 @@
 {
- "generated": "2026-10-09T23:15:13+00:00",
+ "generated": "2026-10-09T23:20:20+00:00",
  "interval": "2h",
  "params": {
   "market": {
@@ -13,6 +13,12 @@
    "ema_slow": 400,
    "atr_bars": 28,
    "allow_shorts": false,
+   "short_mode": "breakdown",
+   "trap_window_bars": 6,
+   "trap_atr": 0.0,
+   "rally_window_bars": 6,
+   "rally_reject_atr": 0.5,
+   "short_stop_atr": null,
    "entry_mode": "breakout",
    "pullback_atr": 1.0,
    "pullback_hold_slow": true,
