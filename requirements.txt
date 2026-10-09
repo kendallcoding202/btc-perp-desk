@@ -1,0 +1,4 @@
+# The desk itself (backtest, paper, dashboard) uses only the Python standard library (3.10+).
+# Live trading needs ccxt; the tests need pytest.
+ccxt>=4.5
+pytest>=8

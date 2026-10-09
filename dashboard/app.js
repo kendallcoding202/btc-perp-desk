@@ -1,0 +1,425 @@
+// BTC Perp Desk board. Polls /api/state and draws it. No build step, no libraries.
+(() => {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  const COLORS = {
+    chief: "--white", scan: "--green", vet: "--red", crowd: "--blue",
+    size: "--pink", fills: "--white", risk: "--orange", crawler: "--pink",
+  };
+
+  // ---- pixel sprites (X = body, k = eye) --------------------------------
+  const SPRITES = {
+    chief: ["...XXXXXX...", ".XXXXXXXXXX.", "XXXXXXXXXXXX", "XXkkXXXXkkXX", "XXkkXXXXkkXX", "XXXXXXXXXXXX",
+            "XXXXXXXXXXXX", "XXXXXXXXXXXX", "XXXXXXXXXXXX", "XXXXXXXXXXXX", "XX.XXX.XXX.X", "X...X...X..."],
+    scan:  ["............", "....XXXX....", "..XXXXXXXX..", ".XXXXXXXXXX.", ".XkkXXXXkkX.", "XXkkXXXXkkXX",
+            "XXXXXXXXXXXX", "XXXXXXXXXXXX", "XXXXXXXXXXXX", ".XXXXXXXXXX.", "..XX.XX.XX..", "............"],
+    vet:   ["............", "..X......X..", "...X....X...", "..XXXXXXXX..", ".XXkXXXXkXX.", "XXXXXXXXXXXX",
+            "X.XXXXXXXX.X", "X.X......X.X", "...XX..XX...", "............", "............", "............"],
+    crowd: ["............", "...XXXXXX...", ".XXXXXXXXXX.", ".XXXXXXXXXX.", "XXXkkXXkkXXX", "XXXkkXXkkXXX",
+            "XXXXXXXXXXXX", "XXXXXXXXXXXX", ".XXXXXXXXXX.", "..XXXXXXXX..", "............", "............"],
+    size:  [".....XX.....", ".....XX.....", "....XXXX....", "....XXXX....", "...XXXXXX...", "...XkXXkX...",
+            "..XXXXXXXX..", "..XXXXXXXX..", ".XXXXXXXXXX.", ".XXXXXXXXXX.", "XXXXXXXXXXXX", "X.X.X..X.X.X"],
+    fills: ["............", "..X......X..", "...X....X...", "..XXXXXXXX..", ".XX.XXXX.XX.", "XXXXXXXXXXXX",
+            "X.XXXXXXXX.X", "X.X......X.X", "...XX..XX...", "............", "............", "............"],
+    risk:  ["............", "....XXXX....", "..XXXXXXXX..", ".XXXXXXXXXX.", ".XXkXXXXkXX.", "XXXkXXXXkXXX",
+            "XXXXXXXXXXXX", "XXXXXXXXXXXX", ".XXXXXXXXXX.", "..XXXXXXXX..", "....XXXX....", "............"],
+    crawler: ["X..........X", ".X........X.", "..X.XXXX.X..", "...XXXXXX...", "XXXXkXXkXXXX", "...XXXXXX...",
+              "..XXXXXXXX..", ".X.XXXXXX.X.", "X...XXXX...X", "...X....X...", "..X......X..", "............"],
+  };
+
+  function sprite(key, px = 3) {
+    const map = SPRITES[key];
+    const c = document.createElement("canvas");
+    c.width = map[0].length * px; c.height = map.length * px;
+    c.className = "sprite";
+    const g = c.getContext("2d");
+    const body = css(COLORS[key]);
+    map.forEach((row, y) => [...row].forEach((ch, x) => {
+      if (ch === ".") return;
+      g.fillStyle = ch === "k" ? "#0d0f1f" : body;
+      g.fillRect(x * px, y * px, px, px);
+    }));
+    return c;
+  }
+
+  // ---- formatting ---------------------------------------------------------
+  const usd = (x, dp = 2) => x == null || isNaN(x) ? "—" : (x < 0 ? "-$" : "$") + Math.abs(x).toLocaleString("en-US", { minimumFractionDigits: dp, maximumFractionDigits: dp });
+  const usdShort = (x) => x == null ? "—" : Math.abs(x) >= 1e9 ? `$${(x / 1e9).toFixed(2)}B` : Math.abs(x) >= 1e6 ? `$${(x / 1e6).toFixed(2)}M` : Math.abs(x) >= 1e3 ? `$${(x / 1e3).toFixed(1)}K` : usd(x, 2);
+  const pct = (x, dp = 2) => x == null || isNaN(x) ? "—" : `${x >= 0 ? "+" : ""}${(x * 100).toFixed(dp)}%`;
+  const num = (x, dp = 2) => x == null || isNaN(x) ? "—" : Number(x).toLocaleString("en-US", { minimumFractionDigits: dp, maximumFractionDigits: dp });
+  const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const hhmm = (ms) => new Date(ms).toISOString().slice(11, 16);
+
+  // ---- canvas helpers -------------------------------------------------------
+  function fit(canvas) {
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+      canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
+    }
+    const g = canvas.getContext("2d");
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, w, h);
+    return { g, w, h };
+  }
+
+  function line(g, pts, color, width = 1.5, dash = []) {
+    g.save(); g.strokeStyle = color; g.lineWidth = width; g.setLineDash(dash); g.beginPath();
+    let started = false;
+    for (const [x, y] of pts) {
+      if (y == null || isNaN(y)) { started = false; continue; }
+      if (!started) { g.moveTo(x, y); started = true; } else g.lineTo(x, y);
+    }
+    g.stroke(); g.restore();
+  }
+
+  // ---- price chart ------------------------------------------------------------
+  let lastGeom = null;
+  function drawChart(chart) {
+    const canvas = $("chart");
+    const { g, w, h } = fit(canvas);
+    const cs = chart.candles;
+    if (!cs.length) return;
+    const padR = 64, padT = 8, padB = 18;
+    const vals = [];
+    cs.forEach((c) => vals.push(c[2], c[3]));
+    [chart.ema_fast, chart.ema_slow, chart.don_hi].forEach((s) => s.forEach((v) => v != null && vals.push(v)));
+    if (chart.stop) vals.push(chart.stop);
+    let lo = Math.min(...vals), hi = Math.max(...vals);
+    const pad = (hi - lo) * 0.06; lo -= pad; hi += pad;
+    const cw = (w - padR) / cs.length;
+    const X = (k) => k * cw + cw / 2;
+    const Y = (p) => padT + (hi - p) / (hi - lo) * (h - padT - padB);
+    const tsIndex = new Map(cs.map((c, k) => [c[0], k]));
+
+    g.font = "10px JetBrains Mono, monospace";
+    for (let k = 0; k <= 4; k++) {
+      const p = lo + (hi - lo) * k / 4, y = Y(p);
+      line(g, [[0, y], [w - padR, y]], css("--line"), 1);
+      g.fillStyle = css("--dim"); g.fillText(Math.round(p).toLocaleString("en-US"), w - padR + 6, y + 3);
+    }
+    const step = Math.max(1, Math.round(cs.length / 6));
+    g.fillStyle = css("--dim");
+    for (let k = 0; k < cs.length; k += step) {
+      const d = new Date(cs[k][0]);
+      g.fillText(`${d.toISOString().slice(5, 10)}`, X(k) - 14, h - 4);
+    }
+
+    line(g, chart.don_hi.map((v, k) => [X(k), v == null ? null : Y(v)]), "rgba(138,143,176,.55)", 1, [3, 4]);
+    line(g, chart.don_lo.map((v, k) => [X(k), v == null ? null : Y(v)]), "rgba(138,143,176,.3)", 1, [3, 4]);
+    line(g, chart.ema_slow.map((v, k) => [X(k), v == null ? null : Y(v)]), css("--blue"), 1.4);
+    line(g, chart.ema_fast.map((v, k) => [X(k), v == null ? null : Y(v)]), css("--pink"), 1.4);
+
+    const bw = Math.max(1, cw * 0.62);
+    cs.forEach(([, o, hgh, l, c], k) => {
+      const up = c >= o, col = up ? css("--green") : css("--red");
+      g.strokeStyle = col; g.beginPath(); g.moveTo(X(k), Y(hgh)); g.lineTo(X(k), Y(l)); g.stroke();
+      g.fillStyle = col;
+      const y1 = Y(Math.max(o, c)), y2 = Y(Math.min(o, c));
+      g.fillRect(X(k) - bw / 2, y1, bw, Math.max(1, y2 - y1));
+    });
+
+    if (chart.stop) {
+      line(g, [[0, Y(chart.stop)], [w - padR, Y(chart.stop)]], css("--orange"), 1.2, [6, 4]);
+      tag(g, w - padR, Y(chart.stop), `STOP ${Math.round(chart.stop).toLocaleString("en-US")}`, css("--orange"));
+    }
+    if (chart.entry) line(g, [[0, Y(chart.entry)], [w - padR, Y(chart.entry)]], "rgba(241,241,246,.6)", 1, [2, 3]);
+
+    for (const m of chart.markers) {
+      const k = nearest(tsIndex, m.ts, chart.bar_ms, cs);
+      if (k == null) continue;
+      const x = X(k), y = Y(m.price);
+      if (m.kind === "entry") {
+        g.fillStyle = css("--green"); g.beginPath(); g.moveTo(x, y + 4); g.lineTo(x - 5, y + 12); g.lineTo(x + 5, y + 12); g.fill();
+      } else {
+        g.fillStyle = m.pnl >= 0 ? css("--green") : css("--red");
+        g.beginPath(); g.arc(x, y, 4, 0, Math.PI * 2); g.fill();
+        g.strokeStyle = "#0d0f1f"; g.stroke();
+      }
+    }
+    const last = cs[cs.length - 1][4];
+    tag(g, w - padR, Y(last), Math.round(last).toLocaleString("en-US"), css("--green"), true);
+    lastGeom = { X, Y, cs, w, h, padR };
+  }
+
+  function nearest(index, ts, barMs, cs) {
+    const open = ts - (ts - cs[0][0]) % barMs;
+    if (index.has(open)) return index.get(open);
+    if (ts < cs[0][0]) return null;
+    return Math.min(cs.length - 1, Math.floor((ts - cs[0][0]) / barMs));
+  }
+
+  function tag(g, x, y, text, color, filled = false) {
+    g.save(); g.font = "bold 10px JetBrains Mono, monospace";
+    const tw = g.measureText(text).width + 8;
+    g.fillStyle = filled ? color : "#0d0f1f"; g.strokeStyle = color;
+    g.fillRect(x + 2, y - 8, tw, 16); g.strokeRect(x + 2, y - 8, tw, 16);
+    g.fillStyle = filled ? "#0d0f1f" : color; g.fillText(text, x + 6, y + 4); g.restore();
+  }
+
+  // ---- the crawler's web: legs reaching out to the last candles' highs ------------
+  function drawWeb() {
+    const canvas = $("web");
+    const { g, w, h } = fit(canvas);
+    if (!lastGeom || window.innerWidth < 980) return;
+    const { X, Y, cs } = lastGeom;
+    const chartTop = $("chart").offsetTop;
+    const cx = w * 0.56, cy = h * 0.78;
+    const pink = css("--pink");
+    const picks = [];
+    for (let k = cs.length - 1; k >= 0 && picks.length < 9; k -= Math.max(1, Math.floor(cs.length / 18))) picks.push(k);
+    g.save();
+    g.strokeStyle = "rgba(255,95,210,.75)"; g.lineWidth = 1.3; g.shadowColor = pink; g.shadowBlur = 6;
+    picks.forEach((k, n) => {
+      const tx = X(k) + 6, ty = Y(n % 2 ? cs[k][3] : cs[k][2]) + chartTop;
+      const kx = (cx + tx) / 2 + (n % 2 ? 18 : -18), ky = (cy + ty) / 2 + 22;
+      g.beginPath(); g.moveTo(cx, cy); g.lineTo(kx, ky); g.lineTo(tx, ty); g.stroke();
+      g.fillStyle = "#fff"; g.beginPath(); g.arc(tx, ty, 2.4, 0, Math.PI * 2); g.fill();
+      g.beginPath(); g.arc(kx, ky, 1.6, 0, Math.PI * 2); g.fill();
+    });
+    g.shadowBlur = 0;
+    g.fillStyle = "#1a1d33"; g.strokeStyle = "#fff"; g.lineWidth = 2;
+    g.beginPath(); g.ellipse(cx, cy, 13, 10, -0.4, 0, Math.PI * 2); g.fill(); g.stroke();
+    g.fillStyle = pink; g.beginPath(); g.ellipse(cx + 12, cy + 6, 8, 6, -0.4, 0, Math.PI * 2); g.fill();
+    g.restore();
+  }
+
+  // ---- equity + pnl bars ----------------------------------------------------
+  function drawEquity(eq) {
+    const { g, w, h } = fit($("equity"));
+    if (eq.length < 2) {
+      const y = h / 2;
+      line(g, [[0, y], [w, y]], css("--green"), 1.5, [5, 5]);
+      g.font = "10px JetBrains Mono, monospace"; g.fillStyle = css("--muted");
+      g.fillText(`${eq.length ? usd(eq[0][1]) + " · " : ""}the curve starts drawing at the first 4h close`, 4, y - 8);
+      return;
+    }
+    const ys = eq.map((p) => p[1]);
+    let lo = Math.min(...ys), hi = Math.max(...ys);
+    if (hi === lo) { hi += 1; lo -= 1; }
+    const padL = 46;
+    const X = (k) => padL + k / (eq.length - 1) * (w - padL - 8);
+    const Y = (v) => 6 + (hi - v) / (hi - lo) * (h - 14);
+    g.font = "10px JetBrains Mono, monospace"; g.fillStyle = css("--dim");
+    [hi, (hi + lo) / 2, lo].forEach((v) => { g.fillText(usdShort(v), 0, Y(v) + 3); line(g, [[padL, Y(v)], [w, Y(v)]], css("--line"), 1); });
+    const grad = g.createLinearGradient(0, 0, 0, h);
+    grad.addColorStop(0, "rgba(62,224,143,.28)"); grad.addColorStop(1, "rgba(62,224,143,0)");
+    g.beginPath(); g.moveTo(X(0), h); eq.forEach((p, k) => g.lineTo(X(k), Y(p[1]))); g.lineTo(X(eq.length - 1), h); g.closePath();
+    g.fillStyle = grad; g.fill();
+    line(g, eq.map((p, k) => [X(k), Y(p[1])]), css("--green"), 2);
+    const lx = X(eq.length - 1), ly = Y(ys[ys.length - 1]);
+    g.fillStyle = css("--green"); g.beginPath(); g.arc(lx, ly, 4, 0, Math.PI * 2); g.fill();
+    g.strokeStyle = "rgba(62,224,143,.35)"; g.lineWidth = 4; g.beginPath(); g.arc(lx, ly, 8, 0, Math.PI * 2); g.stroke();
+  }
+
+  function drawPnlBars(pnls) {
+    const { g, w, h } = fit($("pnlbars"));
+    if (!pnls.length) return;
+    const m = Math.max(...pnls.map(Math.abs)) || 1;
+    const bw = (w - 46) / Math.max(pnls.length, 40);
+    pnls.forEach((p, k) => {
+      const bh = Math.max(3, Math.abs(p) / m * (h - 4));
+      g.fillStyle = p >= 0 ? css("--green") : css("--red");
+      g.fillRect(46 + k * bw, h - bh, Math.max(1, bw * 0.7), bh);
+    });
+  }
+
+  // ---- DOM sections -------------------------------------------------------------
+  function renderAgents(agents) {
+    const root = $("agents");
+    if (!root.children.length) {
+      agents.forEach((a) => {
+        const el = document.createElement("article");
+        el.className = "card"; el.id = `card-${a.key}`;
+        el.append(sprite(a.key));
+        el.insertAdjacentHTML("beforeend", `<div class="name" style="color:var(${COLORS[a.key]})">${esc(a.name)}</div>
+          <div class="role">${esc(a.role)}</div><div class="detail"></div><div class="value"></div>
+          <div class="bar"><i></i></div><div class="quote"></div>`);
+        if (a.asks_jev) el.insertAdjacentHTML("beforeend", `<span class="asks">ASKS JEV</span>`);
+        root.append(el);
+      });
+    }
+    agents.forEach((a) => {
+      const el = $(`card-${a.key}`);
+      el.className = `card ${a.state || ""}`;
+      el.querySelector(".detail").textContent = a.detail || "";
+      el.querySelector(".value").textContent = a.value ?? "";
+      const bar = el.querySelector(".bar i");
+      bar.style.width = `${Math.round((a.score ?? (a.state === "active" ? 1 : 0.25)) * 100)}%`;
+      bar.style.background = `var(${COLORS[a.key]})`;
+      el.querySelector(".quote").textContent = `"${a.quote}"`;
+      el.querySelector(".quote").title = a.quote;
+    });
+  }
+
+  const BUBBLE_SPOTS = { scan: [6, 6], vet: [52, 8], size: [8, 62], fills: [30, 80], risk: [58, 50], crowd: [62, 24] };
+  function renderBubbles(agents) {
+    const root = $("bubbles");
+    root.innerHTML = "";
+    agents.filter((a) => BUBBLE_SPOTS[a.key]).forEach((a) => {
+      const [x, y] = BUBBLE_SPOTS[a.key];
+      const b = document.createElement("div");
+      b.className = "bubble";
+      b.style.left = `${x}%`; b.style.top = `${y}%`;
+      b.style.borderColor = `var(${COLORS[a.key]})`;
+      b.innerHTML = `<b style="color:var(${COLORS[a.key]})">${esc(a.name)}</b>${esc(a.quote)}`;
+      root.append(b);
+    });
+    const chief = agents.find((a) => a.key === "chief");
+    $("chief-bubble").textContent = chief ? chief.quote : "";
+  }
+
+  function renderStage(s) {
+    const t = s.ticker, k = s.kills;
+    $("ticker").innerHTML = `‹ TRADES · BTC ${usd(t.price, 0)} · BANK ${usd(t.bank)} · ` +
+      `<span class="hl">${esc(t.position)}${t.position_detail ? " " + esc(t.position_detail) : ""}</span>` +
+      ` · ${esc(t.record)} · HOLD ${pct(t.hold_pct)} · P&amp;L ${usd(t.pnl)} (${pct(t.pnl_pct)}) · FEES ${usd(t.fees)} · FUNDING ${usd(t.funding)}`;
+    $("chart-title").textContent = `BTC-PERP · ${s.header.interval} · ${usd(t.price, 0)}`;
+    $("chart-sub").textContent = `24h ${pct(t.change_24h)} · ema.fast pink · ema.slow blue · channel dashed`;
+    const chips = $("chips");
+    chips.innerHTML = s.agents.map((a) => `<span class="chip ${a.state === "idle" ? "off" : ""}" title="${esc(a.name)}: ${esc(a.state)}"
+      style="background:var(${COLORS[a.key]})">${esc(a.name[0])}</span>`).join("");
+    if (!$("chief-sprite").children.length) $("chief-sprite").append(sprite("chief", 4));
+    $("mini-time").textContent = s.header.time;
+    $("kill-state").innerHTML = [
+      ["flat_kill", k.flat_kill], ["entry_kill", k.entry_kill], ["jev_kill", k.jev_kill],
+      ["drawdown halt", k.halted], ["daily loss lock", k.daily_locked], ["cooldown", k.cooldown],
+    ].map(([n, on]) => `<div class="${on ? "on" : ""}"><span>${n}</span><span>${on ? "ON" : "off"}</span></div>`).join("");
+    const j = s.jev, ans = j.answers;
+    const row = (label, v) => `<div class="q"><span>${label}</span><div class="bar"><i style="width:${Math.round((v ?? 0) * 100)}%;background:var(--white)"></i></div></div>`;
+    $("jevbox").innerHTML = `<div class="q"><span>MODE</span>${esc(j.mode)}${j.enabled ? "" : " · no key"} · ${j.calls} calls</div>` +
+      (ans ? row(`spent ${num(ans.momentum_already_spent?.noul)}`, ans.momentum_already_spent?.noul) +
+             row(`follow-through ${num(ans.follow_through?.noul)}`, ans.follow_through?.noul) +
+             row(`trend ${num(ans.regime?.probabilities?.trend)}`, ans.regime?.probabilities?.trend)
+           : `<div class="q"><span>LAST ANSWER</span>asked only when every other gate passes</div>`);
+  }
+
+  function renderBalance(s) {
+    const t = s.ticker, goal = s.goal;
+    $("bal-day").textContent = `DAY ${s.header.day}`;
+    $("bal-mode").textContent = s.header.mode;
+    $("bal-record").textContent = t.record;
+    $("bal-hold").textContent = pct(t.hold_pct);
+    $("balance").textContent = usd(t.bank);
+    $("balance").style.color = t.pnl >= 0 ? "var(--green)" : "var(--red)";
+    if (goal) {
+      $("goal-from").textContent = usd(goal.start, 0);
+      $("goal-to").textContent = usd(goal.target, 0);
+      $("goal-bar").style.width = `${(goal.progress * 100).toFixed(1)}%`;
+      const yrs = (y) => y == null ? "—" : y > 200 ? "200+ years" : `${y.toFixed(y < 10 ? 1 : 0)} years`;
+      $("goal-note").innerHTML = `${(goal.progress * 100).toFixed(1)}% of the way (log scale) · ${num(goal.multiple_left, 0)}x to go<br>` +
+        `at backtest pace (${pct(goal.backtest_cagr, 1)}/yr): ${yrs(goal.years_at_backtest_rate)}` +
+        (goal.realised_cagr != null ? `<br>at this account's own pace (${pct(goal.realised_cagr, 1)}/yr): ${yrs(goal.years_at_realised_rate)}` : "");
+    }
+  }
+
+  const GATE_FMT = (g) => {
+    if (g.value == null) return g.note || "";
+    const v = Math.abs(g.value) >= 1000 ? Math.round(g.value).toLocaleString("en-US") : num(g.value, 2);
+    const t = g.threshold == null ? "" : ` ${g.op === "min" ? "≥" : g.op === "max" ? "≤" : "vs"} ${Math.abs(g.threshold) >= 1000 ? Math.round(g.threshold).toLocaleString("en-US") : num(g.threshold, 2)}`;
+    return `${v}${t}`;
+  };
+
+  function renderAnalysis(s) {
+    const st = s.analysis.stats;
+    $("scanned").textContent = `${s.analysis.scanned.toLocaleString("en-US")} BARS SCANNED`;
+    const cells = [
+      ["$BTC", "perp · " + s.header.venue, "sym"], ["Price", usd(st.price, 0)], ["24h", pct(st.change_24h)],
+      ["ATR", `${num(st.atr_pct)}%`], ["Funding APR", `${num(st.funding_apr, 1)}%`],
+      ["Open interest", usdShort(st.open_interest_usd)], ["Spread", st.spread_bps == null ? "—" : `${num(st.spread_bps, 2)} bps`],
+    ];
+    $("stats").innerHTML = cells.map(([k, v, cls]) => `<div class="${cls || ""}"><span>${k}</span><b>${esc(v)}</b></div>`).join("");
+    $("gates").innerHTML = s.analysis.gates.map((g) =>
+      `<li><span>${esc(g.name.replace(/_/g, " "))} <i class="na">${esc(GATE_FMT(g))}</i></span><span class="v ${g.verdict}">${g.verdict}</span></li>`).join("");
+    $("events").innerHTML = s.events.slice().reverse().map((e) =>
+      `<li><b style="color:var(${COLORS[e.agent] || "--muted"})">${esc(e.agent.toUpperCase())}</b>${hhmm(e.ts)} ${esc(e.text)}</li>`).join("") ||
+      `<li>no events yet — the desk speaks when something happens.</li>`;
+  }
+
+  function renderThresholds(rows) {
+    const groups = { KILL: [], HARD: [], SOFT: [] };
+    rows.forEach((r) => (groups[r.section] || groups.HARD).push(r));
+    const desc = { KILL: "desk-level brakes", HARD: "arithmetic, costs nothing", SOFT: "applied to the agents' scores and Jev's answers" };
+    const fmt = (x) => x == null ? "—" : Math.abs(x) >= 1000 ? Math.round(x).toLocaleString("en-US") : num(x, 2);
+    $("thr").innerHTML = Object.entries(groups).filter(([, v]) => v.length).map(([sec, v]) =>
+      `<div class="thr-sec">${sec} — ${v.length} · ${desc[sec]}</div>` + v.map((r) => {
+        const mark = r.verdict === "PASS" || r.verdict === "MARK" ? `<span class="ok">✓</span>` :
+          r.verdict === "DROP" ? `<span class="bad">✗</span>` : r.verdict === "WAIT" ? `<span class="na">…</span>` : `<span class="na">–</span>`;
+        const thr = r.threshold == null ? (r.verdict === "SKIP" && r.value != null ? "info" : "") : `${r.op || "vs"} ${fmt(r.threshold)}`;
+        return `<div class="thr-row"><span class="n">${esc(r.name)}</span><span class="t">${esc(thr)}</span><span class="c">${fmt(r.value)}</span>${mark}</div>`;
+      }).join("")).join("");
+  }
+
+  function renderKills(k) {
+    document.querySelectorAll("[data-kill]").forEach((b) => {
+      const on = !!k[b.dataset.kill];
+      b.classList.toggle("on", on);
+      b.setAttribute("aria-pressed", String(on));
+    });
+  }
+
+  // ---- kill switch POSTs ---------------------------------------------------------
+  function token() { try { return localStorage.getItem("desk-token") || ""; } catch { return ""; } }
+  document.querySelectorAll("[data-kill]").forEach((b) => b.addEventListener("click", async () => {
+    const on = !b.classList.contains("on");
+    const res = await fetch("api/kill", {
+      method: "POST", headers: { "Content-Type": "application/json", "X-Desk-Token": token() },
+      body: JSON.stringify({ switch: b.dataset.kill, on }),
+    }).catch(() => null);
+    if (res && res.status === 403) {
+      const t = prompt("Dashboard token (DASHBOARD_TOKEN):");
+      if (t) { try { localStorage.setItem("desk-token", t); } catch { /* private mode */ } }
+    }
+    $("kill-hint").textContent = res && res.ok ? `${b.dataset.kill} ${on ? "ON" : "off"} — applied on the next poll` : "couldn't reach the desk";
+    tick();
+  }));
+
+  // ---- main loop ---------------------------------------------------------------
+  let state = null;
+  function render() {
+    if (!state) return;
+    const s = state, hdr = s.header;
+    $("title").textContent = hdr.title;
+    $("tagline").textContent = hdr.tagline;
+    $("mode").textContent = hdr.mode; $("mode").className = `mode ${hdr.mode.toLowerCase()}`;
+    $("daydate").textContent = `DAY ${hdr.day} · ${hdr.date}`;
+    $("time").textContent = hdr.time;
+    renderAgents(s.agents); renderStage(s); renderBubbles(s.agents);
+    drawChart(s.chart); drawWeb();
+    renderBalance(s); drawEquity(s.equity); drawPnlBars(s.pnl_bars);
+    renderAnalysis(s); renderThresholds(s.thresholds); renderKills(s.kills);
+    $("foot").textContent = `updated ${new Date(s.updated).toISOString().replace("T", " ").slice(0, 19)} UTC · ${hdr.venue} · not financial advice; the desk can and will lose money`;
+  }
+
+  // Live server: /api/state every 2s. Static hosting (e.g. GitHub Pages): board.json every 60s.
+  const params = new URLSearchParams(location.search);
+  let src = params.get("state") || "api/state";
+  let staticMode = !!params.get("state");
+  async function tick() {
+    try {
+      if (staticMode && src !== "api/state") src = src.split("?")[0] + `?t=${Date.now()}`;
+      let res = await fetch(src, { cache: "no-store" });
+      if (!res.ok && src === "api/state" && res.status !== 503) {
+        src = "board.json"; staticMode = true;
+        res = await fetch(src, { cache: "no-store" });
+      }
+      if (!res.ok) throw new Error(res.status);
+      state = await res.json();
+      render();
+      if (staticMode) {
+        const age = Math.round((Date.now() - state.updated) / 60000);
+        $("foot").textContent += ` · snapshot ${age} min old, refreshes every minute`;
+        document.querySelectorAll("[data-kill]").forEach((b) => { b.disabled = true; });
+        $("kill-hint").textContent = "read-only board: flip switches in ledger/kills.json on GitHub";
+      }
+    } catch (err) {
+      $("foot").textContent = `can't reach the desk (${err.message}). is \`python -m desk paper\` running?`;
+    }
+  }
+  window.addEventListener("resize", render);
+  (async function loop() {
+    await tick();
+    setTimeout(loop, staticMode ? 60000 : 2000);
+  })();
+})();

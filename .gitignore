@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+.pytest_cache/
+# downloaded market data and caches: re-fetched on demand
+data/*
+!data/.gitkeep
+# local live/replay state (the paper experiment's ledger/ IS committed)
+state/*
+!state/.gitkeep
+*.tmp

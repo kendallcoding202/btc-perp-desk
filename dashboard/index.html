@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BTC Perp Desk</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Silkscreen:wght@400;700&family=JetBrains+Mono:wght@400;600;700&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="frame">
+
+  <header class="panel header">
+    <div class="brand">
+      <h1 id="title">BTC PERP DESK</h1>
+      <span class="ring" aria-hidden="true"></span>
+      <span class="tagline" id="tagline">SCAN PICKS · RISK SIZES · FILLS TRADES</span>
+    </div>
+    <div class="clock">
+      <span class="mode" id="mode">—</span>
+      <span class="daydate" id="daydate">DAY — · —</span>
+      <span class="time"><b id="time">--:--</b> UTC</span>
+    </div>
+  </header>
+
+  <section class="agents" id="agents"></section>
+
+  <section class="panel stage" id="stage">
+    <div class="ticker" id="ticker">‹ TRADES</div>
+    <div class="stage-body">
+      <aside class="stage-left">
+        <div class="jev-badge"><span class="jev-rings" aria-hidden="true"></span><span>JEV</span></div>
+        <div class="jev-box" id="jevbox"></div>
+        <div class="floor-label">PAPER HANDS</div>
+      </aside>
+      <div class="chart-wrap">
+        <div class="chart-head"><span id="chart-title">BTC · 4h</span><span id="chart-sub"></span></div>
+        <canvas id="chart"></canvas>
+        <canvas id="web" class="web"></canvas>
+        <div class="bubbles" id="bubbles"></div>
+      </div>
+      <aside class="stage-right">
+        <div class="chips" id="chips"></div>
+        <div class="mini-clock"><span class="jev-rings sm" aria-hidden="true"></span><b id="mini-time">--:--</b></div>
+        <div class="bubble static" id="chief-bubble">pick → crawl. size it.</div>
+        <div class="sprite-slot" id="chief-sprite"></div>
+        <div class="floor-label">HEAD OF THE FLOOR</div>
+        <div class="kill-state" id="kill-state"></div>
+      </aside>
+    </div>
+  </section>
+
+  <section class="panel balance">
+    <div class="bal-head">
+      <span class="label">BALANCE · <span id="bal-day">DAY —</span> · <span id="bal-mode">—</span></span>
+      <span class="label right"><span id="bal-record">0W 0L</span> · HOLD <span id="bal-hold">+0.00%</span></span>
+    </div>
+    <div class="bal-body">
+      <div class="bal-charts">
+        <canvas id="equity"></canvas>
+        <canvas id="pnlbars"></canvas>
+      </div>
+      <div class="bal-side">
+        <div class="label muted">BALANCE</div>
+        <div class="big" id="balance">$—</div>
+        <div class="goal">
+          <div class="goal-line"><span id="goal-from">$50</span><span>→</span><span id="goal-to">$100,000</span></div>
+          <div class="bar"><i id="goal-bar"></i></div>
+          <div class="goal-note" id="goal-note">—</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="bottom">
+    <div class="panel analysis">
+      <div class="panel-head"><span>DESK · ANALYSIS</span><span class="pink" id="scanned">0 SCANNED</span></div>
+      <div class="stats" id="stats"></div>
+      <div class="analysis-body">
+        <ol class="gates" id="gates"></ol>
+        <ul class="events" id="events"></ul>
+      </div>
+    </div>
+    <div class="panel thresholds">
+      <div class="panel-head"><span class="mono-title">thresholds.py</span><span class="pink">EVERY NUMBER THE DESK BELIEVES</span></div>
+      <div id="thr"></div>
+      <div class="filter-line">filter.py · <b>THE ORDER IS THE WHOLE POINT</b></div>
+      <div class="kills">
+        <button data-kill="flat_kill" title="close the position now and stop entering">flat_kill</button>
+        <button data-kill="entry_kill" title="keep the position and stop, no new entries">entry_kill</button>
+        <button data-kill="jev_kill" title="stop consulting Jev">jev_kill</button>
+        <span class="kill-hint" id="kill-hint"></span>
+      </div>
+    </div>
+  </section>
+
+  <footer class="foot" id="foot">connecting…</footer>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
