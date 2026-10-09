@@ -3,11 +3,11 @@
 A multi-agent trading desk for **BTC perpetual futures**, modelled on the "GROKBOT + JEV" dashboard, with one difference: every number it trades on has been backtested, with fees and funding charged.
 
 ```
-CHIEF    never takes a position     runs the gates in order, every 4h close
-SCAN     finding what moves         30-bar Donchian breakout, 50/200 EMA trend filter
+CHIEF    never takes a position     runs the gates in order, every 2h close
+SCAN     finding what moves         60-bar (5-day) Donchian breakout, 100/400 EMA trend filter
 VET      is the move real           efficiency ratio, volatility band       (asks Jev)
 CROWD    who's on the other side    funding pressure: don't join a crowd paying 50%+ APR (asks Jev)
-SIZE     how much                   2% of equity at risk per trade, ≤3x leverage
+SIZE     how much                   5% of equity at risk per trade (aggressive), ≤5x leverage
 FILLS    execution                  taker in, taker out; fees + slippage always charged
 RISK     the stop                   3 ATR stop, trails every new high, never loosens; kill switches
 CRAWLER  reads first, then trades   Hyperliquid live data; Binance archive for 6+ years of history
@@ -16,28 +16,32 @@ JEV      second opinion             TypeSafe AI's decision model, advisory (see 
 
 > **Not financial advice. This can lose money.** Nothing here is a promise of profit. The results below are what history says. The future doesn't have to agree.
 
-## What the backtest says (2020-01 → 2026-09, BTCUSDT perp, 4h)
+## What the backtest says (2020-01 → 2026-09, BTCUSDT perp, 2h candles, 5% risk per trade)
 
 Full report with every table: [`reports/backtest.md`](reports/backtest.md). Re-run it any time with `python -m desk backtest --research`.
 
-| | Desk (2% risk) | Buy & hold BTC |
+| | Desk | Buy & hold BTC |
 |---|---|---|
-| Total return | **+157%** ($50 → $129) | +1057% |
-| Per year | +15.0% | |
-| Worst drop from a peak | **12.3%** | 77% |
-| Out-of-sample (2024-01 → 2026-09, never used for tuning) | +27.8%, profit factor 1.66 | +104% |
+| Total return | **+1,475%** ($50 → $788) | +1,059% |
+| Per year | +50% | |
+| Worst drop from a peak | **28%** | 77% |
+| Out-of-sample (2024-01 → 2026-09; settings were picked on 2020–23) | +95%, profit factor 1.44 | +103% |
+| Trades | 118 (≈17 a year), 42% winners, avg win 2.4× avg loss | |
+
+By year: 2020 +128% · 2021 +10% · 2022 −5% · 2023 +231% · 2024 +69% · 2025 +33% · **2026 so far −11%**.
 
 The honest read:
-- **It has made money, but not spectacularly.** Holding BTC made far more, with far deeper crashes along the way. The desk is in the market 17% of the time and sits out the bear markets (2022: −2.8% vs BTC's −64%).
-- **It has been weaker lately.** On Hyperliquid's own data from 2024-06 to 2026-10 it made +2.6%. 2025 was +2.8%, and 2026 so far is −4.7%.
-- **Whole-period profit isn't the result of one lucky setting.** Every one of the 12 nearby settings tested (breakout length × stop width) was profitable, and tripling fees and slippage still leaves +126%.
-- **$50 → $100,000 is a 2,000× goal.** At the backtested pace that's about 54 years at 2% risk, or about 21 years at the most aggressive setting tested, which had 41% drawdowns. The board shows this projection live.
+- **This is the aggressive profile you asked for.** Each trade risks 5% of the account. Leverage is set by the stop distance: a tight setup gets more (median 1.7×, max 4×). The worst losing streak so far was 8 trades in a row. At 2% risk the same strategy made +21%/yr with a 12% worst drop.
+- **The backtest flatters it.** Many variants were tried to get here, and the 2h/5% choice was made after seeing them. 2026 has been a losing year. The paper experiment is the real test.
+- **Whole-period profit isn't the result of one lucky setting.** Every nearby setting tested was profitable, and tripling fees and slippage still leaves it profitable.
+- **$50 → $100,000 is a 2,000× goal.** At +50%/yr that's about 19 years at the historical pace. The board shows this projection live.
 
 ### Design decisions the data made
-- **3 of the 4 "soft" gates were removed** (trend strength, efficiency, extension). Tested on 2020–2023 only, each one cost money. Trend strength did the most damage: it rejects breakouts before the averages spread apart, which is exactly when entries pay best. They still show on the board as information.
+- **2h candles, not 1h or 4h.** 2h beat 4h on 2020–2023 (+157% vs +104% at equal risk) and held up afterwards. 1h was worse: noise and fees.
+- **3 of the 4 "soft" gates were removed** (trend strength, efficiency, extension). Tested on 2020–2023 only, each one cost money. They still show on the board as information.
 - **Longs only.** Shorts added nothing in 2020–2023 and roughly doubled the drawdown. `allow_shorts` turns them back on.
-- **No fixed take-profit.** The trailing stop already sells winners. Adding a profit target cut total return from +157% to between +43% and +116%, depending on the level.
-- **Jev is advisory.** All 94 historical entries were replayed through Jev (with dates and prices stripped out). Its answers had about zero correlation with which trades won (−0.08, +0.04, +0.01). It's on the board; it gets no veto.
+- **No fixed take-profit.** The trailing stop already sells winners. Adding a profit target cut total return from +1,475% to between +213% and +898%, depending on the level.
+- **Jev is advisory.** All 118 historical entries were replayed through Jev (with dates and prices stripped out). Its answers' correlation with trade outcome was about zero (−0.05 to +0.06). Its "follow-through" answer did split winners from losers somewhat (−$81 below its median, +$819 above), which is worth watching on paper, but it's too weak to give it a veto yet.
 
 ## Quick start
 
@@ -53,14 +57,16 @@ python3 -m pytest                            # 19 tests, incl. "paper ledger == 
 
 ## The $50 paper experiment
 
-`python -m desk paper` (or `python -m desk step` from a scheduler) trades a **$50 paper account** on live Hyperliquid BTC prices. Its record lives in [`ledger/`](ledger/), which is committed so the history is permanent:
+A **$50 paper account** trades live Hyperliquid BTC prices. A GitHub Actions job ([`.github/workflows/paper.yml`](.github/workflows/paper.yml)) runs `python -m desk step` every 15 minutes, so the experiment keeps running with no computer on.
 
-- `ledger/paper.json`: the account, open position, every trade, and the desk's memory
-- `ledger/board.json`: exactly what the dashboard shows
-- `ledger/kills.json`: kill switches (edit it, or use the board's buttons)
+- **The record** lives on the [`paper-ledger`](../../tree/paper-ledger/ledger) branch, saved whenever something happens, so the history is permanent and public:
+  - `ledger/paper.json`: the account, open position, every trade, and the desk's memory
+  - `ledger/kills.json`: kill switches. Create or edit it on that branch, e.g. `{"entry_kill": true}`.
+- **The board** for your phone is published to GitHub Pages every run: **https://kendallcoding202.github.io/btc-perp-desk/**. It is read-only; kill switches go through `kills.json`.
+- **Locally:** `python -m desk paper` runs the same step every minute, with a live board and working kill buttons at http://127.0.0.1:8787. Don't run it against the same ledger as the Action, or the two will diverge.
 
 Fills follow the backtest's rules exactly (a test enforces it):
-- Decisions are made at each 4h close (00/04/08/12/16/20 UTC).
+- Decisions are made at each 2h close (every even UTC hour).
 - Entries fill at the next candle's open.
 - Stops are checked against each candle's range as it forms.
 - Funding is charged every hour, as on Hyperliquid.
@@ -76,8 +82,8 @@ Each `step` processes whatever has closed since the last run, so a missed run ne
 | `flat_kill` | close the position now, take no new entries |
 | `entry_kill` | keep the position and its stop, take no new entries |
 | `jev_kill` | stop consulting Jev |
-| drawdown halt (auto) | down 25% from peak → flat and halted until `python -m desk reset-halt` |
-| daily loss lock (auto) | down 3% on the UTC day → flat until tomorrow |
+| drawdown halt (auto) | down 40% from peak → flat and halted until `python -m desk reset-halt` |
+| daily loss lock (auto) | down 10% on the UTC day → flat until tomorrow |
 | cooldown (auto) | 5 losers in a row → sit out 6 candles |
 
 ## Going live (only after paper earns it)

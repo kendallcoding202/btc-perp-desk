@@ -6,7 +6,10 @@ __pycache__/
 # downloaded market data and caches: re-fetched on demand
 data/*
 !data/.gitkeep
-# local live/replay state (the paper experiment's ledger/ IS committed)
+# local live/replay state
 state/*
 !state/.gitkeep
+# the paper experiment's ledger lives on the `paper-ledger` branch, written by the workflow
+ledger/*
+!ledger/.gitkeep
 *.tmp

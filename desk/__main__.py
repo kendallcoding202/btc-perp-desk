@@ -80,9 +80,10 @@ def cmd_backtest(args) -> int:
     if args.research:
         from . import research
 
-        print("  research: sensitivity, ablation, take profit, sizing, costs" + (", jev" if _jev(p) else ""))
+        print("  research: sensitivity, ablation, trade sooner, take profit, sizing, costs" + (", jev" if _jev(p) else ""))
         parts = [research.sensitivity(bars, funding, p), research.ablation(bars, funding, p),
-                 research.take_profit(bars, funding, p), research.sizing(bars, funding, p),
+                 research.trade_sooner(bars, funding, p), research.take_profit(bars, funding, p),
+                 research.sizing(bars, funding, p),
                  research.costs(bars, funding, p)]
         client = _jev(p.with_(jev={"mode": "advisory"}))
         if client:
@@ -154,6 +155,9 @@ def cmd_step(args) -> int:
     p = _params(args)
     s = paper.step(p, args.ledger, jev=_jev(p))
     _notify(s)
+    if os.environ.get("GITHUB_OUTPUT"):   # tells the workflow whether the ledger needs saving
+        with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+            fh.write(f"changed={'true' if s['paper']['changed'] else 'false'}\n")
     t, g = s["ticker"], s["goal"]
     print(f"  paper equity {t['bank']:,.2f} ({t['pnl_pct']:+.2%}) · {t['position']} {t['position_detail']} · "
           f"{t['record']} · {g['progress']:.1%} of the way to ${g['target']:,.0f}")
@@ -230,7 +234,7 @@ def cmd_jev_test(args) -> int:
     if not c.enabled:
         print("JEV_API_KEY is not set (put it in .env)")
         return 1
-    ans = c.ask("BTC perpetual, 4h bars. Candidate entry: LONG. Close just broke the prior 30-bar high by 0.4 ATR. "
+    ans = c.ask("BTC perpetual, 2h bars. Candidate entry: LONG. Close just broke the prior 60-bar high by 0.4 ATR. "
                 "Funding +8% annualised.", QUESTIONS)
     if ans is None:
         print(f"Jev call failed: {c.last_error}")
@@ -246,7 +250,7 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def common(sp, history=False, server=False):
-        sp.add_argument("--interval", default=None, help="bar size (default from thresholds.py: 4h)")
+        sp.add_argument("--interval", default=None, help="bar size (default from thresholds.py: 2h)")
         sp.add_argument("--risk", type=float, default=None, help="risk per trade, e.g. 0.01 = 1%%")
         sp.add_argument("--jev-mode", choices=["off", "advisory", "gate"], default=None)
         if history:

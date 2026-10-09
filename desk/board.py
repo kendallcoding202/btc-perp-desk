@@ -109,22 +109,17 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
         quotes["chief"] = "kills → data → hard → scan → soft → size → jev → fills. in that order, every bar."
     cards["chief"] = dict(value=plan, detail=f"bar {i + 1:,} · {p.market.interval} · {mode}", state=chief_state)
 
-    bo = _gate(dec, "breakout")
-    lvl = bo.threshold if bo else None
+    bo = _gate(dec, "setup")
     ts_score = dec.scores.get("trend_strength") if dec else None
     if bo and bo.verdict == Verdict.PASS:
-        dist = (bar.close - lvl) / a if a and lvl else 0.0
-        quotes["scan"] = f"close took out the {p.strategy.breakout_bars}-bar high by {dist:.2f} ATR."
-        scan_state = "alert"
-    elif lvl:
-        gap = (lvl / bar.close - 1) if dec and dec.direction.sign > 0 else (1 - lvl / bar.close)
-        quotes["scan"] = f"nothing's breaking. {p.strategy.breakout_bars}-bar {'high' if dec.direction.sign > 0 else 'low'} " \
-                         f"is {_usd(lvl)}, {abs(gap):.1%} away."
-        scan_state = "idle"
+        quotes["scan"], scan_state = f"{bo.note}. that's a setup.", "alert"
+    elif bo:
+        quotes["scan"], scan_state = f"nothing yet. {bo.note}.", "idle"
     else:
         quotes["scan"], scan_state = "warming up the averages.", "idle"
     cards["scan"] = dict(value=f"{ts_score:.2f}" if ts_score is not None else "—",
-                         detail=f"donchian.{p.strategy.breakout_bars} · BTC", score=ts_score, state=scan_state)
+                         detail=f"{p.strategy.entry_mode}.{p.strategy.breakout_bars} · BTC", score=ts_score,
+                         state=scan_state)
 
     eff = dec.scores.get("efficiency") if dec else None
     ext = dec.scores.get("extension") if dec else None
@@ -187,7 +182,7 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
         quotes["risk"] = f"stop {_usd(pos.stop)}, {dist:.1%} away, trailing {p.strategy.trail_atr:g} ATR."
         risk_state = "active"
     else:
-        quotes["risk"] = "nobody buys the top of a 30-bar range without a stop."
+        quotes["risk"] = f"nobody buys the top of a {p.strategy.breakout_bars}-bar range without a stop."
         risk_state = "idle"
     cards["risk"] = dict(value=f"{wins}W {losses}L", detail=f"stop {_usd(pos.stop) if pos else '—'}", state=risk_state)
 

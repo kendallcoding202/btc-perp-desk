@@ -192,7 +192,7 @@
       const y = h / 2;
       line(g, [[0, y], [w, y]], css("--green"), 1.5, [5, 5]);
       g.font = "10px JetBrains Mono, monospace"; g.fillStyle = css("--muted");
-      g.fillText(`${eq.length ? usd(eq[0][1]) + " · " : ""}the curve starts drawing at the first 4h close`, 4, y - 8);
+      g.fillText(`${eq.length ? usd(eq[0][1]) + " · " : ""}the curve starts drawing at the first bar close`, 4, y - 8);
       return;
     }
     const ys = eq.map((p) => p[1]);

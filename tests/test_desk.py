@@ -18,7 +18,11 @@ from desk.models import Bar, FundingEvent, MarketContext, Order, Side, Verdict
 from desk.thresholds import DEFAULT, INTERVAL_SECONDS
 
 H4 = INTERVAL_SECONDS["4h"] * 1000
-P = DEFAULT.with_(sizing={"starting_equity": 10_000.0})
+# Tests run a 4h desk on synthetic 4h bars, independent of whatever thresholds.py currently defaults to.
+P = DEFAULT.with_(market={"interval": "4h"},
+                  strategy={"breakout_bars": 30, "ema_fast": 50, "ema_slow": 200, "atr_bars": 14},
+                  hard={"min_history_bars": 250},
+                  sizing={"starting_equity": 10_000.0, "risk_per_trade": 0.02, "max_leverage": 3.0})
 
 
 def series(n=900, seed=7, drift=0.0006, vol=0.012, start=30_000.0):
@@ -236,8 +240,8 @@ def test_paper_ledger_stepping_matches_the_backtest(tmp_path, monkeypatch):
 def test_jev_gates_advisory_never_drop_gate_mode_can():
     ans = {"momentum_already_spent": {"noul": 0.9}, "follow_through": {"noul": 0.9},
            "regime": {"probabilities": {"trend": 0.9}}}
-    adv = jev_mod.gates_from_answers(ans, DEFAULT.with_(jev={"mode": "advisory"}))
-    gate = jev_mod.gates_from_answers(ans, DEFAULT.with_(jev={"mode": "gate"}))
+    adv = jev_mod.gates_from_answers(ans, P.with_(jev={"mode": "advisory"}))
+    gate = jev_mod.gates_from_answers(ans, P.with_(jev={"mode": "gate"}))
     assert {g.verdict for g in adv} <= {Verdict.PASS, Verdict.MARK}
     assert Verdict.DROP in {g.verdict for g in gate}
     assert jev_mod.gates_from_answers(None, DEFAULT)[0].verdict == Verdict.SKIP

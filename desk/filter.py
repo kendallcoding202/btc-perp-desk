@@ -37,6 +37,7 @@ class EntryDecision:
     leverage: float = 0.0
     scores: dict = field(default_factory=dict)
     jev_answers: dict | None = None
+    setup: str | None = None               # "breakout" or "pullback" when the SCAN gate passed
 
     @property
     def blocked_by(self) -> GateResult | None:
@@ -106,17 +107,35 @@ def evaluate_entry(p: Params, f: ind.Features, i: int, *, equity: float, kills: 
     gates.append(_hard("spread_bps", ctx.spread_bps if ctx else None, h.max_spread_bps, "max", "fills"))
     gates.append(_hard("depth_usd", ctx.depth_usd if ctx else None, h.min_depth_usd, "min", "fills"))
 
-    # 4. SCAN — the breakout itself
+    # 4. SCAN — the setup: a breakout, a pullback inside the trend, or either (strategy.entry_mode)
     level = f.don_hi[i] if d > 0 else f.don_lo[i]
     broke = (close > level) if d > 0 else (close < level)
+    dip_level = ef - d * s.pullback_atr * a
+    dipped = ((close < dip_level) if d > 0 else (close > dip_level)) and \
+        (not s.pullback_hold_slow or (close - es) * d > 0)
+    modes = {"breakout": ("breakout",), "pullback": ("pullback",), "both": ("breakout", "pullback")}[s.entry_mode]
+    hit = [m for m in modes if (broke if m == "breakout" else dipped)]
+    hi_lo = "high" if d > 0 else "low"
+    setup = None
     if direction is Side.SHORT and not s.allow_shorts:
-        gates.append(GateResult("breakout", Verdict.WAIT, close, level, "", "scan", "shorts disabled"))
-    elif broke:
-        gates.append(GateResult("breakout", Verdict.PASS, close, level, "min" if d > 0 else "max", "scan",
-                                f"{s.breakout_bars}-bar {'high' if d > 0 else 'low'} taken out"))
+        gates.append(GateResult("setup", Verdict.WAIT, close, level, "", "scan", "shorts disabled"))
+    elif hit:
+        setup = hit[0]
+        if setup == "breakout":
+            gates.append(GateResult("setup", Verdict.PASS, close, level, "min" if d > 0 else "max", "scan",
+                                    f"breakout: {s.breakout_bars}-bar {hi_lo} taken out"))
+        else:
+            gates.append(GateResult("setup", Verdict.PASS, close, dip_level, "max" if d > 0 else "min", "scan",
+                                    f"pullback: {s.pullback_atr:g} ATR through the {s.ema_fast}-EMA, trend intact"))
     else:
-        gates.append(GateResult("breakout", Verdict.WAIT, close, level, "min" if d > 0 else "max", "scan",
-                                f"waiting for the {s.breakout_bars}-bar {'high' if d > 0 else 'low'}"))
+        want = []
+        if "breakout" in modes:
+            want.append(f"a close {'above' if d > 0 else 'below'} the {s.breakout_bars}-bar {hi_lo} ${level:,.0f}")
+        if "pullback" in modes:
+            want.append(f"a dip to ${dip_level:,.0f}")
+        thr = level if "breakout" in modes else dip_level
+        op = ("min" if d > 0 else "max") if "breakout" in modes else ("max" if d > 0 else "min")
+        gates.append(GateResult("setup", Verdict.WAIT, close, thr, op, "scan", "waiting for " + " or ".join(want)))
 
     # 5. SOFT
     scores = {
@@ -139,7 +158,7 @@ def evaluate_entry(p: Params, f: ind.Features, i: int, *, equity: float, kills: 
     gates.append(_hard("ticket_usd", notional, z.min_notional_usd, "min", "size"))
 
     dec = EntryDecision(None, direction, gates, qty=qty, stop=stop, notional=notional,
-                        leverage=notional / equity if equity > 0 else 0.0, scores=scores)
+                        leverage=notional / equity if equity > 0 else 0.0, scores=scores, setup=setup)
 
     alive = all(g.verdict in (Verdict.PASS, Verdict.MARK, Verdict.SKIP) for g in gates)
 

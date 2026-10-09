@@ -1,0 +1,87 @@
+name: paper desk
+
+# The $50 paper experiment. Every 15 minutes: load the ledger from the `paper-ledger`
+# branch, run one desk step on live Hyperliquid prices, save the ledger if anything
+# happened, and publish the board to GitHub Pages.
+# (GitHub may start scheduled runs a few minutes late; `step` catches up on every
+# bar it missed, so a late or skipped run never loses or double-counts a bar.)
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: paper-desk
+  cancel-in-progress: false
+
+jobs:
+  step:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load the ledger
+        run: |
+          if git fetch --depth=1 origin paper-ledger; then
+            git checkout FETCH_HEAD -- ledger/
+          else
+            echo "no paper-ledger branch yet: the step opens a new \$50 ledger"
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Desk step
+        id: step
+        env:
+          JEV_API_KEY: ${{ secrets.JEV_API_KEY }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python -m desk step
+
+      - name: Save the ledger
+        if: steps.step.outputs.changed == 'true'
+        run: |
+          git config user.name "paper-desk[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          work="$RUNNER_TEMP/ledger-branch"
+          if git fetch --depth=1 origin paper-ledger; then
+            git worktree add "$work" FETCH_HEAD
+            git -C "$work" checkout -B paper-ledger
+          else
+            git worktree add --detach "$work"
+            git -C "$work" checkout --orphan paper-ledger
+            git -C "$work" rm -rfq .
+          fi
+          mkdir -p "$work/ledger"
+          cp ledger/paper.json "$work/ledger/"
+          [ -f ledger/kills.json ] && cp ledger/kills.json "$work/ledger/" || true
+          cd "$work"
+          git add ledger
+          git diff --cached --quiet && exit 0
+          equity=$(python3 -c "import json; print(round(json.load(open('ledger/paper.json'))['broker']['cash'], 2))")
+          git commit -qm "ledger: \$${equity} at $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push origin paper-ledger
+
+      - name: Build the board
+        run: |
+          mkdir -p _site
+          cp dashboard/* _site/
+          cp ledger/board.json _site/board.json
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4

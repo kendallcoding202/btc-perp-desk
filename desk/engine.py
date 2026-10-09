@@ -169,10 +169,10 @@ class Desk:
         if decision.side is not None and pos is None and not orders:
             tp_atr = self.p.strategy.take_profit_atr
             take_profit = (bar.close + decision.side.sign * tp_atr * f.atr[i]) if tp_atr else None
-            orders.append(Order("open", decision.side, decision.qty, "breakout", stop=decision.stop,
+            orders.append(Order("open", decision.side, decision.qty, decision.setup or "entry", stop=decision.stop,
                                 meta={"leverage": decision.leverage, "notional": decision.notional,
                                       "take_profit": take_profit}))
-            self.say(ts_close, "chief", f"go: {decision.side.value} {decision.qty:.4f} BTC "
+            self.say(ts_close, "chief", f"go ({decision.setup}): {decision.side.value} {decision.qty:.4f} BTC "
                                         f"(${decision.notional:,.0f}, {decision.leverage:.1f}x), stop {decision.stop:,.0f}")
 
         for o in orders:

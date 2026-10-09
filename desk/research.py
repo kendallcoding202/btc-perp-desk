@@ -83,7 +83,7 @@ def _halt_date(r) -> str:
 
 def sizing(bars, funding, p: Params) -> str:
     lines = ["## Position size — profit scales with risk, and so does the pain", "",
-             "| risk per trade | total return | CAGR | max drawdown | worst year | hit 25% halt? |",
+             f"| risk per trade | total return | CAGR | max drawdown | worst year | hit {p.risk.max_drawdown_halt:.0%} halt? |",
              "|---|---|---|---|---|---|"]
     for rk in (0.01, 0.02, 0.03, 0.05):
         r = bt.run(bars, funding, p.with_(sizing={"risk_per_trade": rk, "max_leverage": 5.0}))
@@ -92,6 +92,27 @@ def sizing(bars, funding, p: Params) -> str:
         worst = min(v["return"] for v in s["per_year"].values() if v)
         lines.append(f"| {rk:.0%}{' ← default' if rk == p.sizing.risk_per_trade else ''} | {f['return']:+.0%} | "
                      f"{bt._pct(f['cagr'])} | {f['max_drawdown']:.1%} | {worst:+.1%} | {'yes' if f['halted'] else 'no'} |")
+    return "\n".join(lines)
+
+
+def trade_sooner(bars, funding, p: Params) -> str:
+    """'Can it trade more often?' — tested: pullback (buy-the-dip) entries, alone and alongside breakouts."""
+    variants = [("breakouts only ← default", {"entry_mode": "breakout"})]
+    for k in (0.5, 1.0, 2.0):
+        variants.append((f"pullbacks only, {k:g} ATR dip", {"entry_mode": "pullback", "pullback_atr": k}))
+    for k in (0.5, 1.0, 2.0):
+        variants.append((f"breakouts + {k:g} ATR pullbacks", {"entry_mode": "both", "pullback_atr": k}))
+    variants.append(("breakouts + 1 ATR pullbacks + shorts", {"entry_mode": "both", "pullback_atr": 1.0,
+                                                             "allow_shorts": True}))
+    lines = ["## Trade sooner? — pullback entries and shorts", "",
+             "Breakouts can mean days without a trade. These variants trade more often; chosen on in-sample only.", "",
+             "| entries | trades/yr | in-sample return | out-of-sample return | max drawdown | hit drawdown halt |",
+             "|---|---|---|---|---|---|"]
+    for name, ov in variants:
+        r = bt.run(bars, funding, p.with_(strategy=ov))
+        full, a, b = _row(r)
+        lines.append(f"| {name} | {full['trades'] / full['years']:.0f} | {a['return']:+.0%} | {b['return']:+.0%} | "
+                     f"{full['max_drawdown']:.0%} | {'yes, ' + _halt_date(r) if full['halted'] else 'no'} |")
     return "\n".join(lines)
 
 

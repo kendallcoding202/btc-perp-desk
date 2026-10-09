@@ -1,6 +1,6 @@
 """Paper trading ledger — the $50 experiment.
 
-`step()` is idempotent and catch-up safe: it loads the ledger, processes every 4h
+`step()` is idempotent and catch-up safe: it loads the ledger, processes every bar
 bar that has closed since the last run (exactly like the backtest: orders fill at
 the next bar's open, stops are checked against each bar's high/low, funding is
 charged per bar), then saves the ledger and the board.
@@ -112,7 +112,7 @@ def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=
 
     if forming is not None and forming.ts > meta["last_bar_ts"]:
         # The bar that's still forming: orders decided at the last close fill at its open (the backtest's price),
-        # and the stop is checked against its range so far. Same fills as the backtest, minus the 4h wait.
+        # and the stop is checked against its range so far. Same fills as the backtest, minus the wait for the bar to close.
         n0, had = len(broker.trades), broker.position is not None
         broker.fill_pending(forming.open, forming.ts)
         broker.check_stop_bar(forming)
@@ -140,6 +140,7 @@ def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=
                                 "age_s": (now - (f.bars[-1].ts + f.bar_ms)) / 1000})
     state["paper"] = {"days": (now - meta["started_ts"]) / 86400_000, "start_equity": meta["start_equity"],
                       "runs": meta["runs"], "bars_processed_this_run": processed,
-                      "new_events": [{"ts": e.ts, "agent": e.agent, "text": e.text} for e in new_events]}
+                      "new_events": [{"ts": e.ts, "agent": e.agent, "text": e.text} for e in new_events],
+                      "changed": bool(processed or new_events)}
     _write(ledger_dir / "board.json", state)
     return state
