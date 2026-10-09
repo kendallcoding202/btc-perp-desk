@@ -97,7 +97,8 @@ def sizing(bars, funding, p: Params) -> str:
 
 def trade_sooner(bars, funding, p: Params) -> str:
     """'Can it trade more often?' — tested: pullback (buy-the-dip) entries, alone and alongside breakouts."""
-    variants = [("breakouts only ← default", {"entry_mode": "breakout"})]
+    variants = [("breakouts only ← default", {"entry_mode": "breakout"}),
+                ("breakouts, longs + shorts", {"entry_mode": "breakout", "allow_shorts": True})]
     for k in (0.5, 1.0, 2.0):
         variants.append((f"pullbacks only, {k:g} ATR dip", {"entry_mode": "pullback", "pullback_atr": k}))
     for k in (0.5, 1.0, 2.0):

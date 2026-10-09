@@ -1,6 +1,6 @@
 # Backtest — BTC perp, 2h bars
 
-2020-01-01 → 2026-10-01 (6.7 years). Generated 2026-10-09T22:57:05+00:00.
+2020-01-01 → 2026-10-01 (6.7 years). Generated 2026-10-09T23:15:13+00:00.
 Costs charged: taker fee 4.5 bps + slippage 3.0 bps per side, plus real funding prints. Start equity $50, risk 5.0%/trade, max 5x.
 
 | | Desk | Buy & hold BTC |
@@ -73,6 +73,7 @@ Breakouts can mean days without a trade. These variants trade more often; chosen
 | entries | trades/yr | in-sample return | out-of-sample return | max drawdown | hit drawdown halt |
 |---|---|---|---|---|---|
 | breakouts only ← default | 17 | +690% | +99% | 28% | no |
+| breakouts, longs + shorts | 31 | +698% | +59% | 40% | yes, 2026-04-18 |
 | pullbacks only, 0.5 ATR dip | 16 | -26% | +0% | 41% | yes, 2023-10-11 |
 | pullbacks only, 1 ATR dip | 24 | +36% | +13% | 41% | yes, 2026-01-19 |
 | pullbacks only, 2 ATR dip | 7 | -22% | +0% | 40% | yes, 2023-10-11 |
