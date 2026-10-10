@@ -229,6 +229,22 @@ def test_trigger_outlook_matches_the_future_breakout_level():
     assert outlook[0]["ts"] == bars[i].ts + 2 * H4 and outlook[0]["level"] == g.don_hi[i + 1]
 
 
+def test_short_outlook_matches_the_future_breakdown_level():
+    from desk.board import trigger_outlook
+
+    bars, funding = series(seed=5, n=400)
+    i, n = 350, P.strategy.breakout_bars
+    f = ind.compute(bars[: i + 1], funding, P)
+    outlook = trigger_outlook(f, i, n, limit=n, short=True)
+    high = max(b.high for b in bars[: i + 1])              # future bars never make a new low
+    future = [Bar(bars[i].ts + k * H4, high, high, high, high) for k in range(1, n + 1)]
+    g = ind.compute(bars[: i + 1] + future, funding, P)
+    for step in outlook:
+        j = (step["ts"] - bars[0].ts) // H4 - 1
+        assert g.don_lo[j] == step["level"]
+    assert [s["level"] for s in outlook] == sorted(s["level"] for s in outlook)   # only ever steps up
+
+
 # ---------------------------------------------------------------- paper ledger
 
 class FakeFeed:
@@ -250,12 +266,14 @@ class FakeFeed:
         return MarketContext(mid=self.all_bars[self.upto - 1].close, spread_bps=1.0, depth_usd=1e7)
 
 
-def test_paper_ledger_stepping_matches_the_backtest(tmp_path, monkeypatch):
+@pytest.mark.parametrize("shorts", [False, True])
+def test_paper_ledger_stepping_matches_the_backtest(tmp_path, monkeypatch, shorts):
     """Running step() every bar (or in catch-up batches) must equal one backtest over the same bars."""
     monkeypatch.setattr(paper, "LOOKBACK_BARS", 10 ** 6)   # synthetic bars are from 2020; fetch them all
-    bars, funding = series(seed=3, drift=0.002, n=700)
+    bars, funding = series(seed=3, drift=-0.002 if shorts else 0.002, n=700)
     start = 300
-    p = P.with_(hard={"max_data_age_bars": 1e9})
+    p = P.with_(hard={"max_data_age_bars": 1e9},
+                strategy={"allow_shorts": True, "short_mode": "breakdown"} if shorts else {})
     feed = FakeFeed(bars, funding, start)
     clock = lambda: bars[feed.upto].ts + H4 // 2 if feed.upto < len(bars) else bars[-1].ts + 2 * H4
     paper.step(p, tmp_path, feed=feed, log=lambda *a: None, now_ms=clock())
@@ -279,6 +297,10 @@ def test_paper_ledger_stepping_matches_the_backtest(tmp_path, monkeypatch):
         ref.on_bar_close(f, i, now_ms=bar.ts + f.bar_ms)
     assert len(led["broker"]["trades"]) == len(ref_broker.trades) > 0
     assert led["broker"]["cash"] == pytest.approx(ref_broker.cash)
+    sides = {t.side.value for t in ref_broker.trades}
+    assert sides == ({"short"} if shorts else {"long"})
+    said = " ".join(e["text"] for e in led["desk"]["events"])
+    assert ("SHORTED" in said) == shorts and ("BOUGHT" in said) != shorts
     assert json.loads((tmp_path / "board.json").read_text())["goal"]["target"] == p.sizing.goal_equity
 
 
@@ -293,6 +315,8 @@ def test_each_coin_gets_its_own_symbol_and_risk():
     assert btc.sizing.risk_per_trade == DEFAULT.sizing.risk_per_trade
     assert eth.sizing.risk_per_trade == sol.sizing.risk_per_trade == 0.02    # 5% hit the drawdown halt in backtests
     assert all(q.sizing.starting_equity == 50 for q in (btc, eth, sol))
+    assert eth.strategy.allow_shorts and eth.strategy.short_mode == "breakdown"   # the user's paper experiment
+    assert not btc.strategy.allow_shorts and not sol.strategy.allow_shorts
     assert (report_name("BTC"), report_name("eth")) == ("backtest", "backtest-ETH")
 
 

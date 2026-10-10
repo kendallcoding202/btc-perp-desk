@@ -148,6 +148,7 @@ body { padding: 10px; }
 .outlook:empty { display: none; }
 .outlook { padding: 8px 14px 0; }
 .ol-head { font-family: var(--pixel); font-size: 10px; color: var(--muted); letter-spacing: .06em; margin-bottom: 5px; }
+.ol-exp { font-family: var(--pixel); font-size: 10px; color: var(--orange); letter-spacing: .06em; margin-bottom: 6px; }
 .ol-rows { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 4px; }
 .ol-rows div { flex: 0 0 auto; background: var(--panel-2); border: 1px solid var(--line); border-radius: 3px; padding: 4px 8px; display: grid; gap: 1px; }
 .ol-rows div.now { border-color: var(--green); }

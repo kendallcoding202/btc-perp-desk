@@ -73,12 +73,14 @@ def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=
     def note_fills(n_trades_before: int, had_position: bool, ts: int) -> None:
         """Say what FILLS and RISK just did, so the board and phone notifications show it right away."""
         for t in broker.trades[n_trades_before:]:
+            verb = "SOLD" if t.side.value == "long" else "COVERED SHORT"
             desk.say(ts, "risk" if t.reason in ("stop", "take_profit") else "fills",
-                     f"SOLD {t.qty:.5f} {p.market.symbol} @ ${t.exit_price:,.2f} ({t.reason.replace('_', ' ')}) · "
+                     f"{verb} {t.qty:.5f} {p.market.symbol} @ ${t.exit_price:,.2f} ({t.reason.replace('_', ' ')}) · "
                      f"trade {t.net_pnl:+,.2f} · equity ${broker.cash:,.2f}")
         if broker.position is not None and (not had_position or len(broker.trades) > n_trades_before):
             pos = broker.position
-            desk.say(ts, "fills", f"BOUGHT {pos.qty:.5f} {p.market.symbol} @ ${pos.entry_price:,.2f} · stop ${pos.stop:,.2f}")
+            verb = "BOUGHT" if pos.side.value == "long" else "SHORTED"
+            desk.say(ts, "fills", f"{verb} {pos.qty:.5f} {p.market.symbol} @ ${pos.entry_price:,.2f} · stop ${pos.stop:,.2f}")
 
     processed = 0
     if not meta["last_bar_ts"]:

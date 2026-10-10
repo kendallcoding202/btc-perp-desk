@@ -164,8 +164,16 @@ COINS = ("BTC", "ETH", "SOL")
 COIN_OVERRIDES: dict[str, dict] = {
     # ETH and SOL swing harder than BTC: at BTC's 5% risk both hit the 40% drawdown halt in the
     # 2020-26 backtest (ETH in 2024, SOL in 2021). At 2%: ETH +65% (26% worst drop), SOL +40% (17%).
-    "ETH": {"sizing": {"risk_per_trade": 0.02}},
+    # ETH also shorts breakdowns (a close below the 60-bar low while the 100-EMA is under the 400-EMA).
+    # PAPER EXPERIMENT, switched on by the user: it missed the pre-set bar (short PF >= 1.15 in 2020-23
+    # and in 2024+; it made 1.34 / 1.10) but was the only short design that made money in both periods.
+    "ETH": {"sizing": {"risk_per_trade": 0.02}, "strategy": {"allow_shorts": True, "short_mode": "breakdown"}},
     "SOL": {"sizing": {"risk_per_trade": 0.02}},
+}
+
+# Shown on the board so an experiment never passes for a validated setting.
+EXPERIMENTS: dict[str, str] = {
+    "ETH": "breakdown shorts on: paper experiment, missed the pre-set bar",
 }
 
 

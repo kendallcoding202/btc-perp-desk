@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 
 from . import indicators as ind
 from .models import Verdict
+from .thresholds import EXPERIMENTS
 
 AGENTS = [
     ("chief", "CHIEF", "never takes a position"),
@@ -70,19 +71,21 @@ def goal(equity: float, start: float, target: float, cagr: float | None, elapsed
             "realised_cagr": realised, "years_at_realised_rate": years(realised)}
 
 
-def trigger_outlook(f: ind.Features, i: int, n: int, limit: int = 10) -> list[dict]:
+def trigger_outlook(f: ind.Features, i: int, n: int, limit: int = 10, short: bool = False) -> list[dict]:
     """When the breakout line steps down if price makes no new high: old highs age out of the n-bar window.
+    With short=True, the same for the breakdown line: it steps up as old lows age out.
 
     The decision on bar j compares its close with max(high of bars j-n .. j-1), so the decision k bars
     after bar i (closing at bars[i].ts + (k+1) bars) uses the already-known highs i+k-n .. i.
     """
-    highs = [b.high for b in f.bars]
+    xs = [b.low for b in f.bars] if short else [b.high for b in f.bars]
+    pick = min if short else max
     out, prev = [], None
     for k in range(1, n + 1):
         lo = i + k - n
         if lo < 0:
             continue
-        level = max(highs[lo:i + 1])
+        level = pick(xs[lo:i + 1])
         if level != prev:
             out.append({"ts": f.bars[i].ts + (k + 1) * f.bar_ms, "level": level})
             prev = level
@@ -94,6 +97,7 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
           elapsed_days: float | None = None) -> dict:
     p, broker, dec = desk.p, desk.broker, desk.last_decision
     coin = p.market.symbol
+    shorts = p.strategy.allow_shorts and p.strategy.short_mode == "breakdown"
     bars = f.bars
     bar = bars[i]
     price = ctx.mid if ctx and ctx.mid else bar.close
@@ -256,8 +260,9 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
     return {
         "updated": now_ms,
         "header": {
-            "title": f"{coin} PERP DESK", "tagline": "SCAN PICKS · RISK SIZES · FILLS TRADES", "coin": coin,
-            "risk_per_trade": p.sizing.risk_per_trade,
+            "title": f"{coin} PERP DESK", "coin": coin, "risk_per_trade": p.sizing.risk_per_trade,
+            "tagline": "SCAN PICKS · RISK SIZES · FILLS TRADES" + (" · LONG + SHORT" if p.strategy.allow_shorts else ""),
+            "shorts": p.strategy.allow_shorts, "experiment": EXPERIMENTS.get(coin),
             "mode": mode.upper(), "venue": p.market.venue, "interval": p.market.interval,
             "day": day_n, "date": now.strftime("%b %d").upper(), "time": now.strftime("%H:%M"),
         },
@@ -287,8 +292,9 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
                 "spread_bps": ctx.spread_bps if ctx else None, "depth_usd": ctx.depth_usd if ctx else None,
             },
             "gates": [g.as_dict() for g in dec.gates] if dec else [],
-            "outlook": trigger_outlook(f, i, p.strategy.breakout_bars) if (pos is None and dec is not None
-                                                                           and dec.direction.sign > 0) else [],
+            "outlook": trigger_outlook(f, i, p.strategy.breakout_bars, short=dec.direction.sign < 0)
+            if (pos is None and dec is not None and (dec.direction.sign > 0 or shorts)) else [],
+            "outlook_side": "short" if dec is not None and dec.direction.sign < 0 else "long",
             "scanned": i + 1,
             "direction": dec.direction.value if dec else None,
         },

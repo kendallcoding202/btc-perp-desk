@@ -141,7 +141,7 @@ def _notify(state: dict) -> None:
     t, coin = state["ticker"], state["header"].get("coin", "BTC")
     body = "\n".join(f"{e['agent'].upper()}: {e['text']}" for e in events)
     body += f"\n\n{coin} account ${t['bank']:,.2f} ({t['pnl_pct']:+.2%}) · {t['position']} · {coin} ${t['price']:,.2f}"
-    trade = any(w in body for w in ("BOUGHT", "SOLD", "HALT", "daily"))
+    trade = any(w in body for w in ("BOUGHT", "SOLD", "SHORTED", "COVERED", "HALT", "daily"))
     req = urllib.request.Request(f"https://ntfy.sh/{topic}", data=body.encode(), method="POST", headers={
         "Title": f"{coin} desk: " + ("TRADE" if trade else "update"), "Priority": "high" if trade else "default",
         "Tags": "chart_with_upwards_trend" if trade else "robot"})
@@ -192,7 +192,8 @@ def cmd_step(args) -> int:
               f"{t['record']} · {g['progress']:.1%} of the way to ${g['target']:,.0f}")
         summary.append({"coin": coin, "bank": t["bank"], "start": g["start"], "pnl": t["pnl"], "pnl_pct": t["pnl_pct"],
                         "position": t["position"], "record": t["record"], "price": t["price"],
-                        "risk_per_trade": p.sizing.risk_per_trade, "updated": s["updated"]})
+                        "risk_per_trade": p.sizing.risk_per_trade, "shorts": p.strategy.allow_shorts,
+                        "updated": s["updated"]})
     root.mkdir(parents=True, exist_ok=True)
     (root / "index.json").write_text(json.dumps({"updated": int(time.time() * 1000), "coins": summary}))
     if os.environ.get("GITHUB_OUTPUT"):   # tells the workflow whether the ledger needs saving

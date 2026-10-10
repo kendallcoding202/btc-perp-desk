@@ -336,9 +336,13 @@
     $("stats").innerHTML = cells.map(([k, v, cls]) => `<div class="${cls || ""}"><span>${k}</span><b>${esc(v)}</b></div>`).join("");
     const ol = s.analysis.outlook || [];
     const day = (ms) => new Date(ms).toLocaleString("en-US", { weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "UTC" });
-    $("outlook").innerHTML = ol.length ? `<div class="ol-head">BUY LINE · steps down as old highs age out (if ${esc(s.header.coin || "BTC")} makes no new high)</div>` +
+    const olHead = s.analysis.outlook_side === "short"
+      ? `SHORT LINE · a 2h close below it shorts; steps up as old lows age out (if ${esc(s.header.coin || "BTC")} makes no new low)`
+      : `BUY LINE · steps down as old highs age out (if ${esc(s.header.coin || "BTC")} makes no new high)`;
+    $("outlook").innerHTML = (s.header.experiment ? `<div class="ol-exp">EXPERIMENT · ${esc(s.header.experiment)}</div>` : "") +
+      (ol.length ? `<div class="ol-head">${olHead}</div>` +
       `<div class="ol-rows">` + ol.map((r, k) => `<div class="${k === 0 ? "now" : ""}"><span>${k === 0 ? "next close" : day(r.ts) + " UTC"}</span>` +
-      `<b>${px(r.level)}</b><i>${pct(r.level / st.price - 1, 1)}</i></div>`).join("") + `</div>` : "";
+      `<b>${px(r.level)}</b><i>${pct(r.level / st.price - 1, 1)}</i></div>`).join("") + `</div>` : "");
     $("gates").innerHTML = s.analysis.gates.map((g) =>
       `<li><span>${esc(g.name.replace(/_/g, " "))} <i class="na">${esc(GATE_FMT(g))}</i></span><span class="v ${g.verdict}">${g.verdict}</span></li>`).join("");
     $("events").innerHTML = s.events.slice().reverse().map((e) =>
@@ -424,7 +428,9 @@
       c[4] = mid; c[2] = Math.max(c[2], mid); c[3] = Math.min(c[3], mid);
       ch.candles.push(c);
       const line = (s.analysis.outlook && s.analysis.outlook[0]) ? s.analysis.outlook[0].level : null;
-      ch.ema_fast.push(null); ch.ema_slow.push(null); ch.don_lo.push(null); ch.don_hi.push(line);
+      const short = s.analysis.outlook_side === "short";
+      ch.ema_fast.push(null); ch.ema_slow.push(null);
+      ch.don_lo.push(short ? line : null); ch.don_hi.push(short ? null : line);
     }
     return s;
   }
@@ -441,7 +447,7 @@
       start += c.start; bank += b;
       return `<button class="coin ${c.coin === coin ? "on" : ""}" data-coin="${esc(c.coin)}" aria-pressed="${c.coin === coin}">` +
         `<span class="c-name">${esc(c.coin)}<i>${lp ? px(lp) : px(c.price)}</i></span><span class="c-bank">${usd(b)}</span>` +
-        `<span class="c-sub">${pct(b / c.start - 1)} · ${esc(c.position)} · ${esc(c.record)} · risk ${(c.risk_per_trade * 100).toFixed(0)}%</span></button>`;
+        `<span class="c-sub">${pct(b / c.start - 1)} · ${esc(c.position)} · ${esc(c.record)} · risk ${(c.risk_per_trade * 100).toFixed(0)}%${c.shorts ? " · +shorts" : ""}</span></button>`;
     });
     cards.push(`<div class="coin total"><span class="c-name">ALL</span><span class="c-bank">${usd(bank)}</span>` +
       `<span class="c-sub">${pct(start ? bank / start - 1 : 0)} on ${usd(start, 0)} paper</span></div>`);

@@ -38,11 +38,11 @@ The honest read:
 
 ### ETH and SOL: same desk, smaller bets
 
-ETH and SOL run the exact BTC strategy (nothing was re-tuned for them), at **2% risk per trade instead of 5%**. Reports: [`reports/backtest-ETH.md`](reports/backtest-ETH.md), [`reports/backtest-SOL.md`](reports/backtest-SOL.md).
+ETH and SOL run the exact BTC strategy (nothing was re-tuned for them), at **2% risk per trade instead of 5%**. ETH also shorts, as a paper experiment (below). Reports: [`reports/backtest-ETH.md`](reports/backtest-ETH.md), [`reports/backtest-SOL.md`](reports/backtest-SOL.md).
 
 | | ETH (2020-01 → 2026-09) | SOL (2020-09 → 2026-09) |
 |---|---|---|
-| Total return at 2% risk | +65% ($50 → $83) | +40% ($50 → $70) |
+| Total return at 2% risk, longs only | +65% ($50 → $83) | +40% ($50 → $70) |
 | Worst drop from a peak | 26% | 17% |
 | First 60% of the period / last 40% | +32% / +25% | +22% / +15% |
 | Buy & hold, same period | +1,956% (worst drop 81%) | +3,407% (worst drop 97%) |
@@ -55,6 +55,7 @@ Why 2%: at the BTC account's 5% risk, both hit the 40% drawdown halt in the back
 - **Longs only.** Three short designs were tested on top of the longs: breakdowns, failed rallies, and bull traps (13 versions in all). The shorts' winnings never clearly beat their losses (0.64–1.12× in 2020–23, at most 1.00× after). Every version made the total worse and hit the 40% drawdown halt. Shorts lost even in 2022, when BTC fell 64%. The setups stay in the code (`allow_shorts`, `short_mode`) but off.
 - **No shorts on ETH or SOL either.** The same 7 short versions were run on both at 2% risk. The pass rule was set first: the shorts must win at least $1.15 per $1 lost in both 2020–23 and 2024+. None passed.
   - **ETH breakdown shorts came closest.** They made money in both periods ($1.34, then $1.10 per $1 lost), and adding them lifted the backtest from +65% to +104% with a smaller worst drop (19% vs 26%). The edge since 2024 is thin, though: +$3.53 over almost 3 years.
+  - **ETH shorts are on anyway, as a paper experiment you chose.** When the 100-candle EMA is below the 400-candle EMA, ETH shorts a 2h close below the 60-candle low: 3 ATR stop, trailing, covered when the trend flips back up. That adds about 15 trades a year. The board marks it as an experiment and shows a SHORT LINE while ETH is in a downtrend; alerts say SHORTED / COVERED SHORT. [`reports/backtest-ETH.md`](reports/backtest-ETH.md) now includes the shorts: +104% total, 19% worst drop, 2024 −7%. It's the only setting here that was switched on after missing its bar, so judge it on its paper record.
   - **SOL shorts worked in 2020–23 and then stopped.** Every version lost money from 2024 on ($0.63–0.89 per $1 lost).
 - **No fixed take-profit.** The trailing stop already sells winners. Adding a profit target cut total return from +1,475% to between +213% and +898%, depending on the level.
 - **Jev is advisory.** All 118 historical entries were replayed through Jev (with dates and prices stripped out). Its answers' correlation with trade outcome was about zero (−0.05 to +0.06). Its "follow-through" answer did split winners from losers somewhat (−$81 below its median, +$819 above), which is worth watching on paper, but it's too weak to give it a veto yet.
