@@ -3,12 +3,14 @@ name: paper desk
 # The $50 paper experiment. Every 15 minutes: load the ledger from the `paper-ledger`
 # branch, run one desk step on live Hyperliquid prices, save the ledger if anything
 # happened, and publish the board to GitHub Pages.
-# (GitHub may start scheduled runs a few minutes late; `step` catches up on every
-# bar it missed, so a late or skipped run never loses or double-counts a bar.)
+# GitHub delays (and under load drops) scheduled runs, worst at the top of the hour,
+# so the schedule avoids :00 and runs at :04/:19/:34/:49 — each 2h bar closes on an
+# even hour and is picked up 4 minutes later. `step` catches up on every bar it
+# missed, so a late or skipped run never loses or double-counts a bar.
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "4,19,34,49 * * * *"
   workflow_dispatch:
 
 permissions:
