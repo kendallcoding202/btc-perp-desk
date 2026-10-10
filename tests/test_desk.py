@@ -212,6 +212,23 @@ def test_counter_trend_short_is_not_closed_by_the_trend_flip_exit():
     assert desk._manage(f, len(bars) - 1) == []
 
 
+def test_trigger_outlook_matches_the_future_breakout_level():
+    from desk.board import trigger_outlook
+
+    bars, funding = series(seed=5, n=400)
+    i, n = 350, P.strategy.breakout_bars
+    f = ind.compute(bars[: i + 1], funding, P)
+    outlook = trigger_outlook(f, i, n, limit=n)
+    # extend with bars that never make a new high, then check every step against the real don_hi
+    low = min(b.low for b in bars[: i + 1])
+    future = [Bar(bars[i].ts + k * H4, low, low, low, low) for k in range(1, n + 1)]
+    g = ind.compute(bars[: i + 1] + future, funding, P)
+    for step in outlook:
+        j = (step["ts"] - bars[0].ts) // H4 - 1           # the bar whose close makes that decision
+        assert g.don_hi[j] == step["level"]
+    assert outlook[0]["ts"] == bars[i].ts + 2 * H4 and outlook[0]["level"] == g.don_hi[i + 1]
+
+
 # ---------------------------------------------------------------- paper ledger
 
 class FakeFeed:

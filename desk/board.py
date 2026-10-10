@@ -65,6 +65,25 @@ def goal(equity: float, start: float, target: float, cagr: float | None, elapsed
             "realised_cagr": realised, "years_at_realised_rate": years(realised)}
 
 
+def trigger_outlook(f: ind.Features, i: int, n: int, limit: int = 10) -> list[dict]:
+    """When the breakout line steps down if BTC makes no new high: old highs age out of the n-bar window.
+
+    The decision on bar j compares its close with max(high of bars j-n .. j-1), so the decision k bars
+    after bar i (closing at bars[i].ts + (k+1) bars) uses the already-known highs i+k-n .. i.
+    """
+    highs = [b.high for b in f.bars]
+    out, prev = [], None
+    for k in range(1, n + 1):
+        lo = i + k - n
+        if lo < 0:
+            continue
+        level = max(highs[lo:i + 1])
+        if level != prev:
+            out.append({"ts": f.bars[i].ts + (k + 1) * f.bar_ms, "level": level})
+            prev = level
+    return out[:limit]
+
+
 def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict | None = None,
           jev_client=None, now_ms: int | None = None, candles: int = 140, goal_cagr: float | None = None,
           elapsed_days: float | None = None) -> dict:
@@ -259,6 +278,8 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
                 "spread_bps": ctx.spread_bps if ctx else None, "depth_usd": ctx.depth_usd if ctx else None,
             },
             "gates": [g.as_dict() for g in dec.gates] if dec else [],
+            "outlook": trigger_outlook(f, i, p.strategy.breakout_bars) if (pos is None and dec is not None
+                                                                           and dec.direction.sign > 0) else [],
             "scanned": i + 1,
             "direction": dec.direction.value if dec else None,
         },

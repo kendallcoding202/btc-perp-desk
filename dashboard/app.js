@@ -330,6 +330,11 @@
       ["Open interest", usdShort(st.open_interest_usd)], ["Spread", st.spread_bps == null ? "—" : `${num(st.spread_bps, 2)} bps`],
     ];
     $("stats").innerHTML = cells.map(([k, v, cls]) => `<div class="${cls || ""}"><span>${k}</span><b>${esc(v)}</b></div>`).join("");
+    const ol = s.analysis.outlook || [];
+    const day = (ms) => new Date(ms).toLocaleString("en-US", { weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "UTC" });
+    $("outlook").innerHTML = ol.length ? `<div class="ol-head">BUY LINE · steps down as old highs age out (if BTC makes no new high)</div>` +
+      `<div class="ol-rows">` + ol.map((r, k) => `<div class="${k === 0 ? "now" : ""}"><span>${k === 0 ? "next close" : day(r.ts) + " UTC"}</span>` +
+      `<b>${usd(r.level, 0)}</b><i>${pct(r.level / st.price - 1, 1)}</i></div>`).join("") + `</div>` : "";
     $("gates").innerHTML = s.analysis.gates.map((g) =>
       `<li><span>${esc(g.name.replace(/_/g, " "))} <i class="na">${esc(GATE_FMT(g))}</i></span><span class="v ${g.verdict}">${g.verdict}</span></li>`).join("");
     $("events").innerHTML = s.events.slice().reverse().map((e) =>
