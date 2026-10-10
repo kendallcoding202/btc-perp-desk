@@ -16,7 +16,7 @@ from dataclasses import dataclass, field, fields, replace
 
 @dataclass(frozen=True)
 class Market:
-    symbol: str = "BTC"                 # the only thing this desk trades
+    symbol: str = "BTC"                 # Hyperliquid coin name; see COINS below for the paper accounts
     interval: str = "2h"                # bar size the desk thinks in. 2h beat 4h on 2020-23 (+157% vs +104%
                                         # at 2% risk) and held up out-of-sample; 1h was worse (fees, noise)
     venue: str = "hyperliquid"          # where live prices / orders go (see brokers/)
@@ -158,6 +158,26 @@ class Params:
 
 
 DEFAULT = Params()
+
+# The paper accounts the desk runs, $50 each. Same strategy for every coin; only what's listed here differs.
+COINS = ("BTC", "ETH", "SOL")
+COIN_OVERRIDES: dict[str, dict] = {
+    # ETH and SOL swing harder than BTC: at BTC's 5% risk both hit the 40% drawdown halt in the
+    # 2020-26 backtest (ETH in 2024, SOL in 2021). At 2%: ETH +65% (26% worst drop), SOL +40% (17%).
+    "ETH": {"sizing": {"risk_per_trade": 0.02}},
+    "SOL": {"sizing": {"risk_per_trade": 0.02}},
+}
+
+
+def params_for(coin: str, base: Params = DEFAULT) -> Params:
+    coin = coin.upper()
+    p = base.with_(market={"symbol": coin})
+    return p.with_(**COIN_OVERRIDES[coin]) if coin in COIN_OVERRIDES else p
+
+
+def report_name(coin: str) -> str:
+    """reports/<name>.md — BTC keeps the original `backtest` name."""
+    return "backtest" if coin.upper() == "BTC" else f"backtest-{coin.upper()}"
 
 INTERVAL_SECONDS = {
     "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400, "8h": 28800, "12h": 43200, "1d": 86400,

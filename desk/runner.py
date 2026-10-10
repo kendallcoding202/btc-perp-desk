@@ -94,7 +94,7 @@ def run(p: Params, mode: str, *, state_dir: str = "state", poll_s: float = 15.0,
     if rep.exists():
         goal_cagr = json.loads(rep.read_text()).get("full", {}).get("cagr")
     log(f"{mode}: {len(bars)} {p.market.interval} bars, {len(funding)} funding prints, "
-        f"equity ${broker.equity(ctx.mid):,.2f}, BTC {ctx.mid:,.1f}")
+        f"equity ${broker.equity(ctx.mid):,.2f}, {p.market.symbol} {ctx.mid:,.1f}")
 
     while True:
         try:

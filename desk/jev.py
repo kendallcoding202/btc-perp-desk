@@ -57,7 +57,7 @@ def describe(snapshot: dict) -> str:
     d = snapshot
     side = "LONG (upside breakout)" if d["direction"] > 0 else "SHORT (downside breakout)"
     return (
-        f"BTC perpetual futures, {d['interval']} bars. Candidate entry: {side}.\n"
+        f"{d.get('coin', 'BTC')} perpetual futures, {d['interval']} bars. Candidate entry: {side}.\n"
         f"Close just broke the prior {d['breakout_bars']}-bar extreme by {d['breakout_atr']:.2f} ATR.\n"
         f"Move over last 3 bars: {d['ret_3']:+.2f}%. Over last 18 bars: {d['ret_18']:+.2f}%. "
         f"Over last 90 bars: {d['ret_90']:+.2f}%.\n"
@@ -157,7 +157,8 @@ def snapshot(features, i: int, side: Side, p: Params) -> dict:
     level = features.don_hi[i] if d > 0 else features.don_lo[i]
     window = [x for x in features.atr[max(0, i - 90):i + 1] if x]
     return {
-        "interval": p.market.interval, "direction": d, "breakout_bars": p.strategy.breakout_bars,
+        "coin": p.market.symbol, "interval": p.market.interval, "direction": d,
+        "breakout_bars": p.strategy.breakout_bars,
         "breakout_atr": (c - level) / a * d if level else 0.0,
         "ret_3": ret(3), "ret_18": ret(18), "ret_90": ret(90),
         "ema_fast": p.strategy.ema_fast, "ema_slow": p.strategy.ema_slow,

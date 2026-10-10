@@ -1,4 +1,5 @@
-// BTC Perp Desk board. Polls /api/state and draws it. No build step, no libraries.
+// Perp Desk board. Polls the desk's state (live server or static boards/*.json), pulls live prices straight
+// from Hyperliquid every few seconds, and draws it all. No build step, no libraries.
 (() => {
   "use strict";
   const $ = (id) => document.getElementById(id);
@@ -46,6 +47,8 @@
   // ---- formatting ---------------------------------------------------------
   const usd = (x, dp = 2) => x == null || isNaN(x) ? "—" : (x < 0 ? "-$" : "$") + Math.abs(x).toLocaleString("en-US", { minimumFractionDigits: dp, maximumFractionDigits: dp });
   const usdShort = (x) => x == null ? "—" : Math.abs(x) >= 1e9 ? `$${(x / 1e9).toFixed(2)}B` : Math.abs(x) >= 1e6 ? `$${(x / 1e6).toFixed(2)}M` : Math.abs(x) >= 1e3 ? `$${(x / 1e3).toFixed(1)}K` : usd(x, 2);
+  const px = (x) => x == null || isNaN(x) ? "—" : usd(x, Math.abs(x) >= 1000 ? 0 : 2);
+  const pxAxis = (x) => Math.abs(x) >= 1000 ? Math.round(x).toLocaleString("en-US") : Number(x).toFixed(2);
   const pct = (x, dp = 2) => x == null || isNaN(x) ? "—" : `${x >= 0 ? "+" : ""}${(x * 100).toFixed(dp)}%`;
   const num = (x, dp = 2) => x == null || isNaN(x) ? "—" : Number(x).toLocaleString("en-US", { minimumFractionDigits: dp, maximumFractionDigits: dp });
   const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -97,7 +100,7 @@
     for (let k = 0; k <= 4; k++) {
       const p = lo + (hi - lo) * k / 4, y = Y(p);
       line(g, [[0, y], [w - padR, y]], css("--line"), 1);
-      g.fillStyle = css("--dim"); g.fillText(Math.round(p).toLocaleString("en-US"), w - padR + 6, y + 3);
+      g.fillStyle = css("--dim"); g.fillText(pxAxis(p), w - padR + 6, y + 3);
     }
     const step = Math.max(1, Math.round(cs.length / 6));
     g.fillStyle = css("--dim");
@@ -122,7 +125,7 @@
 
     if (chart.stop) {
       line(g, [[0, Y(chart.stop)], [w - padR, Y(chart.stop)]], css("--orange"), 1.2, [6, 4]);
-      tag(g, w - padR, Y(chart.stop), `STOP ${Math.round(chart.stop).toLocaleString("en-US")}`, css("--orange"));
+      tag(g, w - padR, Y(chart.stop), `STOP ${pxAxis(chart.stop)}`, css("--orange"));
     }
     if (chart.entry) line(g, [[0, Y(chart.entry)], [w - padR, Y(chart.entry)]], "rgba(241,241,246,.6)", 1, [2, 3]);
 
@@ -139,7 +142,7 @@
       }
     }
     const last = cs[cs.length - 1][4];
-    tag(g, w - padR, Y(last), Math.round(last).toLocaleString("en-US"), css("--green"), true);
+    tag(g, w - padR, Y(last), pxAxis(last), css("--green"), true);
     lastGeom = { X, Y, cs, w, h, padR };
   }
 
@@ -271,11 +274,12 @@
   }
 
   function renderStage(s) {
-    const t = s.ticker, k = s.kills;
-    $("ticker").innerHTML = `‹ TRADES · BTC ${usd(t.price, 0)} · BANK ${usd(t.bank)} · ` +
+    const t = s.ticker, k = s.kills, coin = s.header.coin || "BTC";
+    const liveTag = live.at ? `<span class="live-dot" aria-hidden="true"></span>LIVE · ` : "";
+    $("ticker").innerHTML = `‹ ${liveTag}TRADES · ${esc(coin)} ${px(t.price)} · BANK ${usd(t.bank)} · ` +
       `<span class="hl">${esc(t.position)}${t.position_detail ? " " + esc(t.position_detail) : ""}</span>` +
       ` · ${esc(t.record)} · HOLD ${pct(t.hold_pct)} · P&amp;L ${usd(t.pnl)} (${pct(t.pnl_pct)}) · FEES ${usd(t.fees)} · FUNDING ${usd(t.funding)}`;
-    $("chart-title").textContent = `BTC-PERP · ${s.header.interval} · ${usd(t.price, 0)}`;
+    $("chart-title").textContent = `${coin}-PERP · ${s.header.interval} · ${px(t.price)}`;
     $("chart-sub").textContent = `24h ${pct(t.change_24h)} · ema.fast pink · ema.slow blue · channel dashed`;
     const chips = $("chips");
     chips.innerHTML = s.agents.map((a) => `<span class="chip ${a.state === "idle" ? "off" : ""}" title="${esc(a.name)}: ${esc(a.state)}"
@@ -325,16 +329,16 @@
     const st = s.analysis.stats;
     $("scanned").textContent = `${s.analysis.scanned.toLocaleString("en-US")} BARS SCANNED`;
     const cells = [
-      ["$BTC", "perp · " + s.header.venue, "sym"], ["Price", usd(st.price, 0)], ["24h", pct(st.change_24h)],
+      ["$" + (s.header.coin || "BTC"), "perp · " + s.header.venue, "sym"], ["Price", px(st.price)], ["24h", pct(st.change_24h)],
       ["ATR", `${num(st.atr_pct)}%`], ["Funding APR", `${num(st.funding_apr, 1)}%`],
       ["Open interest", usdShort(st.open_interest_usd)], ["Spread", st.spread_bps == null ? "—" : `${num(st.spread_bps, 2)} bps`],
     ];
     $("stats").innerHTML = cells.map(([k, v, cls]) => `<div class="${cls || ""}"><span>${k}</span><b>${esc(v)}</b></div>`).join("");
     const ol = s.analysis.outlook || [];
     const day = (ms) => new Date(ms).toLocaleString("en-US", { weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "UTC" });
-    $("outlook").innerHTML = ol.length ? `<div class="ol-head">BUY LINE · steps down as old highs age out (if BTC makes no new high)</div>` +
+    $("outlook").innerHTML = ol.length ? `<div class="ol-head">BUY LINE · steps down as old highs age out (if ${esc(s.header.coin || "BTC")} makes no new high)</div>` +
       `<div class="ol-rows">` + ol.map((r, k) => `<div class="${k === 0 ? "now" : ""}"><span>${k === 0 ? "next close" : day(r.ts) + " UTC"}</span>` +
-      `<b>${usd(r.level, 0)}</b><i>${pct(r.level / st.price - 1, 1)}</i></div>`).join("") + `</div>` : "";
+      `<b>${px(r.level)}</b><i>${pct(r.level / st.price - 1, 1)}</i></div>`).join("") + `</div>` : "";
     $("gates").innerHTML = s.analysis.gates.map((g) =>
       `<li><span>${esc(g.name.replace(/_/g, " "))} <i class="na">${esc(GATE_FMT(g))}</i></span><span class="v ${g.verdict}">${g.verdict}</span></li>`).join("");
     $("events").innerHTML = s.events.slice().reverse().map((e) =>
@@ -380,9 +384,76 @@
     tick();
   }));
 
-  // ---- main loop ---------------------------------------------------------------
-  let state = null;
+  // ---- coins, live prices, main loop ----------------------------------------------
+  const COINS = ["BTC", "ETH", "SOL"];
+  const HL = "https://api.hyperliquid.xyz/info";
+  const storeGet = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
+  const storeSet = (k, v) => { try { localStorage.setItem(k, v); } catch { /* private mode */ } };
+  let coin = (location.hash.slice(1) || storeGet("desk-coin") || "BTC").toUpperCase();
+  if (!COINS.includes(coin)) coin = "BTC";
+
+  let state = null, base = null, index = null;
+  const live = { mids: {}, at: 0, candle: null };   // filled from Hyperliquid by the viewer's own browser
+
+  async function hl(body) {
+    const res = await fetch(HL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    if (!res.ok) throw new Error(res.status);
+    return res.json();
+  }
+
+  // Overlay live prices on the last published snapshot: price, unrealised P&L, balance, forming candle.
+  function withLive(snap) {
+    if (!snap) return snap;
+    const s = JSON.parse(JSON.stringify(snap));
+    const mid = parseFloat(live.mids[s.header.coin || "BTC"]);
+    if (!mid) return s;
+    const t = s.ticker;
+    t.price = mid; s.analysis.stats.price = mid;
+    const p = t.pos;
+    const u = p ? (p.side === "long" ? 1 : -1) * p.qty * (mid - p.entry) : 0;
+    if (t.cash != null && t.cash + u > 0) {
+      t.bank = t.cash + u; t.hold_pct = p ? u / (p.qty * p.entry) : 0;
+      t.pnl = t.bank - s.goal.start; t.pnl_pct = t.bank / s.goal.start - 1;
+      const g = s.goal; g.equity = t.bank;
+      g.progress = Math.max(0, Math.min(1, Math.log(t.bank / g.start) / Math.log(g.target / g.start)));
+      g.multiple_left = g.target / t.bank;
+      if (s.equity && s.equity.length) s.equity.push([Date.now(), t.bank]);
+    }
+    const c = live.candle, ch = s.chart;
+    if (c && ch.candles.length && c[0] > ch.candles[ch.candles.length - 1][0]) {
+      c[4] = mid; c[2] = Math.max(c[2], mid); c[3] = Math.min(c[3], mid);
+      ch.candles.push(c);
+      const line = (s.analysis.outlook && s.analysis.outlook[0]) ? s.analysis.outlook[0].level : null;
+      ch.ema_fast.push(null); ch.ema_slow.push(null); ch.don_lo.push(null); ch.don_hi.push(line);
+    }
+    return s;
+  }
+
+  function renderCoins() {
+    const nav = $("coins");
+    if (!index || !index.coins) { nav.hidden = true; return; }
+    nav.hidden = false;
+    let start = 0, bank = 0;
+    const cards = index.coins.map((c) => {
+      if (c.error) return `<button class="coin" data-coin="${esc(c.coin)}"><span class="c-name">${esc(c.coin)}</span><span class="c-sub">error: ${esc(c.error)}</span></button>`;
+      const lp = parseFloat(live.mids[c.coin]);
+      const b = c.coin === (state && state.header.coin) && state.ticker.bank != null ? state.ticker.bank : c.bank;
+      start += c.start; bank += b;
+      return `<button class="coin ${c.coin === coin ? "on" : ""}" data-coin="${esc(c.coin)}" aria-pressed="${c.coin === coin}">` +
+        `<span class="c-name">${esc(c.coin)}<i>${lp ? px(lp) : px(c.price)}</i></span><span class="c-bank">${usd(b)}</span>` +
+        `<span class="c-sub">${pct(b / c.start - 1)} · ${esc(c.position)} · ${esc(c.record)} · risk ${(c.risk_per_trade * 100).toFixed(0)}%</span></button>`;
+    });
+    cards.push(`<div class="coin total"><span class="c-name">ALL</span><span class="c-bank">${usd(bank)}</span>` +
+      `<span class="c-sub">${pct(start ? bank / start - 1 : 0)} on ${usd(start, 0)} paper</span></div>`);
+    nav.innerHTML = cards.join("");
+    nav.querySelectorAll("[data-coin]").forEach((b) => b.addEventListener("click", () => {
+      coin = b.dataset.coin; storeSet("desk-coin", coin); history.replaceState(null, "", "#" + coin);
+      live.candle = null; src = `boards/${coin}.json`; tick(); pollCandle();
+    }));
+  }
+
   function render() {
+    state = withLive(base);
     if (!state) return;
     const s = state, hdr = s.header;
     $("title").textContent = hdr.title;
@@ -390,41 +461,68 @@
     $("mode").textContent = hdr.mode; $("mode").className = `mode ${hdr.mode.toLowerCase()}`;
     $("daydate").textContent = `DAY ${hdr.day} · ${hdr.date}`;
     $("time").textContent = hdr.time;
+    renderCoins();
     renderAgents(s.agents); renderStage(s); renderBubbles(s.agents);
     drawChart(s.chart); drawWeb();
     renderBalance(s); drawEquity(s.equity); drawPnlBars(s.pnl_bars);
     renderAnalysis(s); renderThresholds(s.thresholds); renderKills(s.kills);
-    $("foot").textContent = `updated ${new Date(s.updated).toISOString().replace("T", " ").slice(0, 19)} UTC · ${hdr.venue} · not financial advice; the desk can and will lose money`;
+    const age = Math.round((Date.now() - s.updated) / 60000);
+    $("foot").textContent = `desk updated ${new Date(s.updated).toISOString().replace("T", " ").slice(0, 16)} UTC (${age} min ago)` +
+      (live.at ? ` · live price ${Math.round((Date.now() - live.at) / 1000)}s ago from Hyperliquid` : "") +
+      ` · not financial advice; the desk can and will lose money`;
+    if (staticMode) {
+      document.querySelectorAll("[data-kill]").forEach((b) => { b.disabled = true; });
+      $("kill-hint").textContent = "read-only board: flip switches in ledger/<COIN>/kills.json on GitHub";
+    }
   }
 
-  // Live server: /api/state every 2s. Static hosting (e.g. GitHub Pages): board.json every 60s.
+  // Live server: /api/state every 2s. Static hosting (GitHub Pages): boards/<COIN>.json every 60s.
   const params = new URLSearchParams(location.search);
   let src = params.get("state") || "api/state";
   let staticMode = !!params.get("state");
   async function tick() {
     try {
-      if (staticMode && src !== "api/state") src = src.split("?")[0] + `?t=${Date.now()}`;
-      let res = await fetch(src, { cache: "no-store" });
+      const url = staticMode && src !== "api/state" ? src.split("?")[0] + `?t=${Date.now()}` : src;
+      let res = await fetch(url, { cache: "no-store" });
       if (!res.ok && src === "api/state" && res.status !== 503) {
-        src = "board.json"; staticMode = true;
-        res = await fetch(src, { cache: "no-store" });
+        staticMode = true; src = `boards/${coin}.json`;
+        res = await fetch(`${src}?t=${Date.now()}`, { cache: "no-store" });
+      }
+      if (!res.ok && src === "boards/BTC.json") {            // an older deploy with a single BTC board
+        src = "board.json"; res = await fetch(`${src}?t=${Date.now()}`, { cache: "no-store" });
       }
       if (!res.ok) throw new Error(res.status);
-      state = await res.json();
-      render();
+      base = await res.json();
       if (staticMode) {
-        const age = Math.round((Date.now() - state.updated) / 60000);
-        $("foot").textContent += ` · snapshot ${age} min old, refreshes every minute`;
-        document.querySelectorAll("[data-kill]").forEach((b) => { b.disabled = true; });
-        $("kill-hint").textContent = "read-only board: flip switches in ledger/kills.json on GitHub";
+        const ir = await fetch(`boards/index.json?t=${Date.now()}`, { cache: "no-store" }).catch(() => null);
+        index = ir && ir.ok ? await ir.json() : null;
       }
+      render();
     } catch (err) {
       $("foot").textContent = `can't reach the desk (${err.message}). is \`python -m desk paper\` running?`;
     }
   }
+
+  async function pollMids() {
+    try { live.mids = await hl({ type: "allMids" }); live.at = Date.now(); render(); } catch { /* keep the last price */ }
+  }
+  async function pollCandle() {
+    const c = (base && base.header.coin) || coin, iv = (base && base.header.interval) || "2h";
+    const ms = (base && base.chart.bar_ms) || 7200000, now = Date.now();
+    try {
+      const rows = await hl({ type: "candleSnapshot", req: { coin: c, interval: iv, startTime: now - 2 * ms, endTime: now } });
+      const f = rows.find((r) => r.T >= now);
+      live.candle = f ? [f.t, +f.o, +f.h, +f.l, +f.c] : null;
+      render();
+    } catch { /* the chart just shows closed candles */ }
+  }
+
   window.addEventListener("resize", render);
   (async function loop() {
     await tick();
     setTimeout(loop, staticMode ? 60000 : 2000);
   })();
+  pollMids(); pollCandle();
+  setInterval(pollMids, 5000);
+  setInterval(pollCandle, 30000);
 })();

@@ -49,6 +49,21 @@ body { padding: 10px; }
 .mode.live { color: var(--red); }
 .mode.replay { color: var(--blue); }
 
+/* coin tabs: one $50 paper account each, plus the total */
+.coins { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; padding: 0; overflow: hidden; background: var(--line); }
+.coins[hidden] { display: none; }
+.coin { background: var(--panel); border: 0; color: var(--text); text-align: left; padding: 9px 12px; cursor: pointer; display: grid; gap: 2px; font-family: var(--mono); min-width: 0; }
+.coin:focus-visible { outline: 2px solid var(--pink); outline-offset: -2px; }
+.coin.on { background: var(--panel-2); box-shadow: inset 0 -3px 0 var(--pink); }
+.coin.total { cursor: default; }
+.coin .c-name { font-family: var(--pixel); font-size: 13px; letter-spacing: .08em; display: flex; justify-content: space-between; gap: 6px; }
+.coin .c-name i { font-style: normal; font-family: var(--mono); font-size: 10px; color: var(--muted); letter-spacing: 0; }
+.coin .c-bank { font-weight: 700; font-size: 16px; }
+.coin .c-sub { font-size: 10px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.live-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--green); margin-right: 5px; vertical-align: middle; animation: pulse 1.6s infinite; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+@media (prefers-reduced-motion: reduce) { .live-dot { animation: none; } }
+
 /* agent cards */
 .agents { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
 .card {
@@ -182,7 +197,8 @@ body { padding: 10px; }
   body { padding: 4px; }
   .frame { padding: 6px; gap: 6px; }
   /* on a phone, what you check first goes first: money, position, chart, then the desk */
-  .header { order: 1; } .balance { order: 2; } .stage { order: 3; } .agents { order: 4; }
+  .header { order: 1; } .coins { order: 1; } .balance { order: 2; }
+  .coins { grid-template-columns: repeat(2, minmax(0, 1fr)); } .stage { order: 3; } .agents { order: 4; }
   .bottom { order: 5; } .foot { order: 6; }
   .clock { width: 100%; justify-content: space-between; }
   .ticker { white-space: normal; line-height: 1.7; }

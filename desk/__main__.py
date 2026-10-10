@@ -1,9 +1,9 @@
 """python -m desk <command>
 
-    backtest     replay history with every cost charged, write reports/backtest.md
+    backtest     replay history with every cost charged, write reports/backtest[-COIN].md  (--coin BTC|ETH|SOL)
     replay       watch the desk trade history on the board (http://127.0.0.1:8787)
-    paper        the $50 paper experiment on live Hyperliquid prices, with the board (step 1)
-    step         process any newly closed bars in the paper ledger once, then exit (for cron / GitHub Actions)
+    paper        one coin's $50 paper account on live Hyperliquid prices, with a live local board
+    step         process newly closed bars for every paper account (BTC, ETH, SOL) once, then exit (cron / Actions)
     live         trade real money — refuses unless the backtest AND paper record pass
     reset-halt   clear a drawdown halt after you've looked at what happened
     jev-test     check that JEV_API_KEY works
@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 
 from . import backtest as bt
-from .thresholds import DEFAULT, Params
+from .thresholds import COINS, DEFAULT, Params, params_for, report_name
 
 
 def _load_env(path: str = ".env") -> None:
@@ -34,8 +34,8 @@ def _load_env(path: str = ".env") -> None:
             os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
-def _params(args) -> Params:
-    p = DEFAULT
+def _params(args, coin: str | None = None) -> Params:
+    p = params_for(coin or getattr(args, "coin", None) or "BTC", DEFAULT)
     if getattr(args, "interval", None) and args.interval != p.market.interval:
         p = p.with_(market={"interval": args.interval})
     if getattr(args, "risk", None):
@@ -57,7 +57,7 @@ def _history(p: Params, source: str, start: str, end: str | None):
     if source == "hyperliquid":
         from .feeds.hyperliquid import HyperliquidFeed
 
-        cache = Path(f"data/hyperliquid_{p.market.interval}.pkl")
+        cache = Path(f"data/hyperliquid_{p.market.symbol}_{p.market.interval}.pkl")
         feed = HyperliquidFeed(p.market.symbol, p.market.interval)
         bars = feed.candles()
         funding = feed.funding(bars[0].ts)
@@ -67,7 +67,7 @@ def _history(p: Params, source: str, start: str, end: str | None):
         return bars, funding
     from .feeds import binance_vision
 
-    return binance_vision.load(interval=p.market.interval, start=start, end=end)
+    return binance_vision.load(symbol=f"{p.market.symbol}USDT", interval=p.market.interval, start=start, end=end)
 
 
 def cmd_backtest(args) -> int:
@@ -90,7 +90,7 @@ def cmd_backtest(args) -> int:
         if client:
             parts.append(research.jev_experiment(bars, funding, p, client))
         extra = "\n\n".join(parts)
-    path = bt.write_report(s, p, extra_md=extra, name=args.name)
+    path = bt.write_report(s, p, extra_md=extra, name=args.name or report_name(p.market.symbol))
     f, o = s["full"], s["out_of_sample"]
     print(f"\n  {f['from']} → {f['to']}: {f['return']:+.1%} total ({bt._pct(f['cagr'])}/yr), max drawdown "
           f"{f['max_drawdown']:.1%}, {f['trades']} trades, profit factor {f['profit_factor']:.2f}")
@@ -123,7 +123,8 @@ def cmd_paper(args) -> int:
     from . import runner
 
     p = _params(args)
-    runner.run_paper(p, ledger_dir=args.ledger, poll_s=args.poll, host=args.host, port=args.port,
+    runner.run_paper(p, ledger_dir=args.ledger or f"ledger/{p.market.symbol}", poll_s=args.poll, host=args.host,
+                     port=args.port,
                      dashboard=not args.no_dashboard, jev=_jev(p))
     return 0
 
@@ -137,12 +138,12 @@ def _notify(state: dict) -> None:
         return
     import urllib.request
 
-    t = state["ticker"]
+    t, coin = state["ticker"], state["header"].get("coin", "BTC")
     body = "\n".join(f"{e['agent'].upper()}: {e['text']}" for e in events)
-    body += f"\n\nequity ${t['bank']:,.2f} ({t['pnl_pct']:+.2%}) · {t['position']} · BTC ${t['price']:,.0f}"
+    body += f"\n\n{coin} account ${t['bank']:,.2f} ({t['pnl_pct']:+.2%}) · {t['position']} · {coin} ${t['price']:,.2f}"
     trade = any(w in body for w in ("BOUGHT", "SOLD", "HALT", "daily"))
     req = urllib.request.Request(f"https://ntfy.sh/{topic}", data=body.encode(), method="POST", headers={
-        "Title": "BTC desk: " + ("TRADE" if trade else "update"), "Priority": "high" if trade else "default",
+        "Title": f"{coin} desk: " + ("TRADE" if trade else "update"), "Priority": "high" if trade else "default",
         "Tags": "chart_with_upwards_trend" if trade else "robot"})
     try:
         urllib.request.urlopen(req, timeout=10).read()
@@ -150,29 +151,65 @@ def _notify(state: dict) -> None:
         print(f"  notify failed: {exc}")
 
 
+def migrate_ledger(root: Path) -> bool:
+    """The desk began as one BTC account in ledger/; each coin now has its own ledger/<COIN>/. Moves it once."""
+    old, new = root / "paper.json", root / "BTC"
+    if not old.exists() or (new / "paper.json").exists():
+        return False
+    new.mkdir(parents=True, exist_ok=True)
+    for name in ("paper.json", "kills.json", "board.json"):
+        if (root / name).exists():
+            (root / name).replace(new / name)
+    print("  moved the BTC ledger to ledger/BTC/")
+    return True
+
+
 def cmd_step(args) -> int:
+    """One pass over every paper account. A coin that errors is reported and skipped; the others still run."""
+    import time
+    import traceback
+
     from . import paper
 
-    p = _params(args)
-    s = paper.step(p, args.ledger, jev=_jev(p))
-    _notify(s)
+    coins = [c.strip().upper() for c in args.coins.split(",") if c.strip()]
+    root = Path(args.ledger)
+    migrated = migrate_ledger(root)
+    changed, failed, summary = migrated, [], []
+    for coin in coins:
+        p = _params(args, coin)
+        try:
+            s = paper.step(p, root / coin, jev=_jev(p))
+        except Exception as exc:  # e.g. a rate-limited API call: retry next run, don't lose the other coins
+            failed.append(coin)
+            print(f"  {coin}: step failed: {type(exc).__name__}: {exc}")
+            traceback.print_exc()
+            summary.append({"coin": coin, "error": f"{type(exc).__name__}: {exc}"[:200]})
+            continue
+        _notify(s)
+        changed = changed or s["paper"]["changed"]
+        t, g = s["ticker"], s["goal"]
+        print(f"  {coin}: equity {t['bank']:,.2f} ({t['pnl_pct']:+.2%}) · {t['position']} {t['position_detail']} · "
+              f"{t['record']} · {g['progress']:.1%} of the way to ${g['target']:,.0f}")
+        summary.append({"coin": coin, "bank": t["bank"], "start": g["start"], "pnl": t["pnl"], "pnl_pct": t["pnl_pct"],
+                        "position": t["position"], "record": t["record"], "price": t["price"],
+                        "risk_per_trade": p.sizing.risk_per_trade, "updated": s["updated"]})
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "index.json").write_text(json.dumps({"updated": int(time.time() * 1000), "coins": summary}))
     if os.environ.get("GITHUB_OUTPUT"):   # tells the workflow whether the ledger needs saving
         with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
-            fh.write(f"changed={'true' if s['paper']['changed'] else 'false'}\n")
-    t, g = s["ticker"], s["goal"]
-    print(f"  paper equity {t['bank']:,.2f} ({t['pnl_pct']:+.2%}) · {t['position']} {t['position_detail']} · "
-          f"{t['record']} · {g['progress']:.1%} of the way to ${g['target']:,.0f}")
-    return 0
+            fh.write(f"changed={'true' if changed else 'false'}\n")
+    return 1 if failed else 0
 
 
 def promotion_status(p: Params) -> list[tuple[str, bool, str]]:
     checks = []
-    rep = Path("reports/backtest.json")
+    coin = p.market.symbol
+    rep = Path(f"reports/{report_name(coin)}.json")
     if not rep.exists():
-        return [("backtest report exists (run `python -m desk backtest`)", False, "missing")]
+        return [(f"backtest report exists (run `python -m desk backtest --coin {coin}`)", False, "missing")]
     s = json.loads(rep.read_text())
     checks += [(f"backtest: {label}", ok, val) for label, ok, val in bt.promotion_check(s, p)]
-    ledger = Path("ledger/paper.json")
+    ledger = Path(f"ledger/{coin}/paper.json")
     if not ledger.exists():
         checks.append(("paper record exists (run `python -m desk paper`)", False, "missing"))
         return checks
@@ -214,15 +251,17 @@ def cmd_live(args) -> int:
 
 
 def cmd_reset_halt(args) -> int:
-    path = Path(f"state/{args.mode}_desk.json")
+    coin = args.coin.upper()
+    path = Path(f"ledger/{coin}/paper.json") if args.mode == "paper" else Path("state/live_desk.json")
     if not path.exists():
-        print("no desk state found")
+        print(f"no desk state found at {path}")
         return 1
     d = json.loads(path.read_text())
-    risk = d.get("risk", {})
-    print(f"  halted: {risk.get('halted')} — {risk.get('halt_reason') or 'n/a'}")
+    holder = d["desk"] if args.mode == "paper" else d
+    risk = holder.get("risk", {})
+    print(f"  {coin} halted: {risk.get('halted')} — {risk.get('halt_reason') or 'n/a'}")
     risk.update({"halted": False, "halt_reason": "", "peak_equity": 0.0})
-    d["risk"] = risk
+    holder["risk"] = risk
     path.write_text(json.dumps(d))
     print("  halt cleared; peak equity resets to current equity on the next bar.")
     return 0
@@ -251,6 +290,7 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def common(sp, history=False, server=False):
+        sp.add_argument("--coin", default="BTC", type=str.upper, choices=list(COINS))
         sp.add_argument("--interval", default=None, help="bar size (default from thresholds.py: 2h)")
         sp.add_argument("--risk", type=float, default=None, help="risk per trade, e.g. 0.01 = 1%%")
         sp.add_argument("--jev-mode", choices=["off", "advisory", "gate"], default=None)
@@ -265,7 +305,7 @@ def main(argv=None) -> int:
     sp = sub.add_parser("backtest")
     common(sp, history=True)
     sp.add_argument("--research", action="store_true", help="add sensitivity/ablation/sizing/cost/Jev sections")
-    sp.add_argument("--name", default="backtest", help="report file name under reports/")
+    sp.add_argument("--name", default=None, help="report file name under reports/ (default per coin)")
     sp.set_defaults(fn=cmd_backtest)
 
     sp = sub.add_parser("replay")
@@ -276,7 +316,8 @@ def main(argv=None) -> int:
 
     sp = sub.add_parser("step")
     common(sp)
-    sp.add_argument("--ledger", default="ledger")
+    sp.add_argument("--coins", default=",".join(COINS), help="comma-separated paper accounts to step")
+    sp.add_argument("--ledger", default="ledger", help="ledger root; each coin lives in <root>/<COIN>/")
     sp.set_defaults(fn=cmd_step)
 
     for name, fn in (("paper", cmd_paper), ("live", cmd_live)):
@@ -286,7 +327,7 @@ def main(argv=None) -> int:
                         help="seconds between checks")
         sp.add_argument("--no-dashboard", action="store_true")
         if name == "paper":
-            sp.add_argument("--ledger", default="ledger")
+            sp.add_argument("--ledger", default=None, help="default ledger/<COIN>")
         if name == "live":
             sp.add_argument("--max-notional", type=float, default=None, help="hard USD cap per position")
             sp.add_argument("--force-unproven", action="store_true", help="override the go-live gate (don't)")
@@ -294,6 +335,7 @@ def main(argv=None) -> int:
 
     sp = sub.add_parser("reset-halt")
     sp.add_argument("--mode", choices=["paper", "live"], default="paper")
+    sp.add_argument("--coin", default="BTC", type=str.upper, choices=list(COINS))
     sp.set_defaults(fn=cmd_reset_halt)
 
     sp = sub.add_parser("jev-test")

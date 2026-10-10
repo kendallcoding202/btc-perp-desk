@@ -24,8 +24,13 @@ AGENTS = [
 ]
 
 
-def _usd(x: float | None, dp: int = 0) -> str:
-    return "—" if x is None else f"${x:,.{dp}f}"
+def _usd(x: float | None, dp: int | None = None) -> str:
+    """Whole dollars for BTC/ETH-sized prices, cents below $1,000 (SOL, small balances)."""
+    if x is None:
+        return "—"
+    if dp is None:
+        dp = 0 if abs(x) >= 1000 else 2
+    return f"${x:,.{dp}f}"
 
 
 def _gate(decision, name):
@@ -66,7 +71,7 @@ def goal(equity: float, start: float, target: float, cagr: float | None, elapsed
 
 
 def trigger_outlook(f: ind.Features, i: int, n: int, limit: int = 10) -> list[dict]:
-    """When the breakout line steps down if BTC makes no new high: old highs age out of the n-bar window.
+    """When the breakout line steps down if price makes no new high: old highs age out of the n-bar window.
 
     The decision on bar j compares its close with max(high of bars j-n .. j-1), so the decision k bars
     after bar i (closing at bars[i].ts + (k+1) bars) uses the already-known highs i+k-n .. i.
@@ -88,6 +93,7 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
           jev_client=None, now_ms: int | None = None, candles: int = 140, goal_cagr: float | None = None,
           elapsed_days: float | None = None) -> dict:
     p, broker, dec = desk.p, desk.broker, desk.last_decision
+    coin = p.market.symbol
     bars = f.bars
     bar = bars[i]
     price = ctx.mid if ctx and ctx.mid else bar.close
@@ -137,7 +143,7 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
     else:
         quotes["scan"], scan_state = "warming up the averages.", "idle"
     cards["scan"] = dict(value=f"{ts_score:.2f}" if ts_score is not None else "—",
-                         detail=f"{p.strategy.entry_mode}.{p.strategy.breakout_bars} · BTC", score=ts_score,
+                         detail=f"{p.strategy.entry_mode}.{p.strategy.breakout_bars} · {coin}", score=ts_score,
                          state=scan_state)
 
     eff = dec.scores.get("efficiency") if dec else None
@@ -169,11 +175,11 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
 
     if pos:
         notional = pos.qty * price
-        quotes["size"] = f"{pos.qty:.4f} BTC on, {_usd(notional)} notional, {notional / equity:.2f}x."
+        quotes["size"] = f"{pos.qty:.4f} {coin} on, {_usd(notional)} notional, {notional / equity:.2f}x."
         size_val = _usd(notional)
     elif dec and dec.qty:
         quotes["size"] = (f"{p.sizing.risk_per_trade:.1%} risk with a {_usd(abs(bar.close - dec.stop))} stop "
-                          f"= {dec.qty:.4f} BTC, {dec.leverage:.2f}x.")
+                          f"= {dec.qty:.4f} {coin}, {dec.leverage:.2f}x.")
         size_val = _usd(dec.notional)
     else:
         quotes["size"], size_val = "nothing to size.", "$0"
@@ -250,7 +256,8 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
     return {
         "updated": now_ms,
         "header": {
-            "title": "BTC PERP DESK", "tagline": "SCAN PICKS · RISK SIZES · FILLS TRADES",
+            "title": f"{coin} PERP DESK", "tagline": "SCAN PICKS · RISK SIZES · FILLS TRADES", "coin": coin,
+            "risk_per_trade": p.sizing.risk_per_trade,
             "mode": mode.upper(), "venue": p.market.venue, "interval": p.market.interval,
             "day": day_n, "date": now.strftime("%b %d").upper(), "time": now.strftime("%H:%M"),
         },
@@ -258,7 +265,9 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
             "price": price, "change_24h": chg_24h, "bank": equity, "pnl": equity - start_eq,
             "pnl_pct": equity / start_eq - 1, "position": side_txt,
             "position_detail": (f"{pos.qty:.4f} @ {pos.entry_price:,.0f}" if pos else ""),
-            "hold_pct": hold, "record": f"{wins}W {losses}L", "fees": broker.fees_total,
+            "hold_pct": hold, "record": f"{wins}W {losses}L", "fees": broker.fees_total, "cash": broker.cash,
+            "pos": None if pos is None else {"side": pos.side.value, "qty": pos.qty, "entry": pos.entry_price,
+                                             "stop": pos.stop},
             "funding": broker.funding_total,
         },
         "agents": agents,

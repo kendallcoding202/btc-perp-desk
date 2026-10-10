@@ -1,6 +1,6 @@
-# BTC Perp Desk
+# BTC Perp Desk (now BTC · ETH · SOL)
 
-A multi-agent trading desk for **BTC perpetual futures**, modelled on the "GROKBOT + JEV" dashboard, with one difference: every number it trades on has been backtested, with fees and funding charged.
+A multi-agent trading desk for **BTC, ETH and SOL perpetual futures** (three separate $50 paper accounts), modelled on the "GROKBOT + JEV" dashboard, with one difference: every number it trades on has been backtested, with fees and funding charged.
 
 ```
 CHIEF    never takes a position     runs the gates in order, every 2h close
@@ -36,6 +36,19 @@ The honest read:
 - **Whole-period profit isn't the result of one lucky setting.** Every nearby setting tested was profitable, and tripling fees and slippage still leaves it profitable.
 - **$50 → $100,000 is a 2,000× goal.** At +50%/yr that's about 19 years at the historical pace. The board shows this projection live.
 
+### ETH and SOL: same desk, smaller bets
+
+ETH and SOL run the exact BTC strategy (nothing was re-tuned for them), at **2% risk per trade instead of 5%**. Reports: [`reports/backtest-ETH.md`](reports/backtest-ETH.md), [`reports/backtest-SOL.md`](reports/backtest-SOL.md).
+
+| | ETH (2020-01 → 2026-09) | SOL (2020-09 → 2026-09) |
+|---|---|---|
+| Total return at 2% risk | +65% ($50 → $83) | +40% ($50 → $70) |
+| Worst drop from a peak | 26% | 17% |
+| First 60% of the period / last 40% | +32% / +25% | +22% / +15% |
+| Buy & hold, same period | +1,956% (worst drop 81%) | +3,407% (worst drop 97%) |
+
+Why 2%: at the BTC account's 5% risk, both hit the 40% drawdown halt in the backtest. ETH stopped in 2024 and SOL in 2021, which would have frozen the account. At 2% neither came close. The edge here is much thinner than on BTC: about +6–8% a year, and both lost money in 2024 (ETH −15%, SOL −12.5%). A wider 4 ATR stop looked better for both, but it was found after looking at these results, so it isn't trusted and isn't used.
+
 ### Design decisions the data made
 - **2h candles, not 1h or 4h.** 2h beat 4h on 2020–2023 (+157% vs +104% at equal risk) and held up afterwards. 1h was worse: noise and fees.
 - **3 of the 4 "soft" gates were removed** (trend strength, efficiency, extension). Tested on 2020–2023 only, each one cost money. They still show on the board as information.
@@ -50,19 +63,23 @@ python3 -m pip install -r requirements.txt   # only needed for live trading and 
 cp .env.example .env                         # optional: JEV_API_KEY, NTFY_TOPIC
 
 python3 -m desk backtest --research          # download history, write reports/backtest.md
+python3 -m desk backtest --coin ETH          # same for ETH (or SOL): reports/backtest-ETH.md
 python3 -m desk replay                       # watch it trade 2024→now at http://127.0.0.1:8787
-python3 -m desk paper                        # the $50 paper experiment, live board at :8787
-python3 -m pytest                            # 19 tests, incl. "paper ledger == backtest"
+python3 -m desk paper                        # a $50 paper account (add --coin ETH), live board at :8787
+python3 -m desk step                         # one step for every coin, the way the Action runs it
+python3 -m pytest                            # 25 tests, incl. "paper ledger == backtest"
 ```
 
-## The $50 paper experiment
+## The $50 paper experiments
 
-A **$50 paper account** trades live Hyperliquid BTC prices. A GitHub Actions job ([`.github/workflows/paper.yml`](.github/workflows/paper.yml)) runs `python -m desk step` every 15 minutes, so the experiment keeps running with no computer on.
+**Three $50 paper accounts** (BTC, ETH, SOL; $150 in all) trade live Hyperliquid prices. Each account is separate: its own cash, position, record and kill switches. A GitHub Actions job ([`.github/workflows/paper.yml`](.github/workflows/paper.yml)) runs `python -m desk step` every 15 minutes, so the experiments keep running with no computer on. If one coin's step fails (say, a rate-limited API call), the other two still run and save, and the failed one catches up next run.
 
 - **The record** lives on the [`paper-ledger`](../../tree/paper-ledger/ledger) branch, saved whenever something happens, so the history is permanent and public:
-  - `ledger/paper.json`: the account, open position, every trade, and the desk's memory
-  - `ledger/kills.json`: kill switches. Create or edit it on that branch, e.g. `{"entry_kill": true}`.
-- **The board** for your phone is published to GitHub Pages every run: **https://kendallcoding202.github.io/btc-perp-desk/**. It is read-only; kill switches go through `kills.json`.
+  - `ledger/<COIN>/paper.json` (`BTC`, `ETH`, `SOL`): the account, open position, every trade, and the desk's memory
+  - `ledger/<COIN>/kills.json`: that account's kill switches. Create or edit it on that branch, e.g. `ledger/SOL/kills.json` with `{"entry_kill": true}`.
+- **The board** for your phone is published to GitHub Pages every run: **https://kendallcoding202.github.io/btc-perp-desk/** (open a coin directly with `#ETH` or `#SOL`). It is read-only; kill switches go through `kills.json`.
+  - Tabs at the top switch coins and show all three balances, plus the $150 total.
+  - **Between runs, your browser pulls prices straight from Hyperliquid every 5 seconds.** The price, open-position P&L, balance and the candle that's still forming move live. Decisions, fills and the record change only when the desk runs: every 2h candle close, picked up within 15 minutes.
 - **Locally:** `python -m desk paper` runs the same step every minute, with a live board and working kill buttons at http://127.0.0.1:8787. Don't run it against the same ledger as the Action, or the two will diverge.
 
 Fills follow the backtest's rules exactly (a test enforces it):
@@ -89,8 +106,8 @@ Each `step` processes whatever has closed since the last run, so a missed run ne
 ## Going live (only after paper earns it)
 
 `python -m desk live --max-notional 50` refuses to start unless **all** of these hold:
-1. `reports/backtest.json` passes the go-live gate: 3+ years, profitable out-of-sample with profit factor ≥ 1.15, max drawdown ≤ 35%, never halted.
-2. The paper ledger has **14+ days** of trading and is up overall.
+1. That coin's backtest report (`reports/backtest.json` for BTC, `reports/backtest-ETH.json`, `reports/backtest-SOL.json`) passes the go-live gate: 3+ years, profitable out-of-sample with profit factor ≥ 1.15, max drawdown ≤ 35%, never halted.
+2. That coin's paper ledger has **14+ days** of trading and is up overall.
 3. `DESK_LIVE_CONFIRM` is set to the exact phrase in `.env.example`.
 4. You set a hard per-position dollar cap with `--max-notional`.
 
@@ -101,12 +118,13 @@ Perpetual futures are restricted in some countries, including for US persons on 
 ## Layout
 
 ```
-desk/thresholds.py   every number the desk believes (change things here, then re-run the backtest)
+desk/thresholds.py   every number the desk believes (change things here, then re-run the backtest);
+                     COINS and COIN_OVERRIDES set which coins trade and their risk
 desk/filter.py       the gate order: kills → data → hard → scan → soft → size → jev
 desk/engine.py       the desk (CHIEF + RISK); identical in backtest, paper and live
 desk/backtest.py     replay with costs; in/out-of-sample, per-year, go-live gate
 desk/research.py     sensitivity, ablation, take-profit, sizing, cost and Jev tables
-desk/paper.py        the $50 ledger step
+desk/paper.py        the $50 ledger step (one ledger per coin under ledger/<COIN>/)
 desk/jev.py          TypeSafe Jev client (POST api.typesafe.ai/v1/systemone)
 desk/brokers/        sim.py (backtest + paper), live.py (ccxt)
 desk/feeds/          hyperliquid.py (live), binance_vision.py (history)

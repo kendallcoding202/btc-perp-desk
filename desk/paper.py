@@ -1,16 +1,16 @@
-"""Paper trading ledger — the $50 experiment.
+"""Paper trading ledger — the $50 experiments (one account per coin).
 
 `step()` is idempotent and catch-up safe: it loads the ledger, processes every bar
-bar that has closed since the last run (exactly like the backtest: orders fill at
+that has closed since the last run (exactly like the backtest: orders fill at
 the next bar's open, stops are checked against each bar's high/low, funding is
 charged per bar), then saves the ledger and the board.
 
 That means it can run from anywhere on any schedule — a laptop loop, or a GitHub
-Actions cron every 4 hours — and the account carries on from the same ledger,
+Actions cron every 15 minutes — and the account carries on from the same ledger,
 with no gaps and no double-counting.
 
-The ledger lives in ledger/ (committed to git, so the experiment's history is
-permanent and auditable): ledger/paper.json + ledger/board.json.
+Each coin's ledger lives in ledger/<COIN>/ (saved to the paper-ledger branch, so the
+experiment's history is permanent and auditable): paper.json + kills.json + board.json.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from . import indicators as ind
 from .brokers.sim import SimBroker
 from .engine import Desk, Kills
 from .filter import evaluate_entry
-from .thresholds import Params
+from .thresholds import Params, report_name
 
 LOOKBACK_BARS = 1500
 FUNDING_WINDOW_MS = 4 * 86400_000
@@ -74,11 +74,11 @@ def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=
         """Say what FILLS and RISK just did, so the board and phone notifications show it right away."""
         for t in broker.trades[n_trades_before:]:
             desk.say(ts, "risk" if t.reason in ("stop", "take_profit") else "fills",
-                     f"SOLD {t.qty:.5f} BTC @ ${t.exit_price:,.0f} ({t.reason.replace('_', ' ')}) · "
+                     f"SOLD {t.qty:.5f} {p.market.symbol} @ ${t.exit_price:,.2f} ({t.reason.replace('_', ' ')}) · "
                      f"trade {t.net_pnl:+,.2f} · equity ${broker.cash:,.2f}")
         if broker.position is not None and (not had_position or len(broker.trades) > n_trades_before):
             pos = broker.position
-            desk.say(ts, "fills", f"BOUGHT {pos.qty:.5f} BTC @ ${pos.entry_price:,.0f} · stop ${pos.stop:,.0f}")
+            desk.say(ts, "fills", f"BOUGHT {pos.qty:.5f} {p.market.symbol} @ ${pos.entry_price:,.2f} · stop ${pos.stop:,.2f}")
 
     processed = 0
     if not meta["last_bar_ts"]:
@@ -130,7 +130,7 @@ def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=
     _write(lpath, {"meta": meta, "broker": broker.to_dict(), "desk": desk.to_dict()})
 
     goal_cagr = None
-    rep = Path("reports/backtest.json")
+    rep = Path(f"reports/{report_name(p.market.symbol)}.json")
     if rep.exists():
         goal_cagr = json.loads(rep.read_text()).get("full", {}).get("cagr")
     state = board_mod.build(desk, f, len(f.bars) - 1, mode="paper", ctx=ctx, jev_client=jev, now_ms=now,

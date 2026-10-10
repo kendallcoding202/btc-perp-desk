@@ -172,7 +172,7 @@ class Desk:
             orders.append(Order("open", decision.side, decision.qty, decision.setup or "entry", stop=decision.stop,
                                 meta={"leverage": decision.leverage, "notional": decision.notional,
                                       "take_profit": take_profit}))
-            self.say(ts_close, "chief", f"go ({decision.setup}): {decision.side.value} {decision.qty:.4f} BTC "
+            self.say(ts_close, "chief", f"go ({decision.setup}): {decision.side.value} {decision.qty:.4f} {self.p.market.symbol} "
                                         f"(${decision.notional:,.0f}, {decision.leverage:.1f}x), stop {decision.stop:,.0f}")
 
         for o in orders:

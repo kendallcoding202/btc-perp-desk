@@ -140,6 +140,7 @@ def summarize(r: Result) -> dict:
     return {
         "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "interval": r.p.market.interval,
+        "coin": r.p.market.symbol,
         "params": r.p.as_dict(),
         "full": full,
         "in_sample": segment(curve, trades, bars, t_start, split),
@@ -180,14 +181,14 @@ def write_report(summary: dict, p: Params, out_dir: str | Path = "reports", extr
     full, ins, oos = summary["full"], summary["in_sample"], summary["out_of_sample"]
     checks = promotion_check(summary, p)
     lines = [
-        f"# Backtest — BTC perp, {summary['interval']} bars",
+        f"# Backtest — {summary.get('coin', 'BTC')} perp, {summary['interval']} bars",
         "",
         f"{full['from']} → {full['to']} ({full['years']:.1f} years). Generated {summary['generated']}.",
         f"Costs charged: taker fee {p.costs.taker_fee_bps} bps + slippage {p.costs.slippage_bps} bps per side, "
         f"plus real funding prints. Start equity ${p.sizing.starting_equity:,.0f}, "
         f"risk {p.sizing.risk_per_trade:.1%}/trade, max {p.sizing.max_leverage:.0f}x.",
         "",
-        "| | Desk | Buy & hold BTC |",
+        f"| | Desk | Buy & hold {summary.get('coin', 'BTC')} |",
         "|---|---|---|",
         f"| Total return | {_pct(full['return'])} | {_pct(full['buy_hold_return'])} |",
         f"| CAGR | {_pct(full['cagr'])} | |",

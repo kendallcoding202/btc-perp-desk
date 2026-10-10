@@ -282,6 +282,64 @@ def test_paper_ledger_stepping_matches_the_backtest(tmp_path, monkeypatch):
     assert json.loads((tmp_path / "board.json").read_text())["goal"]["target"] == p.sizing.goal_equity
 
 
+# ---------------------------------------------------------------- several coins
+
+def test_each_coin_gets_its_own_symbol_and_risk():
+    from desk.thresholds import COINS, params_for, report_name
+
+    assert set(COINS) == {"BTC", "ETH", "SOL"}
+    btc, eth, sol = (params_for(c) for c in ("BTC", "ETH", "SOL"))
+    assert (btc.market.symbol, eth.market.symbol, sol.market.symbol) == ("BTC", "ETH", "SOL")
+    assert btc.sizing.risk_per_trade == DEFAULT.sizing.risk_per_trade
+    assert eth.sizing.risk_per_trade == sol.sizing.risk_per_trade == 0.02    # 5% hit the drawdown halt in backtests
+    assert all(q.sizing.starting_equity == 50 for q in (btc, eth, sol))
+    assert (report_name("BTC"), report_name("eth")) == ("backtest", "backtest-ETH")
+
+
+def test_board_is_labelled_with_its_coin(tmp_path, monkeypatch):
+    monkeypatch.setattr(paper, "LOOKBACK_BARS", 10 ** 6)
+    bars, funding = series(seed=5, n=400, start=150.0)
+    p = P.with_(market={"symbol": "SOL"}, hard={"max_data_age_bars": 1e9})
+    feed = FakeFeed(bars, funding, 350)
+    paper.step(p, tmp_path, feed=feed, log=lambda *a: None, now_ms=bars[350].ts + H4 // 2)
+    b = json.loads((tmp_path / "board.json").read_text())
+    assert b["header"]["coin"] == "SOL" and b["header"]["title"] == "SOL PERP DESK"
+    assert b["ticker"]["cash"] == pytest.approx(b["ticker"]["bank"]) and b["ticker"]["pos"] is None
+
+
+def test_step_runs_every_coin_moves_the_old_ledger_and_survives_one_failing(tmp_path, monkeypatch):
+    import argparse
+
+    from desk import __main__ as cli
+
+    (tmp_path / "paper.json").write_text('{"old": "btc ledger"}')
+    (tmp_path / "kills.json").write_text('{"entry_kill": false}')
+    seen = []
+
+    def fake_step(p, ledger_dir, jev=None, **kw):
+        seen.append((p.market.symbol, Path(ledger_dir).name, p.sizing.risk_per_trade))
+        if p.market.symbol == "ETH":
+            raise TimeoutError("rate limited")
+        return {"paper": {"changed": False, "new_events": []}, "updated": 1, "header": {"coin": p.market.symbol},
+                "ticker": {"bank": 50.0, "pnl": 0.0, "pnl_pct": 0.0, "position": "FLAT", "position_detail": "",
+                           "record": "0W 0L", "price": 100.0},
+                "goal": {"start": 50.0, "target": 100_000.0, "progress": 0.0}}
+
+    monkeypatch.setattr(paper, "step", fake_step)
+    monkeypatch.delenv("NTFY_TOPIC", raising=False)
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    args = argparse.Namespace(coins="BTC,ETH,SOL", ledger=str(tmp_path), interval=None, risk=None,
+                              jev_mode="off", coin=None)
+    assert cli.cmd_step(args) == 1                        # ETH failed, so the run says so...
+    assert seen == [("BTC", "BTC", DEFAULT.sizing.risk_per_trade), ("ETH", "ETH", 0.02), ("SOL", "SOL", 0.02)]
+    assert json.loads((tmp_path / "BTC" / "paper.json").read_text()) == {"old": "btc ledger"}
+    assert (tmp_path / "BTC" / "kills.json").exists() and not (tmp_path / "paper.json").exists()
+    idx = json.loads((tmp_path / "index.json").read_text())["coins"]
+    assert [c["coin"] for c in idx] == ["BTC", "ETH", "SOL"]  # ...but BTC and SOL still ran and are listed
+    assert "rate limited" in idx[1]["error"] and idx[2]["bank"] == 50.0
+    assert cli.migrate_ledger(tmp_path) is False          # only moves once
+
+
 # ---------------------------------------------------------------- jev
 
 def test_jev_gates_advisory_never_drop_gate_mode_can():

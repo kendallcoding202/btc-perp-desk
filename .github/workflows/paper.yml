@@ -1,8 +1,10 @@
 name: paper desk
 
-# The $50 paper experiment. Every 15 minutes: load the ledger from the `paper-ledger`
-# branch, run one desk step on live Hyperliquid prices, save the ledger if anything
-# happened, and publish the board to GitHub Pages.
+# The $50 paper experiments: BTC, ETH and SOL, $50 each, separate accounts. Every 15
+# minutes: load the ledgers from the `paper-ledger` branch, run one desk step per coin
+# on live Hyperliquid prices, save the ledgers if anything happened, and publish the
+# boards to GitHub Pages. A coin whose step fails (say, a rate-limited API call) is
+# retried next run; the other coins are still saved and published.
 # GitHub delays (and under load drops) scheduled runs, worst at the top of the hour,
 # so the schedule avoids :00 and runs at :04/:19/:34/:49 — each 2h bar closes on an
 # even hour and is picked up 4 minutes later. `step` catches up on every bar it
@@ -51,8 +53,8 @@ jobs:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: python -m desk step
 
-      - name: Save the ledger
-        if: steps.step.outputs.changed == 'true'
+      - name: Save the ledgers
+        if: ${{ !cancelled() && steps.step.outputs.changed == 'true' }}
         run: |
           git config user.name "paper-desk[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -65,25 +67,37 @@ jobs:
             git -C "$work" checkout --orphan paper-ledger
             git -C "$work" rm -rfq .
           fi
-          mkdir -p "$work/ledger"
-          cp ledger/paper.json "$work/ledger/"
-          [ -f ledger/kills.json ] && cp ledger/kills.json "$work/ledger/" || true
+          git -C "$work" rm -q --ignore-unmatch ledger/paper.json ledger/kills.json   # pre-multi-coin layout
+          for d in ledger/*/; do
+            [ -f "$d/paper.json" ] || continue
+            mkdir -p "$work/$d"
+            cp "$d/paper.json" "$work/$d"
+            [ -f "$d/kills.json" ] && cp "$d/kills.json" "$work/$d" || true
+          done
           cd "$work"
-          git add ledger
+          git add -A ledger
           git diff --cached --quiet && exit 0
-          equity=$(python3 -c "import json; print(round(json.load(open('ledger/paper.json'))['broker']['cash'], 2))")
-          git commit -qm "ledger: \$${equity} at $(date -u +%Y-%m-%dT%H:%MZ)"
+          banks=$(python3 -c "import json, glob; print(' '.join(f\"{p.split('/')[1]} \${json.load(open(p))['broker']['cash']:.2f}\" for p in sorted(glob.glob('ledger/*/paper.json'))))")
+          git commit -qm "ledger: ${banks} at $(date -u +%Y-%m-%dT%H:%MZ)"
           git push origin paper-ledger
 
-      - name: Build the board
+      - name: Build the boards
+        if: ${{ !cancelled() }}
         run: |
-          mkdir -p _site
+          mkdir -p _site/boards
           cp dashboard/* _site/
-          cp ledger/board.json _site/board.json
+          for b in ledger/*/board.json; do
+            [ -f "$b" ] && cp "$b" "_site/boards/$(basename "$(dirname "$b")").json"
+          done
+          [ -f ledger/index.json ] && cp ledger/index.json _site/boards/index.json
+          [ -f _site/boards/BTC.json ] && cp _site/boards/BTC.json _site/board.json   # old links keep working
+          ls -l _site _site/boards
 
       - uses: actions/upload-pages-artifact@v3
+        if: ${{ !cancelled() }}
         with:
           path: _site
 
       - id: deploy
+        if: ${{ !cancelled() }}
         uses: actions/deploy-pages@v4
