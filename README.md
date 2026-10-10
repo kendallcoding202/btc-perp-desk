@@ -53,6 +53,9 @@ Why 2%: at the BTC account's 5% risk, both hit the 40% drawdown halt in the back
 - **2h candles, not 1h or 4h.** 2h beat 4h on 2020–2023 (+157% vs +104% at equal risk) and held up afterwards. 1h was worse: noise and fees.
 - **3 of the 4 "soft" gates were removed** (trend strength, efficiency, extension). Tested on 2020–2023 only, each one cost money. They still show on the board as information.
 - **Longs only.** Three short designs were tested on top of the longs: breakdowns, failed rallies, and bull traps (13 versions in all). The shorts' winnings never clearly beat their losses (0.64–1.12× in 2020–23, at most 1.00× after). Every version made the total worse and hit the 40% drawdown halt. Shorts lost even in 2022, when BTC fell 64%. The setups stay in the code (`allow_shorts`, `short_mode`) but off.
+- **No shorts on ETH or SOL either.** The same 7 short versions were run on both at 2% risk. The pass rule was set first: the shorts must win at least $1.15 per $1 lost in both 2020–23 and 2024+. None passed.
+  - **ETH breakdown shorts came closest.** They made money in both periods ($1.34, then $1.10 per $1 lost), and adding them lifted the backtest from +65% to +104% with a smaller worst drop (19% vs 26%). The edge since 2024 is thin, though: +$3.53 over almost 3 years.
+  - **SOL shorts worked in 2020–23 and then stopped.** Every version lost money from 2024 on ($0.63–0.89 per $1 lost).
 - **No fixed take-profit.** The trailing stop already sells winners. Adding a profit target cut total return from +1,475% to between +213% and +898%, depending on the level.
 - **Jev is advisory.** All 118 historical entries were replayed through Jev (with dates and prices stripped out). Its answers' correlation with trade outcome was about zero (−0.05 to +0.06). Its "follow-through" answer did split winners from losers somewhat (−$81 below its median, +$819 above), which is worth watching on paper, but it's too weak to give it a veto yet.
 
