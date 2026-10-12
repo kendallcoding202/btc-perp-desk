@@ -136,4 +136,6 @@ desk/brokers/        sim.py (backtest + paper), live.py (ccxt)
 desk/feeds/          hyperliquid.py (live), binance_vision.py (history)
 desk/board.py        state → dashboard JSON (agent cards, bubbles, gates, thresholds)
 dashboard/           the board: no build step, phone-friendly
+dashboard/spider.js  the walking CRAWLER: visits whatever the desk just did (gate cards in order, the
+                     newest candle, the trigger line, new fills). Decoration only; it changes no rule
 ```

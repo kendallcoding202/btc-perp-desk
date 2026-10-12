@@ -181,6 +181,7 @@
       g.fillStyle = "#fff"; g.beginPath(); g.arc(tx, ty, 2.4, 0, Math.PI * 2); g.fill();
       g.beginPath(); g.arc(kx, ky, 1.6, 0, Math.PI * 2); g.fill();
     });
+    if (document.documentElement.dataset.spider === "on") return g.restore();   // spider.js walks the real one
     g.shadowBlur = 0;
     g.fillStyle = "#1a1d33"; g.strokeStyle = "#fff"; g.lineWidth = 2;
     g.beginPath(); g.ellipse(cx, cy, 13, 10, -0.4, 0, Math.PI * 2); g.fill(); g.stroke();
@@ -398,6 +399,9 @@
 
   let state = null, base = null, index = null;
   const live = { mids: {}, at: 0, candle: null };   // filled from Hyperliquid by the viewer's own browser
+  // spider.js listens: "desk:board" after a board loads, "desk:tick" after a live price (candle = newest high, chart px)
+  const newest = () => lastGeom && { x: lastGeom.X(lastGeom.cs.length - 1), y: lastGeom.Y(lastGeom.cs[lastGeom.cs.length - 1][2]) };
+  const emit = (name, detail) => window.dispatchEvent(new CustomEvent(name, { detail: { coin: state && state.header.coin, candle: newest(), ...detail } }));
 
   async function hl(body) {
     const res = await fetch(HL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -504,13 +508,14 @@
         index = ir && ir.ok ? await ir.json() : null;
       }
       render();
+      emit("desk:board", { updated: base.updated, scanned: base.analysis?.scanned, gates: base.analysis?.gates || [] });
     } catch (err) {
       $("foot").textContent = `can't reach the desk (${err.message}). is \`python -m desk paper\` running?`;
     }
   }
 
   async function pollMids() {
-    try { live.mids = await hl({ type: "allMids" }); live.at = Date.now(); render(); } catch { /* keep the last price */ }
+    try { live.mids = await hl({ type: "allMids" }); live.at = Date.now(); render(); emit("desk:tick", { price: state && state.ticker.price }); } catch { /* keep the last price */ }
   }
   async function pollCandle() {
     const c = (base && base.header.coin) || coin, iv = (base && base.header.interval) || "2h";
