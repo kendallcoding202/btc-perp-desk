@@ -1,7 +1,7 @@
 # Backtest — BTC perp, 2h bars
 
-2020-01-01 → 2026-10-01 (6.7 years). Generated 2026-10-09T23:20:20+00:00.
-Costs charged: taker fee 4.5 bps + slippage 3.0 bps per side, plus real funding prints. Start equity $50, risk 5.0%/trade, max 5x.
+2020-01-01 → 2026-10-01 (6.7 years). Generated 2026-10-12T22:50:28+00:00.
+Costs charged: taker fee 4.5 bps + slippage 3.0 bps per side, plus real funding prints. Start equity $150, risk 5.0%/trade, max 5x.
 
 | | Desk | Buy & hold BTC |
 |---|---|---|
@@ -9,9 +9,9 @@ Costs charged: taker fee 4.5 bps + slippage 3.0 bps per side, plus real funding 
 | CAGR | +50.5% | |
 | Max drawdown | 28.2% | 77.2% |
 | Sharpe (daily) | 1.21 | |
-| Final equity | $788 | |
+| Final equity | $2,363 | |
 
-Trades 118 (118 long / 0 short), win rate 42%, profit factor 1.70, avg win $37, avg loss $-15. Fees paid $85, funding paid $69. In the market 12% of the time.
+Trades 118 (118 long / 0 short), win rate 42%, profit factor 1.70, avg win $110, avg loss $-46. Fees paid $254, funding paid $206. In the market 12% of the time.
 
 ## In-sample vs out-of-sample
 
@@ -111,7 +111,7 @@ The trailing stop already sells winners: it ratchets up behind every new high an
 
 | risk per trade | total return | CAGR | max drawdown | worst year | hit 40% halt? |
 |---|---|---|---|---|---|
-| 1% | +98% | +10.7% | 6.4% | -2.1% | no |
+| 1% | +95% | +10.4% | 6.4% | -2.1% | no |
 | 2% | +256% | +20.7% | 12.4% | -4.3% | no |
 | 3% | +513% | +30.8% | 18.0% | -6.6% | no |
 | 5% ← default | +1475% | +50.5% | 28.2% | -11.4% | no |
@@ -125,6 +125,8 @@ The trailing stop already sells winners: it ratchets up behind every new high an
 | 7 | 15 | +800.4% | 1.49 |
 
 ## Jev experiment — does a second opinion predict which trades win?
+
+_Carried over from the 2026-10-09 report (the $50 start). The 118 entries are the same at $150, and Jev's answers don't depend on account size, so it was not re-run._
 
 Every one of the 118 historical entries was described to Jev (relative numbers only, no dates or prices) and asked the desk's three questions. 0 correlation = no predictive value.
 

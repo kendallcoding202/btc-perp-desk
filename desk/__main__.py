@@ -2,7 +2,7 @@
 
     backtest     replay history with every cost charged, write reports/backtest[-COIN].md  (--coin BTC|ETH|SOL)
     replay       watch the desk trade history on the board (http://127.0.0.1:8787)
-    paper        one coin's $50 paper account on live Hyperliquid prices, with a live local board
+    paper        one coin's $150 paper account on live Hyperliquid prices, with a live local board
     step         process newly closed bars for every paper account (BTC, ETH, SOL) once, then exit (cron / Actions)
     live         trade real money — refuses unless the backtest AND paper record pass
     reset-halt   clear a drawdown halt after you've looked at what happened

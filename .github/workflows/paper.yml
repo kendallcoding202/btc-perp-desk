@@ -1,6 +1,6 @@
 name: paper desk
 
-# The $50 paper experiments: BTC, ETH and SOL, $50 each, separate accounts. Every 15
+# The paper experiments: BTC, ETH and SOL, $150 each, separate accounts. Every 15
 # minutes: load the ledgers from the `paper-ledger` branch, run one desk step per coin
 # on live Hyperliquid prices, save the ledgers if anything happened, and publish the
 # boards to GitHub Pages. A coin whose step fails (say, a rate-limited API call) is
@@ -37,7 +37,7 @@ jobs:
       - name: Load the ledger
         id: load
         run: |
-          # A failed fetch must stop the run. Carrying on would open fresh $50 ledgers and the
+          # A failed fetch must stop the run. Carrying on would open fresh ledgers and the
           # save step would push them over the real ones. Only a branch that doesn't exist yet
           # (ls-remote exit code 2) means "first run, start new ledgers".
           for attempt in 1 2 3; do
@@ -48,7 +48,7 @@ jobs:
             rc=0
             git ls-remote --exit-code --heads origin paper-ledger > /dev/null || rc=$?
             if [ "$rc" -eq 2 ]; then
-              echo "no paper-ledger branch yet: the step opens a new \$50 ledger"
+              echo "no paper-ledger branch yet: the step opens new ledgers"
               exit 0
             fi
             sleep $((attempt * 10))

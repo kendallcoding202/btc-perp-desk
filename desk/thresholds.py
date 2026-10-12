@@ -81,7 +81,8 @@ class Soft:
 @dataclass(frozen=True)
 class Sizing:
     """SIZE — how much."""
-    starting_equity: float = 50.0       # paper (and backtest) start with $50
+    starting_equity: float = 150.0      # paper (and backtest) start with $150: below ~$150 the ETH/SOL tickets
+                                        # (≈0.3-0.5x equity) start to fall under Hyperliquid's $10 minimum order
     goal_equity: float = 100_000.0      # the board tracks progress toward this
     risk_per_trade: float = 0.05        # AGGRESSIVE: lose 5% of equity if the stop is hit. Position size =
                                         # risk / stop distance, so a tight setup gets more leverage, a wild one
@@ -159,7 +160,7 @@ class Params:
 
 DEFAULT = Params()
 
-# The paper accounts the desk runs, $50 each. Same strategy for every coin; only what's listed here differs.
+# The paper accounts the desk runs, $150 each. Same strategy for every coin; only what's listed here differs.
 COINS = ("BTC", "ETH", "SOL")
 COIN_OVERRIDES: dict[str, dict] = {
     # ETH and SOL swing harder than BTC: at BTC's 5% risk both hit the 40% drawdown halt in the

@@ -53,7 +53,7 @@ def _thin(seq: list, n: int) -> list:
 
 
 def goal(equity: float, start: float, target: float, cagr: float | None, elapsed_days: float | None) -> dict:
-    """Progress toward the target on a log scale ($50→$100k is 2000x: $100 is 9% of the way, $1,000 is 39%)."""
+    """Progress toward the target on a log scale ($150→$100k is 667x: $300 is 11% of the way, $1,500 is 35%)."""
     import math
 
     progress = math.log(equity / start) / math.log(target / start) if equity > 0 and target > start else 0.0

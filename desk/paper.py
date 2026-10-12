@@ -1,4 +1,4 @@
-"""Paper trading ledger — the $50 experiments (one account per coin).
+"""Paper trading ledger — the paper experiments (one $150 account per coin).
 
 `step()` is idempotent and catch-up safe: it loads the ledger, processes every bar
 that has closed since the last run (exactly like the backtest: orders fill at
