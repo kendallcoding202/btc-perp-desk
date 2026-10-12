@@ -35,12 +35,26 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Load the ledger
+        id: load
         run: |
-          if git fetch --depth=1 origin paper-ledger; then
-            git checkout FETCH_HEAD -- ledger/
-          else
-            echo "no paper-ledger branch yet: the step opens a new \$50 ledger"
-          fi
+          # A failed fetch must stop the run. Carrying on would open fresh $50 ledgers and the
+          # save step would push them over the real ones. Only a branch that doesn't exist yet
+          # (ls-remote exit code 2) means "first run, start new ledgers".
+          for attempt in 1 2 3; do
+            if git fetch --depth=1 origin paper-ledger; then
+              git checkout FETCH_HEAD -- ledger/
+              exit 0
+            fi
+            rc=0
+            git ls-remote --exit-code --heads origin paper-ledger > /dev/null || rc=$?
+            if [ "$rc" -eq 2 ]; then
+              echo "no paper-ledger branch yet: the step opens a new \$50 ledger"
+              exit 0
+            fi
+            sleep $((attempt * 10))
+          done
+          echo "::error::could not fetch the paper-ledger branch; stopping so the ledgers are not reset"
+          exit 1
 
       - uses: actions/setup-python@v5
         with:
@@ -63,10 +77,31 @@ jobs:
             git worktree add "$work" FETCH_HEAD
             git -C "$work" checkout -B paper-ledger
           else
+            rc=0
+            git ls-remote --exit-code --heads origin paper-ledger > /dev/null || rc=$?
+            if [ "$rc" -ne 2 ]; then
+              echo "::error::could not fetch the paper-ledger branch to save onto; not saving"
+              exit 1
+            fi
             git worktree add --detach "$work"
             git -C "$work" checkout --orphan paper-ledger
             git -C "$work" rm -rfq .
           fi
+          # Never let a run replace an account with a younger one: same start time, and the run
+          # count only goes up. A reset needs a deliberate manual edit of the branch.
+          python3 - "$work" <<'PY'
+          import glob, json, sys
+          work = sys.argv[1]
+          for new in sorted(glob.glob("ledger/*/paper.json")):
+              try:
+                  old = json.load(open(f"{work}/{new}"))["meta"]
+              except FileNotFoundError:
+                  continue
+              m = json.load(open(new))["meta"]
+              if m["started_ts"] != old["started_ts"] or m["runs"] < old["runs"]:
+                  sys.exit(f"::error::{new} would replace the saved account (started {old['started_ts']}, "
+                           f"{old['runs']} runs) with started {m['started_ts']}, {m['runs']} runs; not saving")
+          PY
           git -C "$work" rm -q --ignore-unmatch ledger/paper.json ledger/kills.json   # pre-multi-coin layout
           for d in ledger/*/; do
             [ -f "$d/paper.json" ] || continue
@@ -82,7 +117,7 @@ jobs:
           git push origin paper-ledger
 
       - name: Build the boards
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.load.outcome == 'success' }}
         run: |
           mkdir -p _site/boards
           cp dashboard/* _site/
@@ -94,10 +129,10 @@ jobs:
           ls -l _site _site/boards
 
       - uses: actions/upload-pages-artifact@v3
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.load.outcome == 'success' }}
         with:
           path: _site
 
       - id: deploy
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.load.outcome == 'success' }}
         uses: actions/deploy-pages@v4
