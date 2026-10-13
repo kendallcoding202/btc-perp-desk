@@ -40,7 +40,8 @@ MAX_USD = 1_000_000.0          # one flow, either way: a typo guard
 MAX_MONTHS = 600               # one plan: 50 years
 DAY_MS = 86_400_000
 YEAR_MS = 365.25 * DAY_MS
-EXTRA_KEYS = {"date", "amount", "note"}
+EXTRA_KEYS = {"date", "amount", "note", "future"}
+FUTURE_DAYS = 366              # an extra dated further ahead than this is taken for a typo unless it says "future": true
 MONTHLY_KEYS = {"amount", "day", "first", "count", "note"}
 SECTION_KEYS = {"monthly", "extra"}
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -83,8 +84,26 @@ def _strict_json(text: str, source: str):
     try:
         return json.loads(text, object_pairs_hook=pairs, parse_constant=constant)
     except json.JSONDecodeError as exc:
-        raise FlowsError(f"{source} is not valid JSON (line {exc.lineno}, column {exc.colno}: {exc.msg}). Every "
-                         f"account's step waits until it's fixed, so no deposit or withdrawal is skipped") from None
+        hint = _hint(text, exc.pos)
+        raise FlowsError(f"{source} is not valid JSON{': ' + hint if hint else ''} (line {exc.lineno}, column "
+                         f"{exc.colno}: {exc.msg}). Every account's step waits until it's fixed, so no deposit or "
+                         f"withdrawal is skipped") from None
+
+
+def _hint(text: str, pos: int) -> str:
+    """The fix, in plain words, for the slips a phone keyboard makes (JSON's own message rarely says)."""
+    before, at = text[:pos].rstrip(), text[pos:].lstrip()
+    if any(q in text for q in "\u201c\u201d\u2018\u2019"):
+        return "your keyboard typed curly quotes (\u201c \u201d); use straight \" quotes (turn off smart punctuation)"
+    if (before.endswith(",") and at[:1] in ("]", "}")) or (at[:1] == "," and at[1:].lstrip()[:1] in ("]", "}")):
+        return "remove the comma after the last entry"         # (Python 3.12 points past the comma, 3.13 at it)
+    if re.search(r"\[\s*\]$", before) and at[:1] == "{":           # an empty list, the entry typed after it
+        return "put the entry inside the list's brackets: \"extra\": [ {...} ], not after them"
+    if before[-1:] in ("}", "]") and at[:1] in ("{", "\""):
+        return "add a comma between two entries"
+    if at[:1] == "$" or (at[:1] == "-" and at[1:2].isspace()) or (re.search(r"\d,$", before) and at[:1].isdigit()):
+        return "write amounts as plain numbers: 250 or -50 (no $, no space after the minus, no thousands commas)"
+    return ""
 
 
 def _comments_ok(obj: dict, where: str) -> dict:
@@ -178,7 +197,7 @@ def _monthly(plans, where: str) -> list[Flow]:
     return out
 
 
-def _extras(items, where: str) -> list[Flow]:
+def _extras(items, where: str, today: date | None = None) -> list[Flow]:
     if not isinstance(items, list):
         raise FlowsError(f"{where} must be a list [...] of {{\"date\", \"amount\", \"note\"}} entries")
     out, per_day = [], {}
@@ -186,6 +205,12 @@ def _extras(items, where: str) -> list[Flow]:
         w = f"{where}[{k}]"
         e = _keys(e, EXTRA_KEYS, {"date", "amount"}, w)
         d = _date(e["date"], f"{w}.date")
+        if "future" in e and not isinstance(e["future"], bool):
+            raise FlowsError(f"{w}.future is {e['future']!r}; it can only be true (or left out)")
+        if today is not None and (d - today).days > FUTURE_DAYS and e.get("future") is not True:
+            # a year typo (2062 for 2026) would otherwise wait, silently, for decades
+            raise FlowsError(f"{w}.date is {e['date']!r}, more than a year from today ({today}): a typo in the year? "
+                             f"If it really is planned that far ahead, add \"future\": true to the entry")
         amount = _amount(e["amount"], f"{w}.amount", positive=False)
         n = per_day.get(d, 0)
         per_day[d] = n + 1
@@ -193,10 +218,11 @@ def _extras(items, where: str) -> list[Flow]:
     return out
 
 
-def parse(text: str, accounts, source: str = FILE) -> dict:
+def parse(text: str, accounts, source: str = FILE, now_ms: int | None = None) -> dict:
     """{account: [Flow, ...] in the order they apply, or the FlowsError for that account's entry}. A problem with the
     file as a whole (bad JSON, an account name it doesn't know) raises: it can't be pinned on one account, so every
-    account's step stops."""
+    account's step stops. With `now_ms`, an extra dated more than a year ahead is refused as a likely typo."""
+    today = None if now_ms is None else datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc).date()
     data = _strict_json(text, source)
     if not isinstance(data, dict):
         raise FlowsError(f"{source} must be one object {{\"BTC\": {{...}}, ...}}, not {type(data).__name__}")
@@ -213,7 +239,7 @@ def parse(text: str, accounts, source: str = FILE) -> dict:
             if "monthly" in section:
                 flows += _monthly(section["monthly"], f"{source}: {acc}.monthly")
             if "extra" in section:
-                flows += _extras(section["extra"], f"{source}: {acc}.extra")
+                flows += _extras(section["extra"], f"{source}: {acc}.extra", today)
             order = {"plan": 0, "extra": 1}
             out[acc] = sorted(flows, key=lambda f: (f.ts, order[f.kind], f.id))
         except FlowsError as exc:
@@ -221,14 +247,17 @@ def parse(text: str, accounts, source: str = FILE) -> dict:
     return out
 
 
-def load(path: str | Path = FILE, accounts=None) -> dict:
-    """parse() of the file; {} when there is none (no account has flows)."""
+def load(path: str | Path = FILE, accounts=None, now_ms: int | None = None) -> dict:
+    """parse() of the file, as of `now_ms` (default: now); {} when there is none (no account has flows)."""
+    import time
+
     from .thresholds import ACCOUNTS
 
     path = Path(path)
     if not path.exists():
         return {}
-    return parse(path.read_text(), accounts or ACCOUNTS, source=path.name)
+    return parse(path.read_text(), accounts or ACCOUNTS, source=path.name,
+                 now_ms=int(time.time() * 1000) if now_ms is None else now_ms)
 
 
 def schedule(plans: dict, account: str) -> list[Flow]:
@@ -250,9 +279,14 @@ def due(flows: list[Flow], recorded: list[dict], now_ms: int, account: str = "")
         f = by_id.get(r["id"])
         if f is None or f.date != r["date"] or abs(f.amount - r["amount"]) > 1e-9:
             now = "no longer lists it" if f is None else f"now says {f.amount:+,.2f} on {f.date}"
-            raise FlowsError(f"{who}the ledger recorded {r['id']} ({r['amount']:+,.2f} on {r['date']}) but "
-                             f"{FILE} {now}. A recorded deposit or withdrawal can't be removed or changed: put it "
-                             f"back as it was, and correct it with a new extra entry (below 0 takes money out)")
+            # the likeliest way to get here without editing anything: a new extra put above one on the same day
+            # (entries on one day are numbered in file order)
+            same_day = r["kind"] == "extra" and any(g.kind == "extra" and g.date == r["date"] for g in flows)
+            fix = (f"if you added an entry dated {r['date']}, move it below the one already there. Otherwise " if
+                   same_day else "")
+            raise FlowsError(f"{who}{fix}put back what was recorded: a recorded deposit or withdrawal can't be "
+                             f"removed or changed (correct it with a new extra entry; below 0 takes money out). The "
+                             f"ledger recorded {r['id']} ({r['amount']:+,.2f} on {r['date']}) but {FILE} {now}")
     done = {r["id"] for r in recorded}
     return [f for f in flows if f.ts <= now_ms and f.id not in done]
 
@@ -283,10 +317,38 @@ def rescale_brakes(risk, equity: float, amount: float) -> None:
     risk.day_start_equity *= s
 
 
-def apply_desk(desk, f: Flow, ts: int, price: float, start_equity: float, recorded: list[dict]) -> dict:
+def withdrawal_wait(amount: float, equity: float, cash: float, notional: float, max_leverage: float) -> str | None:
+    """Why a withdrawal can't go out now (None: it can), the way an exchange keeps back what an open position needs:
+    the realised cash must stay above 0, and the position within `max_leverage` of what's left. Flat, anything up to
+    the whole account can go (more than that is refused by record())."""
+    if amount >= 0 or notional <= 0:
+        return None
+    left = equity + amount
+    if cash + amount > 0 and left > 0 and notional / left <= max_leverage:
+        return None
+    most = max(0.0, min(cash, equity - notional / max_leverage))
+    return (f"the open position needs the money: ${notional:,.2f} held, at most {max_leverage:g}x the account, so at "
+            f"most ${most:,.2f} of the ${equity:,.2f} can come out now")
+
+
+def _waiting(say, events, f: Flow, ts: int, why: str) -> None:
+    """Said once (the board and the phone), however many runs it waits."""
+    head = f"WITHDRAWAL ${-f.amount:,.2f} waiting ({_label(f.kind, f.note)}, {f.date})"
+    if not any(e.agent == "bank" and e.text.startswith(head) for e in events):
+        say(ts, "bank", f"{head}: {why}. It goes out at the first bar open where it fits; nothing has been taken "
+                        f"out yet")
+
+
+def apply_desk(desk, f: Flow, ts: int, price: float, start_equity: float, recorded: list[dict]) -> dict | None:
     """A desk account's flow (paper.step), at `ts` with the position marked at `price`: the cash moves, the brakes are
-    scaled, the units are bought or sold, and the board and the phone are told. Nothing else changes."""
-    eq = desk.broker.equity(price)
+    scaled, the units are bought or sold, and the board and the phone are told. Nothing else changes. None (and
+    nothing changes) for a withdrawal the open position still needs: it waits."""
+    eq, pos = desk.broker.equity(price), desk.broker.position
+    why = withdrawal_wait(f.amount, eq, desk.broker.cash, pos.notional(price) if pos else 0.0,
+                          desk.p.sizing.max_leverage)
+    if why:
+        _waiting(desk.say, desk.events, f, ts, why)
+        return None
     rec = record(f, ts, eq, desk.broker.cash, start_equity, recorded)
     desk.broker.cash += f.amount
     rescale_brakes(desk.risk, eq, f.amount)
@@ -295,10 +357,16 @@ def apply_desk(desk, f: Flow, ts: int, price: float, start_equity: float, record
     return rec
 
 
-def apply_book(book, f: Flow, ts: int, marks: dict, start_equity: float, recorded: list[dict]) -> dict:
+def apply_book(book, f: Flow, ts: int, marks: dict, start_equity: float, recorded: list[dict]) -> dict | None:
     """The VT basket's flow (paper.step_basket), at `ts` with each coin marked at `marks` (else its last close). VT
-    has no brakes: the cash and the units move, and the board and the phone are told."""
+    has no brakes: the cash and the units move, and the board and the phone are told. None for a withdrawal the
+    holdings still need (more than the rules ever hold: book_leverage x max_units): it waits."""
     eq = book.equity(marks)
+    held = sum(s.qty * marks.get(c, s.mark) for c, s in book.sleeves.items())
+    why = withdrawal_wait(f.amount, eq, book.cash, held, book.vt.book_leverage * book.vt.max_units)
+    if why:
+        _waiting(book.say, book.events, f, ts, why)
+        return None
     rec = record(f, ts, eq, book.cash, start_equity, recorded)
     book.cash += f.amount
     recorded.append(rec)
@@ -306,12 +374,15 @@ def apply_book(book, f: Flow, ts: int, marks: dict, start_equity: float, recorde
     return rec
 
 
+def _label(kind: str, note: str) -> str:
+    label = {"plan": "monthly plan", "extra": "extra", "exchange": "on the exchange"}.get(kind, kind)
+    return f"{label}: {note}" if note and note != label else label
+
+
 def describe(rec: dict) -> str:
-    """The event the board shows and the phone gets."""
+    """The event the board shows and the phone gets (with the flow's date: a desk board's events show the time only)."""
     a, e = rec["amount"], rec["equity_before"]
-    label = {"plan": "monthly plan", "extra": "extra", "exchange": "on the exchange"}.get(rec["kind"], rec["kind"])
-    if rec.get("note") and rec["note"] != label:
-        label = f"{label}: {rec['note']}"
+    label = f"{_label(rec['kind'], rec.get('note', ''))}, {rec['date']}"
     if a > 0:
         return (f"DEPOSIT ${a:,.2f} recorded ({label}) — money in, not profit. bank ${e:,.2f} → ${e + a:,.2f}; "
                 f"performance unchanged")
@@ -319,14 +390,11 @@ def describe(rec: dict) -> str:
             f"performance unchanged")
 
 
-def realised_twr(start_equity: float, recorded: list[dict], cash: float) -> float:
-    """Time-weighted return on the realised balance (cash): each stretch between flows chained, so a flow never moves
-    it. With no flows it is cash / start - 1."""
-    r, base = 1.0, start_equity
-    for rec in recorded:
-        r *= rec["cash_before"] / base
-        base = rec["cash_before"] + rec["amount"]
-    return r * cash / base - 1
+def realised_return(start_equity: float, recorded: list[dict], cash: float) -> float:
+    """The go-live gate's "up overall": the realised balance (cash) over the units, i.e. the realised NAV - 1. Each
+    flow bought or sold its units at the marked NAV it found, so neither a deposit nor a withdrawal moves it, whether
+    a position was open or not. With no flows it is cash / start - 1, as before."""
+    return cash / units(start_equity, recorded) - 1
 
 
 def years_to(target: float, equity: float, rate: float | None, future: list[tuple[float, float]]) -> float | None:
@@ -384,8 +452,11 @@ class State:
             "withdrawn": -sum(r["amount"] for r in rec if r["amount"] < 0), "count": len(rec),
             "units": self.units(), "nav": self.nav(equity), "twr": self.nav(equity) - 1,
             "pnl": equity - self.start - self.net, "start": self.start,
-            "marks": [[r["ts"], r["amount"]] for r in rec[-100:]],     # the equity chart marks each one
+            "marks": [[r["ts"], r["amount"], r["kind"]] for r in rec[-100:]],     # the equity chart marks each one
             "recent": [{k: r[k] for k in ("id", "date", "ts", "amount", "kind", "note")} for r in rec[-10:]],
             "planned": {"count": len(self.planned), "usd": sum(f.amount for f in self.planned),
-                        "next": None if nxt is None else {"id": nxt.id, "date": nxt.date, "amount": nxt.amount}},
+                        "next": None if nxt is None else {"id": nxt.id, "date": nxt.date, "amount": nxt.amount},
+                        # extras still to come, by date: one dated by mistake far ahead shows here
+                        "extras": [{"id": f.id, "date": f.date, "amount": f.amount, "note": f.note}
+                                   for f in self.planned if f.kind == "extra"][:5]},
         }

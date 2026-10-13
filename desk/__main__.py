@@ -167,14 +167,17 @@ def _notify(state: dict) -> None:
     import urllib.request
 
     t, coin = state["ticker"], state["header"].get("coin", "BTC")
+    fl = state.get("flows")     # with deposits, the percentage is the time-weighted one: they aren't in it
     body = "\n".join(f"{e['agent'].upper()}: {e['text']}" for e in events)
-    body += f"\n\n{coin} account ${t['bank']:,.2f} ({t['pnl_pct']:+.2%}) · {t['position']}"
+    body += f"\n\n{coin} account ${t['bank']:,.2f} ({t['pnl_pct']:+.2%}{' time-weighted' if fl else ''}) · {t['position']}"
     body += f" · {coin} ${t['price']:,.2f}" if t.get("price") is not None else ""    # the VT basket has no one price
-    fl = state.get("flows")
-    if fl:      # the percentage above is the time-weighted one: deposits and withdrawals aren't in it
+    if fl:
         body += f"\n{fl['net']:+,.2f} net deposited so far (not profit) · P&L {fl['pnl']:+,.2f}"
-    trade = any(w in body for w in ("BOUGHT", "SOLD", "SHORTED", "COVERED", "ADDED", "TRIMMED", "HALT", "daily"))
-    money = next((w for w in ("DEPOSIT", "WITHDRAWAL") for e in events if e["text"].startswith(w)), None)
+    # a trade is in the desk's own events, never in a bank event (its note is the owner's free text: "SOLD the bike")
+    trade = any(w in e["text"] for e in events if e["agent"] != "bank"
+                for w in ("BOUGHT", "SOLD", "SHORTED", "COVERED", "ADDED", "TRIMMED", "HALT", "daily"))
+    money = next((w + (" waiting" if " waiting (" in e["text"] else "") for w in ("DEPOSIT", "WITHDRAWAL")
+                  for e in events if e["agent"] == "bank" and e["text"].startswith(w)), None)
     name = "basket" if state["header"].get("kind") == "basket" else "desk"
     req = urllib.request.Request(f"https://ntfy.sh/{topic}", data=body.encode(), method="POST", headers={
         "Title": f"{coin} {name}: " + ("TRADE" if trade else money or "update"),
@@ -184,6 +187,41 @@ def _notify(state: dict) -> None:
         urllib.request.urlopen(req, timeout=10).read()
     except Exception as exc:  # a missed notification must never break the ledger
         print(f"  notify failed: {exc}")
+
+
+PAUSED_PUSH_EVERY_MS = 6 * 3600_000     # a deposits.json mistake is pushed again every 6 hours until it's fixed
+
+
+def _notify_paused(paused: list[tuple[str, str]], path: Path, now_ms: int | None = None) -> bool:
+    """A deposits.json mistake stops those accounts until it's fixed: tell the phone. Runs keep no state between them,
+    so it's pushed on the first run after the file was last committed (the edit that broke it), then once every
+    PAUSED_PUSH_EVERY_MS. Returns whether it pushed."""
+    import subprocess
+    import time
+    import urllib.request
+
+    topic = os.environ.get("NTFY_TOPIC", "").strip()
+    if not topic:
+        return False
+    now = int(time.time() * 1000) if now_ms is None else now_ms
+    try:    # the file's last commit (the Action checks main out): the owner's edit
+        out = subprocess.run(["git", "log", "-1", "--format=%ct", "--", path.name], cwd=path.resolve().parent,
+                             capture_output=True, text=True, timeout=10).stdout.strip()
+        edited = int(out) * 1000 if out else 0
+    except Exception:
+        edited = 0
+    if not (0 <= now - edited < 20 * 60_000 or now % PAUSED_PUSH_EVERY_MS < 15 * 60_000):
+        return False
+    names = ", ".join(c for c, _ in paused)
+    body = "\n\n".join(f"{c}: {text}" for c, text in paused) + (
+        f"\n\nNothing is lost: fix {path.name} on main and the next run catches up every missed candle.")
+    req = urllib.request.Request(f"https://ntfy.sh/{topic}", data=body.encode(), method="POST", headers={
+        "Title": f"{names} paused: {path.name}", "Priority": "high", "Tags": "warning"})
+    try:
+        urllib.request.urlopen(req, timeout=10).read()
+    except Exception as exc:  # a missed notification must never break the step
+        print(f"  notify failed: {exc}")
+    return True
 
 
 def migrate_ledger(root: Path) -> bool:
@@ -210,7 +248,7 @@ def cmd_step(args) -> int:
     coins = [c.strip().upper() for c in args.coins.split(",") if c.strip()]
     root = Path(args.ledger)
     migrated = migrate_ledger(root)
-    changed, failed, summary = migrated, [], []
+    changed, failed, summary, paused = migrated, [], [], []
     try:    # deposits and withdrawals: a bad file stops the accounts it may be about, loudly, never silently
         plans = flows_mod.load(getattr(args, "flows", flows_mod.FILE))
     except flows_mod.FlowsError as exc:
@@ -227,7 +265,10 @@ def cmd_step(args) -> int:
             failed.append(coin)
             print(f"  {coin}: step failed: {type(exc).__name__}: {exc}")
             traceback.print_exc()
-            summary.append({"coin": coin, "error": f"{type(exc).__name__}: {exc}"[:200]})
+            summary.append({"coin": coin, "error": f"{type(exc).__name__}: {exc}"[:600 if isinstance(
+                exc, flows_mod.FlowsError) else 200]})
+            if isinstance(exc, flows_mod.FlowsError):
+                paused.append((coin, str(exc)))
             continue
         _notify(s)
         changed = changed or s["paper"]["changed"]
@@ -246,6 +287,8 @@ def cmd_step(args) -> int:
         else:
             row.update({"kind": "desk", "risk_per_trade": p.sizing.risk_per_trade, "shorts": p.strategy.allow_shorts})
         summary.append(row)
+    if paused:
+        _notify_paused(paused, Path(getattr(args, "flows", flows_mod.FILE)))
     root.mkdir(parents=True, exist_ok=True)
     (root / "index.json").write_text(json.dumps({"updated": int(time.time() * 1000), "coins": summary}))
     if os.environ.get("GITHUB_OUTPUT"):   # tells the workflow whether the ledger needs saving
@@ -272,20 +315,21 @@ def promotion_status(p: Params) -> list[tuple[str, bool, str]]:
 
     days = (time.time() * 1000 - meta.get("started_ts", time.time() * 1000)) / 86400_000
     ret = broker["cash"] / meta.get("start_equity", broker["cash"]) - 1 if meta.get("start_equity") else 0.0
-    shown = f"{ret:+.2%} realised"
+    shown, up = f"{ret:+.2%} realised", ret > p.promotion.min_paper_return
     recorded = saved.get("flows") or []
-    if recorded:    # "up overall" is the trading's, never the money put in: time-weighted, flows taken out
+    if recorded:    # "up overall" is the trading's, never the money put in or taken out
         from . import flows as flows_mod
 
         start = meta.get("start_equity", 0.0)
         net = sum(r["amount"] for r in recorded)
-        ret = flows_mod.realised_twr(start, recorded, broker["cash"])
-        shown = (f"{ret:+.2%} realised, time-weighted · P&L {broker['cash'] - start - net:+,.2f} · "
-                 f"{net:+,.2f} net deposited, not counted")
+        ret = flows_mod.realised_return(start, recorded, broker["cash"])    # the realised NAV: a flow never moves it
+        pnl = broker["cash"] - start - net                                  # and in dollars, flows left out
+        up = ret > p.promotion.min_paper_return and pnl > 0
+        shown = (f"{ret:+.2%} realised, time-weighted · P&L {pnl:+,.2f} · {net:+,.2f} net deposited, not counted"
+                 + ("" if up or ret <= p.promotion.min_paper_return else " (the P&L must be up too)"))
     checks.append((f"paper traded ≥ {p.promotion.min_paper_days:.0f} days", days >= p.promotion.min_paper_days,
                    f"{days:.1f} days"))
-    checks.append((f"paper return > {p.promotion.min_paper_return:.0%}", ret > p.promotion.min_paper_return,
-                   shown))
+    checks.append((f"paper return > {p.promotion.min_paper_return:.0%}", up, shown))
     return checks
 
 

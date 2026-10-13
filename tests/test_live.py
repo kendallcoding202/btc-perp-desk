@@ -1469,7 +1469,7 @@ def test_live_a_deposit_during_a_35pct_drawdown_doesnt_hide_it(tmp_path, monkeyp
     assert dd == pytest.approx(0.35) and not saved["risk"]["halted"] and not kills.get("entry_kill")
     assert saved["risk"]["peak_equity"] == pytest.approx(10_000.0 * 11_500 / 6_500)
     said = [e["text"] for e in saved["events"] if e["agent"] == "bank"]
-    assert said == ["DEPOSIT $5,000.00 recorded (on the exchange: deposit) — money in, not profit. bank $6,500.00 → "
+    assert said == ["DEPOSIT $5,000.00 recorded (on the exchange: deposit, 2020-12-06) — money in, not profit. bank $6,500.00 → "
                     "$11,500.00; performance unchanged"]
     t = states[-1]["ticker"]
     assert t["bank"] == 11_500.0 and t["pnl"] == pytest.approx(-3_500.0) and t["pnl_pct"] == pytest.approx(-0.35)

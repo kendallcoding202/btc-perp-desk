@@ -1,7 +1,8 @@
 {
-  "_how": "Money put into or taken out of a paper account, so the desk never counts it as profit or loss. Amounts are dollars; an extra below 0 is a withdrawal. Add new extras at the end of the list. Never edit or delete one that's already been recorded: correct it with another extra. README: Deposits and withdrawals.",
+  "_how": "Money put into or taken out of a paper account, so the desk never counts it as profit or loss. Put each extra on its own line between the [ and the ]: {\"date\": \"2026-12-15\", \"amount\": 250, \"note\": \"bonus\"}, with a comma after every entry but the last. Plain numbers in dollars; below 0 is a withdrawal. Add new extras at the end. Never edit or delete one that's already been recorded: correct it with another extra. README: Deposits and withdrawals.",
   "BTC": {
     "monthly": {"amount": 100, "day": 1, "first": "2026-11-01", "count": 60},
-    "extra": []
+    "extra": [
+    ]
   }
 }

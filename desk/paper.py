@@ -14,9 +14,12 @@ experiment's history is permanent and auditable): paper.json + kills.json + boar
 
 `step_basket()` does the same for the VT basket (desk/voltrend.py) in ledger/VT/.
 
-Both take the account's deposits and withdrawals (desk/flows.py, from deposits.json): each one is applied once, at the
-open of the first bar that opens on or after its date's 00:00 UTC, before that bar's fills, and kept in the ledger's
-"flows" list. A ledger that has none has no "flows" key, as before.
+Both take the account's deposits and withdrawals (desk/flows.py, from deposits.json): each one is applied once and
+kept in the ledger's "flows" list (a ledger that has none has no "flows" key, as before). A run on time puts it in
+at this run's price, the one the board marks the account at, after the forming bar's fills: the performance figure
+reads the same just before and just after it. A run that catches up bars it missed puts it in at the open of the
+first of them on or after its date's 00:00 UTC, before that bar's fills. A withdrawal the open position still needs
+waits for the first bar open where it fits (flows.withdrawal_wait), with everything dated after it.
 """
 
 from __future__ import annotations
@@ -89,10 +92,13 @@ def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=
     todo = flows_mod.due(flows or [], recorded, now, p.market.symbol)    # before any request: a bad file stops here
 
     def take_flows(ts: int, price: float) -> None:
-        """Every flow due by `ts` (a bar's open), at that bar's open price, before its fills: money in or out, the
-        brakes scaled so they read the same percentage, nothing else touched."""
+        """Every flow due by `ts`, in at `price`: money in or out, the brakes scaled so they read the same percentage,
+        nothing else touched. A withdrawal the open position needs stops the queue there, until a later bar."""
         while todo and todo[0].ts <= ts:
-            rec = flows_mod.apply_desk(desk, todo.pop(0), ts, price, meta["start_equity"], recorded)
+            rec = flows_mod.apply_desk(desk, todo[0], ts, price, meta["start_equity"], recorded)
+            if rec is None:
+                return
+            todo.pop(0)
             log(f"{p.market.symbol}: {flows_mod.describe(rec)}")
 
     raw = feed.candles(start_ms=now - LOOKBACK_BARS * feed.bar_ms, closed_only=False)
@@ -152,19 +158,23 @@ def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=
     if forming is not None and forming.ts > meta["last_bar_ts"]:
         # The bar that's still forming: orders decided at the last close fill at its open (the backtest's price),
         # and the stop is checked against its range so far. Same fills as the backtest, minus the wait for the bar to close.
-        take_flows(forming.ts, forming.open)
         n0, had = len(broker.trades), broker.position is not None
         broker.fill_pending(forming.open, forming.ts)
         broker.check_stop_bar(forming)
         note_fills(n0, had, now)
+        # Money in or out due by now goes in now, after those fills, at the price the board marks the account at
+        # (board.build): its units at the NAV the board shows, so the performance figure doesn't move.
+        take_flows(now, ctx.mid if ctx and ctx.mid else bars[-1].close)
 
     if processed == 0 and desk.last_decision is None:
         eq = broker.equity(ctx.mid or bars[-1].close)
         desk.last_decision = evaluate_entry(p, f, len(bars) - 1, equity=eq, kills=desk.kill_gates(now, eq),
                                             ctx=ctx, now_ms=now)
 
-    if todo:    # due, but no bar has opened since its date's 00:00 UTC in this answer: the next run takes it
-        log(f"{p.market.symbol}: {', '.join(fl.id for fl in todo)} due; recorded at the next bar's open")
+    if todo:    # a withdrawal the open position needs, or no forming bar in this answer: the next run tries again
+        log(f"{p.market.symbol}: {', '.join(fl.id for fl in todo)} due, not in yet: "
+            + ("a withdrawal waiting for the open position to release it" if todo[0].amount < 0 and broker.position
+               else "recorded at the next run"))
     new_events = _new_events(before, desk.events)
 
     meta["runs"] += 1
@@ -226,12 +236,16 @@ def step_basket(vt: VolTrend = VOLTREND, ledger_dir: str | Path = "ledger/VT", f
     before = list(book.events)
     todo = flows_mod.due(flows or [], recorded, now, "VT")
 
-    def take_flows(ts: int, opens: dict) -> None:
-        """Every flow due by the daily open `ts`, before that day's fills, with each coin marked at its open (a coin
-        with no bar that day at its last close). VT has no brakes: only the cash and the units move."""
+    def take_flows(ts: int, marks: dict) -> bool:
+        """Every flow due by `ts`, with each coin marked at `marks` (a coin not in it at its last close). VT has no
+        brakes: only the cash and the units move. False when a withdrawal the holdings need stops the queue there."""
         while todo and todo[0].ts <= ts:
-            rec = flows_mod.apply_book(book, todo.pop(0), ts, opens, meta["start_equity"], recorded)
+            rec = flows_mod.apply_book(book, todo[0], ts, marks, meta["start_equity"], recorded)
+            if rec is None:
+                return False
+            todo.pop(0)
             log(f"VT: {flows_mod.describe(rec)}")
+        return True
 
     # Enough history for the 50-day average at the oldest close still to process (after an outage, fetch more).
     since = now - VT_LOOKBACK_DAYS * day
@@ -296,7 +310,7 @@ def step_basket(vt: VolTrend = VOLTREND, ledger_dir: str | Path = "ledger/VT", f
 
             if not todo:
                 voltrend.advance(book, closed, fbar, days, after=after)
-            else:   # the same loop, cut at each flow's day so the flow goes in at that day's open
+            else:   # catching up: the same loop, cut at each flow's day so the flow goes in at that day's open
                 opens = {c: {b.ts: b.open for b in closed[c]} for c in vt.coins}
                 run: list[int] = []
                 for d in days:
@@ -315,12 +329,14 @@ def step_basket(vt: VolTrend = VOLTREND, ledger_dir: str | Path = "ledger/VT", f
     # close (otherwise an order belongs to an earlier open: a closed bar missing from every answer after a day with
     # no run). If a coin's forming bar isn't in the answer, they all wait for the next run.
     last = meta["last_bar_ts"]
+    marks = {c: (forming[c] if c in forming else closed[c][-1]).close for c in vt.coins}
     if all(c in forming and forming[c].ts == last + day for c in vt.coins) and \
             not any(b.ts > last for c in vt.coins for b in closed[c]):
-        take_flows(last + day, {c: forming[c].open for c in vt.coins})
         for c in vt.coins:
             book.fill_pending(c, forming[c].open, forming[c].ts)
-    marks = {c: (forming[c] if c in forming else closed[c][-1]).close for c in vt.coins}
+        # Money in or out due by now goes in now, after those fills, at the marks the board shows: its units at the
+        # NAV the board shows, so the performance figure doesn't move.
+        take_flows(now, marks)
     preview = {}
     for c in vt.coins:
         if c not in book.signals:   # day one: no decision yet, show what the rule sees at the last close
@@ -328,7 +344,9 @@ def step_basket(vt: VolTrend = VOLTREND, ledger_dir: str | Path = "ledger/VT", f
             preview[c] = {**sig, "target": sig["raw"], "held": 0.0, "ts": None}
 
     if todo:
-        log(f"VT: {', '.join(fl.id for fl in todo)} due; recorded at the next daily open every coin has")
+        log(f"VT: {', '.join(fl.id for fl in todo)} due, not in yet: " +
+            ("a withdrawal waiting for the holdings to release it" if todo[0].amount < 0 and any(
+                s.qty for s in book.sleeves.values()) else "recorded at the next run with every coin's forming bar"))
     new_events = _new_events(before, book.events)
     meta["runs"] += 1
     meta["last_run_ts"] = now

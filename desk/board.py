@@ -129,7 +129,8 @@ def _goal_with_flows(equity, start, target, pace, elapsed_days, flows, now_ms) -
         "years_at_test_rate_without_plan": no_plan(test),
         "deposited": s["net"], "deposits_in": s["deposited"], "withdrawn": s["withdrawn"],
         "planned_left": s["planned"]["count"], "planned_left_usd": s["planned"]["usd"],
-        "plan_included": True, "twr": s["twr"],
+        "plan_included": bool(future), "twr": s["twr"],
+        "next_extra": (s["planned"]["extras"] or [None])[0],
     })
     return g
 
