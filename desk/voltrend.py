@@ -547,10 +547,11 @@ def write_report(rep: dict, out_dir: str | Path = "reports", name: str = "backte
               "The same rules were simulated in the edge hunt with pandas on Binance 1h bars resampled to days "
               "(`research/edge-hunt-2026-10/candidates/voltgt/held_quantity_version.py`). Returns agree. Two things differ:",
               "",
-              "- **Its 2020-23 Sharpe is lower (1.63) for a reason that isn't the strategy.** Its data drops the 5 days "
-              "in 2022 when SOL's 1h file is missing an hour, and on those days it leaves SOL's position out of equity: "
-              "a fake -12.5% day, then the money comes back. Keeping SOL at its last close (as this backtest does) gives "
-              "1.86 in that same simulation, with the same +279%.",
+              "- **Its 2020-23 Sharpe is lower (1.63) for a reason that isn't the strategy.** Binance's archive has no "
+              "SOL bars for 5 days in 2022 (02-26 to 02-28, 04-01, 04-02), in either the 1h or the 1d files. On those "
+              "days the research simulation leaves SOL's position out of equity: a fake -12.5% day, then the money "
+              "comes back. Keeping SOL at its last close (as this backtest does) gives 1.86 in that same simulation, "
+              "with the same +279%.",
               "- **Blocked-order counts differ on small accounts.** The research version runs the 25% band on one "
               "continuous series; this account runs it on the units it actually holds, as the rule is written (a "
               "skipped entry leaves it at 0 units). With the band on held units, the research simulation reproduces "

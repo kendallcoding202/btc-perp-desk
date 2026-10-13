@@ -184,9 +184,10 @@ class VolTrend:
     min_order_usd: float = 10.0         # Hyperliquid's minimum order: smaller entries and resizes are skipped
                                         # (a skipped entry is retried at the next close; exits always go through)
     starting_equity: float = 500.0      # entries are ~0.14x equity and resizes ~0.06x, so below ~$250 the $10
-                                        # minimum blocks most ETH/SOL orders (fresh starts since 2024: $50 has 351
-                                        # orders blocked, $250 28, $500 3). Yours to change: the backtest's minimum-
-                                        # capital table (reports/backtest-VT.md) shows what each size costs
+                                        # minimum starts skipping ETH/SOL orders (a fifth to a third of them at
+                                        # $150) and at $50 it blocks most of them (fresh starts since 2024: $50 has
+                                        # 351 orders blocked, $250 28, $500 3). Yours to change: the backtest's
+                                        # minimum-capital table (reports/backtest-VT.md) shows what each size costs
     goal_equity: float = 100_000.0      # the board tracks progress toward this, like the desk accounts
 
 

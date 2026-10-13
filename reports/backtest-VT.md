@@ -2,7 +2,7 @@
 
 PAPER EXPERIMENT. There is no live mode for this account.
 
-2020-01-01 → 2026-09-30 (6.7 years), Binance perp daily bars and funding. Generated 2026-10-13T00:32:04+00:00.
+2020-01-01 → 2026-09-30 (6.7 years), Binance perp daily bars and funding. Generated 2026-10-13T01:52:08+00:00.
 Rules (thresholds.VolTrend, frozen): a third of the book per coin; units = min(2, 0.40 / 10-day realised vol) while the close is above its 50-day average, else 0; held units change only past a 25% band; notional = equity x 0.65 / 3 x units. Decided at the 00:00 UTC close, filled at the next day's open.
 Costs charged: taker fee 4.5 bps + slippage 3.0 bps per fill, plus real funding prints. Start equity $500, Hyperliquid's $10 minimum order applied (exits always go through).
 
@@ -58,7 +58,7 @@ Daily-return correlation with the desk's three accounts (research/edge-hunt-2026
 
 The same rules were simulated in the edge hunt with pandas on Binance 1h bars resampled to days (`research/edge-hunt-2026-10/candidates/voltgt/held_quantity_version.py`). Returns agree. Two things differ:
 
-- **Its 2020-23 Sharpe is lower (1.63) for a reason that isn't the strategy.** Its data drops the 5 days in 2022 when SOL's 1h file is missing an hour, and on those days it leaves SOL's position out of equity: a fake -12.5% day, then the money comes back. Keeping SOL at its last close (as this backtest does) gives 1.86 in that same simulation, with the same +279%.
+- **Its 2020-23 Sharpe is lower (1.63) for a reason that isn't the strategy.** Binance's archive has no SOL bars for 5 days in 2022 (02-26 to 02-28, 04-01, 04-02), in either the 1h or the 1d files. On those days the research simulation leaves SOL's position out of equity: a fake -12.5% day, then the money comes back. Keeping SOL at its last close (as this backtest does) gives 1.86 in that same simulation, with the same +279%.
 - **Blocked-order counts differ on small accounts.** The research version runs the 25% band on one continuous series; this account runs it on the units it actually holds, as the rule is written (a skipped entry leaves it at 0 units). With the band on held units, the research simulation reproduces this report's minimum-capital table.
 
 | Sharpe / return | This backtest | Research |
