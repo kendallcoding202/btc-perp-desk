@@ -74,6 +74,8 @@ class FakeHyperliquid:
         self.orders: list[dict] = []              # every create_order call, as sent
         self.cancels: list[str] = []
         self.fail: dict[str, int] = {}            # call kind -> how many of the next calls raise
+        self.fail_after: dict[str, int] = {}      # ...raise after the exchange took the order (a timeout)
+        self.stops_vanish = False                 # stop orders are acknowledged but never rest
         self.calls: list[str] = []
         self.now = T0
         self.oid = 100
@@ -191,6 +193,12 @@ class FakeHyperliquid:
                                  "reduceOnly": bool(params.get("reduceOnly"))}
             self.status[oid] = {"id": oid, "symbol": symbol, "status": "open", "side": side, "amount": sz,
                                 "filled": 0.0, "average": None, "triggerPrice": trig, "fee": None}
+            if self.stops_vanish:
+                del self.resting[oid]
+                self.status[oid]["status"] = "rejected"
+            if self.fail_after.get(kind, 0) > 0:
+                self.fail_after[kind] -= 1
+                raise ExchangeDown("stop: read timed out")
             return {"info": {"resting": {"oid": int(oid)}}, "id": oid, "symbol": symbol, "status": None,
                     "side": None, "amount": None, "filled": None, "average": None, "price": None, "fee": None,
                     "trades": []}
@@ -328,3 +336,82 @@ def test_live_refuses_a_coin_or_venue_with_no_market_and_a_cap_below_the_minimum
     with pytest.raises(LiveSetupError, match="minimum"):
         _broker("ETH", ex, tmp_path, cap=5.0)
     assert live_mod.market_symbol("hyperliquid", "eth") == "ETH/USDC:USDC"
+
+
+# ---------------------------------------------------------------- bug 2: never a position without a stop
+
+class Sleeps(list):
+    def __call__(self, s):
+        self.append(s)
+
+
+def _long_btc(tmp_path, ex, **kw):
+    b = _broker("BTC", ex, tmp_path, cap=500.0, **kw)
+    b.submit(Order("open", Side.LONG, 0.005, "breakout", stop=80_000.0))
+    b.execute_now(82_000.0, T0)
+    return b
+
+
+def test_a_stop_that_fails_is_retried_with_backoff_until_it_rests_on_the_exchange(tmp_path):
+    ex, naps = FakeHyperliquid(PRICES), Sleeps()
+    ex.fail["stop"] = 2                                      # rate-limited twice, then it goes through
+    b = _long_btc(tmp_path, ex, sleep=naps)
+    stops = ex.fetch_open_orders("BTC/USDC:USDC")
+    assert len(stops) == 1 and stops[0]["triggerPrice"] == 80_000.0 and stops[0]["reduceOnly"]
+    assert b.position is not None and b.stop_order_id == stops[0]["id"]
+    assert [o["kind"] for o in ex.orders] == ["entry", "stop", "stop", "stop"] and naps == [1.0, 2.0]
+
+
+@pytest.mark.parametrize("how", ["every call fails", "accepted but never rests"])
+def test_a_stop_that_never_rests_closes_the_position_and_alerts(tmp_path, how):
+    ex, naps, said = FakeHyperliquid(PRICES), Sleeps(), []
+    if how == "every call fails":
+        ex.fail["stop"] = 99
+    else:
+        ex.stops_vanish = True
+    b = _long_btc(tmp_path, ex, sleep=naps, on_alert=said.append)
+    assert b.position is None and "BTC/USDC:USDC" not in ex.positions        # flat on the exchange too
+    close = ex.orders[-1]
+    assert close["kind"] == "close" and close["params"] == {"reduceOnly": True} and close["side"] == "sell"
+    assert b.trades[-1].reason == "no_stop" and len(naps) == 3
+    assert any("closing" in a for a in said)
+
+
+def test_a_stop_the_exchange_took_despite_an_error_is_not_placed_twice(tmp_path):
+    ex = FakeHyperliquid(PRICES)
+    ex.fail_after["stop"] = 1                                # placed, but the answer timed out
+    b = _long_btc(tmp_path, ex, sleep=Sleeps())
+    assert len(ex.fetch_open_orders("BTC/USDC:USDC")) == 1 and b.position is not None
+
+
+def test_every_sync_puts_back_a_stop_that_has_gone_missing(tmp_path):
+    ex, said = FakeHyperliquid(PRICES), []
+    b = _long_btc(tmp_path, ex, sleep=Sleeps(), on_alert=said.append)
+    ex.resting.clear()                                       # cancelled on the exchange (by hand, or lost)
+    b.check_stop_price(82_100.0, T0 + 60_000)
+    stops = ex.fetch_open_orders("BTC/USDC:USDC")
+    assert len(stops) == 1 and stops[0]["triggerPrice"] == 80_000.0
+    assert any("no stop resting" in a for a in said)
+    b.check_stop_price(82_200.0, T0 + 120_000)               # and a sync with the stop in place sends nothing
+    assert len(ex.orders) == 3
+
+
+def test_a_trail_move_that_fails_keeps_the_old_stop_and_is_retried_at_the_next_sync(tmp_path):
+    ex = FakeHyperliquid(PRICES)
+    b = _long_btc(tmp_path, ex, sleep=Sleeps())
+    ex.fail["stop"] = live_mod.STOP_ATTEMPTS                 # every try of the move fails
+    b.update_stop(81_000.0)
+    assert b.position is not None                             # still protected by the old stop: not flattened
+    assert [o["triggerPrice"] for o in ex.fetch_open_orders("BTC/USDC:USDC")] == [80_000.0]
+    b.check_stop_price(82_000.0, T0 + 60_000)
+    assert [o["triggerPrice"] for o in ex.fetch_open_orders("BTC/USDC:USDC")] == [81_000.0]
+
+
+def test_a_close_leaves_no_stop_behind_to_close_the_next_position(tmp_path):
+    ex = FakeHyperliquid(PRICES)
+    b = _long_btc(tmp_path, ex, sleep=Sleeps())
+    ex.fail["cancel"] = 1                                    # the cancel after the close fails once...
+    b.close_now(82_500.0, T0 + 60_000, "flat_kill")
+    assert b.position is None and "BTC/USDC:USDC" not in ex.positions
+    b.check_stop_price(82_500.0, T0 + 120_000)               # ...and the next sync cancels it
+    assert ex.fetch_open_orders("BTC/USDC:USDC") == []

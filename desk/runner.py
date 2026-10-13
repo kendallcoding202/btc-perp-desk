@@ -10,7 +10,9 @@ Every `poll` seconds:
 from __future__ import annotations
 
 import json
+import os
 import time
+import urllib.request
 from pathlib import Path
 
 from . import board as board_mod
@@ -26,6 +28,19 @@ LOOKBACK_BARS = 1500
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _push(title: str, body: str) -> None:
+    """A live alert to the phone via ntfy.sh, if NTFY_TOPIC is set (the same topic the paper desk notifies on)."""
+    topic = os.environ.get("NTFY_TOPIC", "").strip()
+    if not topic:
+        return
+    req = urllib.request.Request(f"https://ntfy.sh/{topic}", data=body.encode(), method="POST",
+                                 headers={"Title": title, "Priority": "urgent", "Tags": "rotating_light"})
+    try:
+        urllib.request.urlopen(req, timeout=10).read()
+    except Exception as exc:  # a missed notification must never stop the loop
+        print(f"  alert push failed: {type(exc).__name__}")
 
 
 def _atomic_write(path: Path, data: dict) -> None:
@@ -65,9 +80,17 @@ def run(p: Params, mode: str, *, state_dir: str = "state", poll_s: float = 15.0,
     feed = HyperliquidFeed(p.market.symbol, p.market.interval)
 
     from .brokers.live import LiveBroker
-    broker = LiveBroker(p, state_path=state_dir_p / "live_position.json", max_notional_usd=max_notional)
+    broker = LiveBroker(p, state_path=state_dir_p / "live_position.json", max_notional_usd=max_notional, log=log)
 
     desk = Desk(p, broker, jev=jev)
+
+    def on_alert(text: str) -> None:    # the broker's alerts: on the board, and on the phone
+        desk.say(_now_ms(), "risk", f"ALERT: {text}")
+        _push(f"{p.market.symbol} LIVE: ALERT", text)
+
+    broker.on_alert = on_alert
+    for _, text in broker.alerts:       # raised while the broker started up, before the board existed
+        on_alert(text)
     meta = {"started_ts": _now_ms(), "start_equity": broker.cash, "last_bar_ts": 0}
     if desk_path.exists():
         saved = json.loads(desk_path.read_text())
