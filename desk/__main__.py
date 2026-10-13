@@ -3,7 +3,7 @@
     backtest     replay history with every cost charged, write reports/backtest[-COIN].md  (--coin BTC|ETH|SOL)
     vt-backtest  the VT vol-trend basket's backtest (BTC+ETH+SOL, daily), write reports/backtest-VT.md
     replay       watch the desk trade history on the board (http://127.0.0.1:8787)
-    paper        one coin's $150 paper account on live Hyperliquid prices, with a live local board
+    paper        one coin's paper account on live prices (BTC: Coinbase's rules and prices), with a live local board
     step         process newly closed bars for every paper account (BTC, ETH, SOL, VT) once, then exit (cron / Actions)
     live         trade real money — refuses unless the backtest AND paper record pass
     reset-halt   clear a drawdown halt after you've looked at what happened
@@ -224,6 +224,27 @@ def _notify_paused(paused: list[tuple[str, str]], path: Path, now_ms: int | None
     return True
 
 
+def _notify_refused(refused: list[tuple[str, str]], now_ms: int | None = None) -> bool:
+    """A ledger from another venue stops that account until a human archives it (paper.LedgerRefused): tell the
+    phone, once every PAUSED_PUSH_EVERY_MS (runs keep no state between them). Returns whether it pushed."""
+    import time
+    import urllib.request
+
+    topic = os.environ.get("NTFY_TOPIC", "").strip()
+    now = int(time.time() * 1000) if now_ms is None else now_ms
+    if not topic or now % PAUSED_PUSH_EVERY_MS >= 15 * 60_000:
+        return False
+    names = ", ".join(c for c, _ in refused)
+    body = "\n\n".join(f"{c}: {text}" for c, text in refused) + "\n\nThe other accounts keep running."
+    req = urllib.request.Request(f"https://ntfy.sh/{topic}", data=body.encode(), method="POST", headers={
+        "Title": f"{names} paused: ledger from another venue", "Priority": "high", "Tags": "warning"})
+    try:
+        urllib.request.urlopen(req, timeout=10).read()
+    except Exception as exc:  # a missed notification must never break the step
+        print(f"  notify failed: {exc}")
+    return True
+
+
 def migrate_ledger(root: Path) -> bool:
     """The desk began as one BTC account in ledger/; each coin now has its own ledger/<COIN>/. Moves it once."""
     old, new = root / "paper.json", root / "BTC"
@@ -248,7 +269,7 @@ def cmd_step(args) -> int:
     coins = [c.strip().upper() for c in args.coins.split(",") if c.strip()]
     root = Path(args.ledger)
     migrated = migrate_ledger(root)
-    changed, failed, summary, paused = migrated, [], [], []
+    changed, failed, summary, paused, refused = migrated, [], [], [], []
     try:    # deposits and withdrawals: a bad file stops the accounts it may be about, loudly, never silently
         plans = flows_mod.load(getattr(args, "flows", flows_mod.FILE))
     except flows_mod.FlowsError as exc:
@@ -266,9 +287,11 @@ def cmd_step(args) -> int:
             print(f"  {coin}: step failed: {type(exc).__name__}: {exc}")
             traceback.print_exc()
             summary.append({"coin": coin, "error": f"{type(exc).__name__}: {exc}"[:600 if isinstance(
-                exc, flows_mod.FlowsError) else 200]})
+                exc, (flows_mod.FlowsError, paper.LedgerRefused)) else 200]})
             if isinstance(exc, flows_mod.FlowsError):
                 paused.append((coin, str(exc)))
+            if isinstance(exc, paper.LedgerRefused):    # a ledger from another venue: a human archives it
+                refused.append((coin, str(exc)))
             continue
         _notify(s)
         changed = changed or s["paper"]["changed"]
@@ -286,9 +309,13 @@ def cmd_step(args) -> int:
                                      for h in s["basket"]["holdings"]]})
         else:
             row.update({"kind": "desk", "risk_per_trade": p.sizing.risk_per_trade, "shorts": p.strategy.allow_shorts})
+            if s.get("venue"):      # BTC on Coinbase: the tab says so, with the contracts it holds
+                row.update({"venue": s["venue"]["name"], "contracts": s["venue"]["contracts"]})
         summary.append(row)
     if paused:
         _notify_paused(paused, Path(getattr(args, "flows", flows_mod.FILE)))
+    if refused:
+        _notify_refused(refused)
     root.mkdir(parents=True, exist_ok=True)
     (root / "index.json").write_text(json.dumps({"updated": int(time.time() * 1000), "coins": summary}))
     if os.environ.get("GITHUB_OUTPUT"):   # tells the workflow whether the ledger needs saving

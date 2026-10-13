@@ -1,4 +1,4 @@
-"""Paper trading ledger — the paper experiments (one $150 account per coin).
+"""Paper trading ledger — the paper experiments (BTC $500 on Coinbase's rules, ETH and SOL $150, VT $500).
 
 `step()` is idempotent and catch-up safe: it loads the ledger, processes every bar
 that has closed since the last run (exactly like the backtest: orders fill at
@@ -10,7 +10,9 @@ Actions cron every 15 minutes — and the account carries on from the same ledge
 with no gaps and no double-counting.
 
 Each coin's ledger lives in ledger/<COIN>/ (saved to the paper-ledger branch, so the
-experiment's history is permanent and auditable): paper.json + kills.json + board.json.
+experiment's history is permanent and auditable): paper.json + kills.json + board.json. BTC's trades under its
+venue's rules (desk/venue.py: Coinbase's whole contracts, margin, sessions, fees) on Coinbase's own data
+(feeds/coinbase.py), exactly as the backtest applies them; the others read Hyperliquid.
 
 `step_basket()` does the same for the VT basket (desk/voltrend.py) in ledger/VT/.
 
@@ -31,14 +33,17 @@ from pathlib import Path
 from . import board as board_mod
 from . import flows as flows_mod
 from . import indicators as ind
+from . import venue as venue_mod
 from . import voltrend
+from .backtest import make_desk
 from .brokers.sim import SimBroker
 from .engine import Desk, Kills
 from .filter import evaluate_entry
 from .models import Bar
-from .thresholds import VOLTREND, Params, VolTrend
+from .thresholds import VOLTREND, Params, VolTrend, venue_for
 
 LOOKBACK_BARS = 1500
+LOOKBACK_SPARE = 60       # Coinbase: the window asked for is this many bars longer (its closures have no candles)
 FUNDING_WINDOW_MS = 4 * 86400_000
 VT_LOOKBACK_DAYS = 120    # daily candles per VT coin per run: the 50-day average and vol need 50, the rest is margin
 VT_MEMORY_BARS = 70       # closed daily bars per VT coin the ledger keeps: the 50-day window, plus 20 days to spare
@@ -65,23 +70,73 @@ def _saved(meta: dict, recorded: list[dict], **parts) -> dict:
     return {"meta": meta, **parts, **({"flows": recorded} if recorded else {})}
 
 
+class LedgerRefused(RuntimeError):
+    """A saved ledger from another venue (a Hyperliquid BTC account, now that BTC simulates Coinbase): never converted
+    or overwritten. That account's step stops, loudly, until a human archives the old ledger."""
+
+
+def _check_venue(saved: dict, p: Params, lpath: Path) -> None:
+    """The ledger's venue (meta "venue"; a ledger from before venues had none: Hyperliquid) must be the account's."""
+    was, now = saved.get("meta", {}).get("venue", "hyperliquid"), p.market.venue
+    if was == now:
+        return
+    m, b = saved.get("meta", {}), saved.get("broker", {})
+    opened = time.gmtime(m.get("started_ts", 0) / 1000)
+    venue, coin = venue_for(p), p.market.symbol
+    raise LedgerRefused(
+        f"{lpath} is a {was.capitalize()} paper account (opened {time.strftime('%Y-%m-%d %H:%M UTC', opened)}, "
+        f"${b.get('cash', 0):,.2f}, {len(b.get('trades', []))} trades, {m.get('runs', 0)} runs), but {coin} now "
+        "simulates " + (f"{venue.display} ({venue.product}, desk/thresholds.py)" if venue else now) + ". Not "
+        f"converting it: archive it by hand on the paper-ledger branch (move ledger/{coin}/paper.json to ledger/archive/"
+        f"{coin}-{was}-{m.get('start_equity', 0):.0f}usd-from-{time.strftime('%Y-%m-%d', opened)}.json, as the earlier "
+        f"runs were) and the next run opens a fresh ${p.sizing.starting_equity:,.0f} account.")
+
+
 def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=print,
          now_ms: int | None = None, flows: list | None = None) -> dict:
-    """`flows`: this account's deposits and withdrawals (flows.schedule), or None for none."""
+    """`flows`: this account's deposits and withdrawals (flows.schedule), or None for none.
+
+    An account with venue rules (thresholds.VENUES: BTC on Coinbase) reads Coinbase (feeds/coinbase.py) and trades
+    under desk/venue.py, as the backtest does: whole contracts, sessions, the overnight margin check, the fee estimate.
+    Its ledger also keeps a "venue" record: the margin rates and maintenance windows Coinbase listed, and the funding
+    log (Coinbase keeps no funding history). A ledger from another venue is refused, never converted."""
     from .feeds.hyperliquid import HyperliquidFeed
 
     ledger_dir = Path(ledger_dir)
     lpath = ledger_dir / "paper.json"
-    feed = feed or HyperliquidFeed(p.market.symbol, p.market.interval)
+    spec = venue_for(p)
     now = now_ms or int(time.time() * 1000)
+    saved = json.loads(lpath.read_text()) if lpath.exists() else None
+    if saved is not None:
+        _check_venue(saved, p, lpath)                                     # before any request
+    if spec is not None:    # and so is a deposits.json the ledger disagrees with: before Coinbase's product request
+        flows_mod.due(flows or [], list((saved or {}).get("flows") or []), now, p.market.symbol)
+    if feed is None:
+        if spec is not None:
+            from .feeds.coinbase import CoinbaseFeed
 
-    broker = SimBroker(p)
-    desk = Desk(p, broker, jev=jev)
+            feed = CoinbaseFeed(spec, p.market.interval)
+        else:
+            feed = HyperliquidFeed(p.market.symbol, p.market.interval)
+
+    vstate = None
+    if spec is None:
+        broker = SimBroker(p)
+        desk = Desk(p, broker, jev=jev)
+    else:
+        # This run's word on the contract first (margin, session, maintenance, the funding rate), the saved one if
+        # this answer has none: the rules for every bar this run processes.
+        details = feed.product() if hasattr(feed, "product") else None
+        vstate = venue_mod.remember((saved or {}).get("venue"), details, now, spec)
+        if hasattr(feed, "log"):
+            feed.log = venue_mod.FundingLog(vstate["funding_log"], spec.funding_log_days)
+        broker, desk = make_desk(p, jev=jev, windows=vstate["windows"], margin=vstate["margin"])
     meta = {"started_ts": now, "start_equity": p.sizing.starting_equity, "last_bar_ts": 0, "runs": 0,
             "interval": p.market.interval}
+    if spec is not None:
+        meta.update({"venue": spec.name, "product": spec.product})
     recorded: list[dict] = []
-    if lpath.exists():
-        saved = json.loads(lpath.read_text())
+    if saved is not None:
         broker.load_dict(saved["broker"])
         desk.load_dict(saved["desk"])
         meta.update(saved["meta"])
@@ -101,9 +156,15 @@ def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=
             todo.pop(0)
             log(f"{p.market.symbol}: {flows_mod.describe(rec)}")
 
-    raw = feed.candles(start_ms=now - LOOKBACK_BARS * feed.bar_ms, closed_only=False)
+    if spec is None:
+        raw = feed.candles(start_ms=now - LOOKBACK_BARS * feed.bar_ms, closed_only=False)
+    else:   # Coinbase has no candle while it's closed: ask for a little more, keep LOOKBACK_BARS closed ones
+        raw = feed.candles(start_ms=now - (LOOKBACK_BARS + LOOKBACK_SPARE) * feed.bar_ms, closed_only=False)
+        raw = raw[-(LOOKBACK_BARS + 1):]
     forming = raw[-1] if raw and raw[-1].ts + feed.bar_ms > now else None
     bars = raw[:-1] if forming else raw
+    if spec is not None and forming is None:
+        bars = bars[-LOOKBACK_BARS:]
     # Funding only matters for bars we're about to process and the 3-day average at the newest bar.
     # Fetching just that window keeps each step to ~4 light requests (Hyperliquid rate-limits by weight).
     since = min(meta["last_bar_ts"] or now, now) - FUNDING_WINDOW_MS
@@ -112,17 +173,20 @@ def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=
     ctx = feed.context()
     before = list(desk.events)
 
+    def qty(q: float) -> str:     # Coinbase: "3 contracts (0.03 BTC)"
+        return desk.venue.describe(q, p.market.symbol) if desk.venue is not None else f"{q:.5f} {p.market.symbol}"
+
     def note_fills(n_trades_before: int, had_position: bool, ts: int) -> None:
         """Say what FILLS and RISK just did, so the board and phone notifications show it right away."""
         for t in broker.trades[n_trades_before:]:
             verb = "SOLD" if t.side.value == "long" else "COVERED SHORT"
             desk.say(ts, "risk" if t.reason in ("stop", "take_profit") else "fills",
-                     f"{verb} {t.qty:.5f} {p.market.symbol} @ ${t.exit_price:,.2f} ({t.reason.replace('_', ' ')}) · "
+                     f"{verb} {qty(t.qty)} @ ${t.exit_price:,.2f} ({t.reason.replace('_', ' ')}) · "
                      f"trade {t.net_pnl:+,.2f} · equity ${broker.cash:,.2f}")
         if broker.position is not None and (not had_position or len(broker.trades) > n_trades_before):
             pos = broker.position
             verb = "BOUGHT" if pos.side.value == "long" else "SHORTED"
-            desk.say(ts, "fills", f"{verb} {pos.qty:.5f} {p.market.symbol} @ ${pos.entry_price:,.2f} · stop ${pos.stop:,.2f}")
+            desk.say(ts, "fills", f"{verb} {qty(pos.qty)} @ ${pos.entry_price:,.2f} · stop ${pos.stop:,.2f}")
 
     processed = 0
     if not meta["last_bar_ts"]:
@@ -130,9 +194,11 @@ def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=
         meta["last_bar_ts"] = bars[-1].ts
         eq = broker.equity(bars[-1].close)
         desk.last_decision = evaluate_entry(p, f, len(bars) - 1, equity=eq, kills=desk.kill_gates(now, eq),
-                                            ctx=ctx, now_ms=now, jev=jev)
-        desk.say(now, "chief", f"${p.sizing.starting_equity:,.0f} paper account opened. "
-                               f"first decision on the next {p.market.interval} close.")
+                                            ctx=ctx, now_ms=now, jev=jev, venue=desk.venue)
+        desk.say(now, "chief", f"${p.sizing.starting_equity:,.0f} paper account opened"
+                               + (f" on {spec.display} ({spec.product}, {spec.contract_size:g} BTC contracts)"
+                                  if spec is not None else "")
+                               + f". first decision on the next {p.market.interval} close.")
         log(f"paper ledger opened with ${p.sizing.starting_equity:,.2f}; trading starts at the next bar close")
     else:
         for i, bar in enumerate(bars):
@@ -169,7 +235,7 @@ def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=
     if processed == 0 and desk.last_decision is None:
         eq = broker.equity(ctx.mid or bars[-1].close)
         desk.last_decision = evaluate_entry(p, f, len(bars) - 1, equity=eq, kills=desk.kill_gates(now, eq),
-                                            ctx=ctx, now_ms=now)
+                                            ctx=ctx, now_ms=now, venue=desk.venue)
 
     if todo:    # a withdrawal the open position needs, or no forming bar in this answer: the next run tries again
         log(f"{p.market.symbol}: {', '.join(fl.id for fl in todo)} due, not in yet: "
@@ -179,7 +245,11 @@ def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=
 
     meta["runs"] += 1
     meta["last_run_ts"] = now
-    _write(lpath, _saved(meta, recorded, broker=broker.to_dict(), desk=desk.to_dict()))
+    venue_part = {} if vstate is None else {"venue": vstate}
+    _write(lpath, _saved(meta, recorded, broker=broker.to_dict(), desk=desk.to_dict(), **venue_part))
+    # Coinbase: a funding hour this run logged that the saved ledger hasn't is worth saving (it's the only history)
+    logged = vstate is not None and {r[0] for r in vstate["funding_log"]} - {
+        r[0] for r in ((saved or {}).get("venue") or {}).get("funding_log") or []}
 
     done = {r["id"] for r in recorded}
     state = board_mod.build(desk, f, len(f.bars) - 1, mode="paper", ctx=ctx, jev_client=jev, now_ms=now,
@@ -187,13 +257,14 @@ def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=
                             flows=flows_mod.State(meta["start_equity"], recorded,
                                                   [fl for fl in flows or [] if fl.id not in done]),
                             elapsed_days=(now - meta["started_ts"]) / 86400_000, crawler={
-                                "source": f"hyperliquid · {p.market.interval}", "funding_prints": len(funding),
+                                "source": f"{spec.name if spec else 'hyperliquid'} · {p.market.interval}",
+                                "funding_prints": len(funding),
                                 "requests": feed.requests, "latency_ms": feed.last_latency_ms,
-                                "age_s": (now - (f.bars[-1].ts + f.bar_ms)) / 1000})
+                                "age_s": (now - (f.bars[-1].ts + f.bar_ms)) / 1000}, venue_state=vstate)
     state["paper"] = {"days": (now - meta["started_ts"]) / 86400_000, "start_equity": meta["start_equity"],
                       "runs": meta["runs"], "bars_processed_this_run": processed,
                       "new_events": [{"ts": e.ts, "agent": e.agent, "text": e.text} for e in new_events],
-                      "changed": bool(processed or new_events)}
+                      "changed": bool(processed or new_events or logged)}
     _write(ledger_dir / "board.json", state)
     return state
 
