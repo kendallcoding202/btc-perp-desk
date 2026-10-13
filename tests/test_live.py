@@ -863,3 +863,37 @@ def test_missing_credentials_or_an_empty_account_refuse_to_start(tmp_path):
     with pytest.raises(LiveSetupError, match="HL_WALLET_ADDRESS"):
         _broker("BTC", ex, tmp_path)
     assert ex.orders == []
+
+
+# ---------------------------------------------------------------- review: no ccxt builder fee, no referrer
+
+def _offline_hyperliquid():
+    """The real ccxt class with its transport recorded and nothing signed or sent anywhere."""
+    ccxt = pytest.importorskip("ccxt")
+    ex = ccxt.hyperliquid(live_mod.exchange_config("hyperliquid", wallet=MASTER, key=NOT_A_KEY))
+    sent = []
+
+    def no_network(*a, **k):
+        raise AssertionError("network access attempted")
+
+    ex.fetch = no_network
+    ex.sign_l1_action = lambda *a, **k: {"r": "0x0", "s": "0x0", "v": 27}
+    ex.sign_user_signed_action = lambda *a, **k: {"r": "0x0", "s": "0x0", "v": 27}
+    ex.privatePostExchange = lambda params=None, context=None: (sent.append(params["action"]["type"])
+                                                                or {"status": "ok", "response": {"type": "default"}})
+    ex.publicPostInfo = lambda params=None, context=None: "default"
+    return ex, sent
+
+
+def test_ccxt_signs_no_builder_fee_approval_or_referrer_and_attaches_no_builder_fee():
+    """ccxt's hyperliquid class runs initialize_client() before every order and cancel. By default it approves a
+    0.01% builder fee (then adds it to every order: +22% on the 4.5 bp taker fee the costs assume) and sets a
+    referrer; with an API wallet the refused approval is re-sent before every order. make_exchange switches both off."""
+    ex, sent = _offline_hyperliquid()
+    ex.initialize_client()
+    assert sorted(sent) == ["approveBuilderFee", "setReferrer"] and ex.options.get("approvedBuilderFee")  # the default
+    ex, sent = _offline_hyperliquid()
+    live_mod._no_builder_fee(ex)
+    for _ in range(3):
+        ex.initialize_client()
+    assert sent == [] and not ex.options.get("approvedBuilderFee")     # no builder attached to orders, nothing signed

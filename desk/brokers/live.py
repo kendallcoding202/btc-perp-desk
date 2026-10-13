@@ -102,8 +102,25 @@ def make_exchange(venue: str):
     ex = cls(exchange_config(venue, wallet=env("HL_WALLET_ADDRESS"), key=env("HL_PRIVATE_KEY"),
                              sub_account=env("HL_SUBACCOUNT_ADDRESS"), api_key=env("EXCHANGE_API_KEY"),
                              secret=env("EXCHANGE_API_SECRET"), password=env("EXCHANGE_API_PASSWORD")))
+    if venue == "hyperliquid":
+        _no_builder_fee(ex)
     ex.load_markets()
     return ex
+
+
+def _no_builder_fee(ex) -> None:
+    """ccxt's hyperliquid class (checked on 4.5.85) signs an approveBuilderFee and a setReferrer before its first
+    order, cancel and market load. Once the approval goes through (a main key) it adds a 0.01% builder fee to every
+    order, on top of the taker fee the desk's costs assume; when it is refused (an API wallet) it retries the refused
+    approval before every order and cancel, an extra round trip in front of each stop placement and trail move.
+    Neither is wanted: skip the approval (approvedBuilderFee stays unset, so no builder is attached to any order)
+    and the referrer. This leans on ccxt internals; if they're gone, refuse rather than trade on unchecked fees."""
+    if not callable(getattr(ex, "handle_builder_fee_approval", None)) or not isinstance(getattr(ex, "options", None),
+                                                                                         dict):
+        raise LiveSetupError("this ccxt version's hyperliquid class has no handle_builder_fee_approval: its builder "
+                             "fee can't be switched off as it was on 4.5.85 (requirements.txt). Check it first")
+    ex.handle_builder_fee_approval = lambda: True
+    ex.options["refSet"] = True
 
 
 # Venues whose reported account value already includes unrealised PnL.
