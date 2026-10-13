@@ -12,15 +12,23 @@ It has NOT been run against a funded account. Before trusting it:
 
 Design rules:
   * each coin trades its own perp (SYMBOL_FORMATS), on that market's size step and
-    minimum order; no market for the coin = refuse to start;
+    minimum order; no market for the coin, a missing credential, an account that reads $0
+    or a cap that can't buy one ticket = refuse to start. On Hyperliquid a sub-account is
+    traded through vaultAddress (HL_SUBACCOUNT_ADDRESS), and ccxt's builder fee is off;
   * the protective stop lives ON THE EXCHANGE as a reduce-only stop-market order,
     so if this process dies the position is still protected. It counts as placed only
-    once it is read back from the open orders; it is retried with backoff, and if it
-    still won't rest the position is closed and an alert goes out. Every sync checks
-    it is still there and puts it back if not;
+    once it is read back from the open orders, at its level and covering the whole
+    position; it is retried with backoff, and if it still won't rest the position is
+    closed and an alert goes out. Every sync checks one such stop is there, puts it back
+    if not, and cancels any extra ones;
   * the exchange is the source of truth for the position; the desk's local copy
-    (entry, best close, stop) is reconciled on every sync. An exit the exchange made
-    is booked at its own fills, fees and funding, never at a later mid;
+    (size, entry, best close, stop) is reconciled on every sync. A position is booked as
+    one trade from every one of its closing fills since the entry (it may close in
+    pieces), with their fees and the funding the exchange charged that coin, never at a
+    later mid; fills that can't be read are re-read, and an exit booked without them is
+    re-booked once they can be;
+  * a desk close that doesn't go through is kept (close_wanted) and sent again at every
+    check, across restarts, until the position is flat;
   * each coin's state is its own file (state/<COIN>/live_position.json);
   * any exception while placing an order leaves the desk in entry_kill.
 """

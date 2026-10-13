@@ -660,6 +660,9 @@ def test_after_a_gap_live_decides_on_every_missed_bar_in_order_as_paper_does(tmp
     # ...but that entry's open has passed: live doesn't take it at today's price
     assert [o for o in ex.orders if o["kind"] == "entry"] == [] and broker.position is None
     assert any("not taken" in e.text for e in _desk_events(tmp_path))
+    # so from there live is flat where paper is long, and their decisions differ until paper is flat again
+    for k in (252, 253):
+        assert rows["paper"][bars[k].ts][0] == "long" and rows["live"][bars[k].ts][0] is None
 
 
 def test_an_entry_from_the_newest_close_after_a_gap_is_taken_as_paper_takes_it(tmp_path, monkeypatch):

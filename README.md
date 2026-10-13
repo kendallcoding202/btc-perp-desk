@@ -72,7 +72,7 @@ python3 -m desk vt-backtest                  # the VT basket: reports/backtest-V
 python3 -m desk replay                       # watch it trade 2024→now at http://127.0.0.1:8787
 python3 -m desk paper                        # a $150 paper account (add --coin ETH), live board at :8787
 python3 -m desk step                         # one step for every account (BTC, ETH, SOL, VT), the way the Action runs it
-python3 -m pytest                            # 83 tests, incl. "paper ledger == backtest" for the desk and for VT,
+python3 -m pytest                            # 102 tests, incl. "paper ledger == backtest" for the desk and for VT,
                                              # and live mode against a fake exchange (tests/test_live.py)
 ```
 
@@ -167,24 +167,40 @@ This is for the BTC, ETH and SOL desk accounts only. VT has no live mode.
 3. `DESK_LIVE_CONFIRM` is set to the exact phrase in `.env.example`.
 4. You set a hard per-position dollar cap with `--max-notional`.
 
-It also refuses if the venue lists no perp for that coin, if `--max-notional` is below the venue's minimum order ($10 on Hyperliquid), if live state from before it was kept per coin is still in `state/`, or if another live process is already running that coin. A test holds each of these refusals (`tests/test_live.py`).
+`--force-unproven` overrides 1 and 2: it prints a warning and carries on. 3 and 4 always hold. Don't use it.
 
-The live broker (`desk/brokers/live.py`) uses ccxt. On Hyperliquid it uses an **API wallet**, not your main key. The protective stop rests **on the exchange** as a reduce-only order, so it holds even if this process stops. **It has never been run against a funded account.** It has only been run against a fake exchange in the tests, one that answers the way ccxt's Hyperliquid class does.
+It also refuses to start if:
+- a credential is missing, or the account reads $0. On Hyperliquid, `HL_WALLET_ADDRESS` is the account the API wallet was approved for, never the API wallet's own address.
+- the venue lists no perp for that coin.
+- `--max-notional` can't buy the smallest ticket at the current price. That is the venue's minimum order ($10 on Hyperliquid) after the size step and the 3 bps slippage cushion: $10.80 on BTC at 83,000. It moves with the price, by up to one size step (about $1 of BTC at 100,000), so start at $12 or more.
+- live state from before it was kept per coin is still in `state/`, or another live process is already running that coin.
+
+A test holds each of these refusals (`tests/test_live.py`). If the exchange errors while live starts (a rate limit, a timeout), it keeps trying every 15 s rather than exiting, sets `entry_kill` and alerts your phone.
+
+The live broker (`desk/brokers/live.py`) uses ccxt, pinned to 4.5.85 in `requirements.txt`. On Hyperliquid it uses an **API wallet**, not your main key, and switches off ccxt's builder fee and referrer, which the desk's costs don't include. The protective stop rests **on the exchange** as a reduce-only order, so it holds even if this process stops. **It has never been run against a funded account.** It has only been run against fakes: the tests' in-process exchange, and a fake Hyperliquid server behind the real ccxt class.
+
+To run two coins, give each its own Hyperliquid sub-account: set `HL_SUBACCOUNT_ADDRESS` for that process (`HL_SUBACCOUNT_ADDRESS=0x... python -m desk live --coin ETH ...`), and give its board its own `--port`. Orders and cancels then carry the sub-account as `vaultAddress`, and every read asks for it. Two coins on one account would each size from the whole account's value. Don't keep orders of your own on a market the desk trades: it cancels any other stop it finds resting there.
 
 **The five live-only bugs the October 2026 audit found ([`reports/edge-hunt-2026-10.md`](reports/edge-hunt-2026-10.md)) are fixed**, each with tests that fail on the old code:
 - **ETH and SOL orders went to BTC**, at 30× the cap or more. Each coin now trades its own perp (`<COIN>/USDC:USDC` on Hyperliquid). Sizes are cut down to that market's size step and kept under the cap, and a ticket under the $10 minimum isn't sent.
-- **A failed stop after an entry left the position unprotected.** A stop now counts as placed only once it's read back from the exchange's open orders. It's tried 4 times (waiting 1, 2 and 4 s). If it still won't rest, the position is closed at market and an alert goes out: logged, on the board, and to your phone if `NTFY_TOPIC` is set. Every check (every 15 s) makes sure a stop is resting, and puts it back if it isn't.
-- **A stop that filled on the exchange was booked at the next price check.** It's now booked at the exchange's own fills, with their price and fee and the funding the exchange charged. If the fills can't be read, it falls back to the stop order, then to the stop level, with an alert.
-- **After a gap, live processed only the newest candle.** It now goes through every missed candle in order and makes the same decision paper would on each. Exits and trailing stops that paper would have acted on are acted on now. Entries from missed candles are not taken: paper filled them at a price that has passed. If the gap is longer than the 1,500-candle history window, live stops rather than guess.
+- **A failed stop after an entry left the position unprotected.** A stop now counts as placed only once it's read back from the exchange's open orders, at its level and covering the whole position. It's tried 4 times (waiting 1, 2 and 4 s). If it still won't rest, the position is closed at market and an alert goes out: logged, on the board, and to your phone if `NTFY_TOPIC` is set. Every check (every 15 s) makes sure one stop is resting, puts it back if it isn't, and cancels any extra ones.
+- **A stop that filled on the exchange was booked at the next price check.** It's now booked at the exchange's own fills, with their price and fee and the funding the exchange charged that coin. A position closed in pieces (part by hand, or a close that only partly filled, then the stop) is one trade, booked from all of its closing fills. If the fills can't be read, the read is retried. If they still can't be read, the exit is booked for now at the stop level with an alert, and re-booked from the fills once they can be read.
+- **After a gap, live processed only the newest candle.** It now goes through every missed candle in order, and makes paper's decision on each as long as it holds what paper holds. Exits and trailing stops that paper would have acted on are acted on now. An entry from a missed candle isn't taken, because paper filled it at a price that has passed. So from then on live can be flat where paper is in the trade, and their decisions differ until paper is flat again. Sizing at missed candles uses the account's current value. The newest candle counts as fresh only for 5 minutes after its close; an entry from an older one isn't taken either. If the gap is longer than the 1,500-candle history window, live stops rather than guess.
 - **State files were shared across coins.** Each coin's live files are now in `state/<COIN>/`. If an old shared file is still in `state/`, live refuses until you move it. The old code sent every coin's orders to BTC-PERP, so any position the file describes is on BTC.
 
+A review of those fixes found more live-only problems, also fixed with tests (see the report):
+- A sub-account's orders went to the main account. `HL_SUBACCOUNT_ADDRESS` now puts them on the sub-account.
+- A desk close that failed once was dropped until the desk decided again, which for a daily-loss flatten meant the next UTC day. It's now sent again at every check until it goes through, and after a restart.
+- A restart that hit one exchange error exited, even when it had to put a missing stop back. A restart in the middle of a catch-up could stop itself out on a candle paper held through.
+- A trade's funding included the other coins' funding on the account; ccxt's builder fee would have added 1 bp to every order; a cap just above the minimum started and then never traded; `reset-halt --mode live` said "halt cleared" under a running live process, which wrote the halt back. Now `reset-halt` refuses until that coin's live process is stopped.
+
 What is still open:
+- Live has never placed an order on a real exchange. How the real venue shapes orders and fills, how fast new orders show up in its open orders, and its rate limits are unverified. Start with the smallest cap, and watch the first fills by hand.
 - Only Hyperliquid was checked, against ccxt's code and Hyperliquid's public market list. The other venues' symbols follow ccxt's naming but weren't checked. Those venues may also need extra parameters before their stop orders show up in `fetch_open_orders`. Without them, the stop check would fail and close every new position.
-- By default, ccxt's Hyperliquid class tries to approve a 0.01% builder fee before the first order. If that goes through, it adds the fee to every order (`options["builderFee"]`). It is a main-wallet action, so with an API wallet it probably fails, but nobody has checked. The backtest doesn't charge it.
-- If you run two coins on one account, each desk sizes from the whole account's value. Give each coin its own account (a sub-account with its own API wallet), and give each coin's board its own `--port`.
+- Any exchange error while placing an order still sets `entry_kill`, even when a retry then gets the order through. Clear it from the board once you've checked.
 - The go-live gate still rests on 14 days of paper, which the audit calls noise.
 
-Paper trading is not affected by any of this. The backtests (BTC, ETH, SOL, VT) and paper steps on copies of the real ledgers give byte-for-byte the same output before and after these fixes, apart from each report's generated time. Start live with the smallest cap, and watch the first fills by hand.
+Paper trading is not affected by any of this. The backtests (BTC, ETH, SOL, VT) and paper steps on copies of the real ledgers give byte-for-byte the same output before and after these fixes, apart from each report's generated time.
 
 Perpetual futures are restricted in some countries, including for US persons on most venues. Check that your venue is legal where you live.
 
