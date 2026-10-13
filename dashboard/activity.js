@@ -3,7 +3,8 @@
 // Everything that moves here is tied to one of four real things. Nothing moves on a timer of its own:
 //   (a) the last desk run: its board (boards/<ACC>.json, built by desk/board.py), replayed in the order the desk
 //       ran its steps, always labelled "REPLAY · LAST RUN hh:mm UTC";
-//   (b) a live allMids price from Hyperliquid, fetched in this browser by app.js every 5 s ("desk:tick");
+//   (b) a live allMids price from Hyperliquid, fetched in this browser by app.js every 5 s ("desk:tick"); on BTC's
+//       Coinbase tab it is a proxy, named as one, and unused while the last run found Coinbase closed;
 //   (c) app.js's re-read of the board every 60 s ("desk:board");
 //   (d) the clock: the countdown to the next close, and how old the board is.
 // The desk's rules are fixed in desk/thresholds.py. This page shows what the last run did; it changes nothing.
@@ -32,6 +33,8 @@
     setup: "SCAN",
     trend_strength: "SOFT", efficiency: "SOFT", momentum_already_spent: "SOFT", crowding: "SOFT",
     ticket_usd: "SIZE",
+    // BTC on Coinbase (desk/venue.py): the session and a known funding rate with HARD, whole contracts and margin with SIZE
+    session: "HARD", funding_known: "HARD", desk_size_usd: "SIZE", contracts: "SIZE", margin: "SIZE",
   };
   const OWNER_PHASE = { risk: "KILLS", chief: "KILLS", crawler: "DATA", jev: "JEV" };
   const phaseOf = (g) => PHASE[g.name] || OWNER_PHASE[g.owner] || "HARD";
@@ -171,12 +174,17 @@
   }
 
   // Live numbers for the open desk tab: the only arithmetic this page does on the board
+  // BTC on Coinbase (board.venue): the live price is Hyperliquid's BTC, a proxy (Coinbase's API can't be read from a
+  // browser), and while the last run found Coinbase closed nothing is re-marked, as app.js does
+  const venue = () => (B && B.venue) || null;
+  const vName = () => { const v = venue(); return v ? v.name.charAt(0).toUpperCase() + v.name.slice(1) : "Hyperliquid"; };
   function calc(now) {
     const b = B, coin = b.header.coin, ch = b.chart, t = b.ticker, st = b.analysis.stats;
-    const lv = mids ? parseFloat(mids[coin]) : NaN, isLive = isFinite(lv) && lv > 0;
+    const shut = (b.venue && b.venue.closed_now) || null;
+    const lv = mids && !shut ? parseFloat(mids[coin]) : NaN, isLive = isFinite(lv) && lv > 0;
     const mid = isLive ? lv : t.price, cl = last(ch.candles), c = closes(now);
     const atrUsd = st.atr_pct != null && cl ? st.atr_pct / 100 * cl[4] : null;   // the ATR the run used, in $
-    const o = { coin, mid, isLive, cl, atrUsd, c, pos: t.pos, rules: b.rules || null };
+    const o = { coin, mid, isLive, shut, cl, atrUsd, c, pos: t.pos, rules: b.rules || null };
     o.brake = t.pos ? null : brake();     // flat and braked: no line is in play, whatever the price does
     if (t.pos) {
       const p = t.pos, sg = p.side === "long" ? 1 : -1;
@@ -290,10 +298,11 @@
 
   // ---- monitor row 2: the trigger meter (desk tabs) --------------------------------------------------------
   function priceCap(o, now) {
+    if (o.shut) return `${vName()} closed at the last run, ${hhmm(B.updated)} UTC (${o.shut.why}) · price ${mid$(o.mid)} from that run`;
     if (!o.isLive) return `price ${mid$(o.mid)} at the last run, ${hhmm(B.updated)} UTC · no live price yet`;
     const age = now - midsAt;
     return age > NO_TICK ? `no live price for ${Math.round(age / 1000)} s · showing the last one, ${mid$(o.mid)}`
-      : `price ${mid$(o.mid)} from Hyperliquid · ${Math.max(0, Math.round(age / 1000))}s ago`;
+      : `price ${mid$(o.mid)} from Hyperliquid${venue() ? ", a proxy for Coinbase's" : ""} · ${Math.max(0, Math.round(age / 1000))}s ago`;
   }
   let lastPct = null;
   function meter(now) {
@@ -487,7 +496,7 @@
     const before = (e) => closeAt != null && (e.ts < closeAt || (e.ts === closeAt && e.agent !== "chief"));
     const evLine = (e) => L1((e.agent || "").toUpperCase(), `${hhmm(e.ts)} ${e.text}`, null, "act-ev");
     L1("RUN", `#${pp.runs ?? "—"} on this ledger · ${h.coin} · ${(h.mode || "").toLowerCase()} · board built ${hms(b.updated)} UTC`);
-    L1("CRAWL", `${(cr.bars ?? ch.candles.length).toLocaleString("en-US")} ${iv} candles + ${cr.funding ?? 0} funding prints · ${cr.requests ?? "—"} requests to Hyperliquid`);
+    L1("CRAWL", `${(cr.bars ?? ch.candles.length).toLocaleString("en-US")} ${iv} candles + ${cr.funding ?? 0} funding prints · ${cr.requests ?? "—"} requests to ${vName()}`);
     if (cl) {
       const closeTs = cl[0] + bar;
       L1("CRAWL", `newest close ${hhmm(closeTs)} UTC at ${usd(cl[4])}${cr.age_s != null ? ` · ${ago(cr.age_s * 1000)} old at the run` : ""}`);
@@ -621,7 +630,7 @@
   M.jump.addEventListener("click", () => log.scrollIntoView({ behavior: reduced.matches ? "auto" : "smooth", block: "start" }));
 
   // ---- the log's LIVE rows: computed in this browser from Hyperliquid prices ------------------------------
-  const LIVE_HEAD = (iv) => `<div class="act-lh">LIVE · COMPUTED IN YOUR BROWSER FROM HYPERLIQUID PRICES · the desk itself decides only at the ${esc(iv)} close</div>`;
+  const LIVE_HEAD = (iv) => `<div class="act-lh">LIVE · COMPUTED IN YOUR BROWSER FROM HYPERLIQUID PRICES${venue() ? " (A PROXY FOR COINBASE'S)" : ""} · the desk itself decides only at the ${esc(iv)} close</div>`;
   let liveShape = "";
   function liveRows(now) {
     if (!B) return;
@@ -636,7 +645,7 @@
       });
     } else {
       const o = calc(now), iv = (B.header.interval || "").toLowerCase(), age = Math.round((now - midsAt) / 1000);
-      rows.push(["PRICE", o.isLive ? `${mid$(o.mid)} · allMids · ${age > NO_TICK / 1000 ? `no live price for ${age} s` : `${age}s ago`}` : `${mid$(o.mid)} at the last run · no live price yet`, ""]);
+      rows.push(["PRICE", o.shut ? `${mid$(o.mid)} at the last run · ${vName()} was closed then (${o.shut.why})` : o.isLive ? `${mid$(o.mid)} · allMids · ${age > NO_TICK / 1000 ? `no live price for ${age} s` : `${age}s ago`}` : `${mid$(o.mid)} at the last run · no live price yet`, ""]);
       const exp = B.header.shorts && B.header.experiment && o.side === "short" ? " · shorts: paper experiment" : "";
       if (o.pos) {
         rows.push(["STOP", `${usd(o.pos.stop)} from the last run · ${pct(o.stopPct)} away${o.stopAtr != null ? ` · ${o.stopAtr.toFixed(1)} ATR` : ""}`, o.through ? "act-hot" : ""]);
@@ -660,7 +669,7 @@
         rows.push(["TREND IF IT CLOSED HERE", `${side}${near ? " ≈" : ""} · ${r.ema_fast}-EMA ${usd(o.ef)} ${near ? "≈" : o.ef >= o.es ? "≥" : "<"} ${r.ema_slow}-EMA ${usd(o.es)}${was && was !== side ? ` · flips from ${was}` : ""}`, ""]);
       }
     }
-    const shape = rows.map((r) => r[0]).join("|") + "|" + basket();
+    const shape = rows.map((r) => r[0]).join("|") + "|" + basket() + "|" + !!venue();   // the heading names the proxy
     if (shape !== liveShape) {
       liveShape = shape;
       L.live.innerHTML = LIVE_HEAD(basket() ? "00:00 UTC" : (B.header.interval || "")) + rows.map(() => `<div class="act-lr"><b></b><span></span></div>`).join("");

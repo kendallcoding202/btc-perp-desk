@@ -10,7 +10,7 @@ The audit of the BTC/ETH/SOL perp desk, and the hunt for anything worth adding t
 - **Adding VT to the desk looked better in 2024–26** (Sharpe 0.98 vs 0.85). That gain can't be told apart from luck: there is a 32% chance it is zero or negative.
 - **The SOL desk account has no demonstrated edge.** Its Sharpe was 0.27 in 2020–23 and 0.24 since, with about a 39% chance that its true Sharpe is zero or below. ETH is thin too.
 - **Live trading has never run with money.** The audit found five live-only bugs. ETH and SOL orders would have gone to BTC at about 30× (ETH) to 550–770× (SOL) the size cap, and on any coin a failed stop placement could leave a position with no stop. All five are now fixed, with tests against a fake exchange (2026-10-13, see "Code and execution" below). A review of those fixes found more live-only problems (13, one of them HIGH: a Hyperliquid sub-account's orders went to the main account). Those are fixed too. The paper ledger-reset bug was fixed earlier (ef00987). Paper trading is not affected.
-- **The 2024–26 data is now used up.** Only data from 2026-10-01 on can confirm anything. The quarterly re-audit's pass bar needs tightening before its first use in April 2027.
+- **The 2024–26 data is now used up.** Only data from 2026-10-01 on can confirm anything. The quarterly re-audit's pass bar was tightened for this (research/edge-hunt-2026-10/REAUDIT.md): it first runs 2027-01-03, and its numbers are provisional until 2027-10, the first re-audit with 12 months of new data.
 
 *Sharpe* = return per unit of bumpiness, on daily returns. In a backtest, 1+ is strong, 0.5 is modest and 0 is nothing.
 

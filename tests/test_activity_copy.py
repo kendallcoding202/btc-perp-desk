@@ -103,6 +103,35 @@ def test_every_gate_the_desk_makes_has_its_phase_in_filter_order():
     assert set(full) <= set(phase) and len(full) == 17
 
 
+def test_the_coinbase_gates_have_their_phase_too():
+    """BTC on Coinbase adds the session and funding-known gates (HARD) and whole contracts and margin (SIZE)."""
+    from desk import venue as venue_mod
+    from desk.thresholds import COINBASE
+
+    phase, owner_phase = _js_map("PHASE"), _js_map("OWNER_PHASE")
+    phases = re.search(r"const PHASES = \[(.*?)\];", JS).group(1).replace('"', "").replace(" ", "").split(",")
+    p = params_for("BTC")
+    bars, funding = _bars(start=60_000.0)
+    f = ind.compute(bars, funding, p)
+    rules = venue_mod.Rules(COINBASE)
+    desk = Desk(p, SimBroker(p))
+    names = set()
+    for open_, age in ((True, 3_600_000), (False, 30 * 3_600_000)):
+        ctx = MarketContext(mid=bars[-1].close, spread_bps=1.0, depth_usd=1e7, session_open=open_, funding_age_ms=age)
+        d = evaluate_entry(p, f, len(bars) - 1, equity=500.0, kills=desk.kill_gates(bars[-1].ts, 500.0), ctx=ctx,
+                           venue=rules)
+        order = []
+        for g in d.gates:
+            ph = phase.get(g.name) or owner_phase.get(g.owner)
+            assert ph, f"{g.name} (owner {g.owner}) has no phase in activity.js"
+            order.append(phases.index(ph))
+            names.add(g.name)
+        assert order == sorted(order), [g.name for g in d.gates]
+    assert {"session", "funding_known", "desk_size_usd"} <= names and "ticket_usd" not in names
+    assert phase["session"] == phase["funding_known"] == "HARD"
+    assert phase["desk_size_usd"] == phase["contracts"] == phase["margin"] == "SIZE"
+
+
 def test_it_adds_no_host_no_loop_and_one_same_site_request():
     assert "requestAnimationFrame" not in JS
     assert not re.search(r"XMLHttpRequest|WebSocket|EventSource|sendBeacon|import\(", JS)

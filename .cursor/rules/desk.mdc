@@ -5,16 +5,18 @@ alwaysApply: true
 
 # What this repo is
 
-A **paper-trading** perp desk. Four paper accounts trade live Hyperliquid prices with fake money:
+A **paper-trading** perp desk. Four paper accounts trade live prices with fake money:
 
-- **BTC, ETH, SOL** desk accounts ($150 each): a 2h-candle breakout strategy with a trailing stop and risk brakes. ETH also takes breakdown shorts, as an experiment.
+- **BTC, ETH, SOL** desk accounts: a 2h-candle breakout strategy with a trailing stop and risk brakes. ETH also takes breakdown shorts, as an experiment.
+  - **BTC** ($500) is simulated on Coinbase US's BTC perp rules (BIP-20DEC30-CDE): Coinbase's candles, whole 0.01 BTC contracts, its margin, sessions and estimated fees and funding (`desk/venue.py`, `desk/feeds/coinbase.py`).
+  - **ETH and SOL** ($150 each) use Hyperliquid's prices.
 - **VT**, the vol-trend basket ($500): once a day it holds each of BTC/ETH/SOL only while that coin is above its 50-day average, sized by volatility.
 
 A GitHub Actions job (`.github/workflows/paper.yml`) runs `python -m desk step` about once an hour. It saves the ledgers to the `paper-ledger` branch and publishes the dashboard (`dashboard/`) to GitHub Pages. A live-trading mode exists but is gated (README, "Going live") and has never run with real money.
 
 # Never do these
 
-- **Don't change the strategy.** That means `desk/thresholds.py` (every setting) and the trading logic (`desk/engine.py`, `desk/filter.py`, `desk/indicators.py`, `desk/voltrend.py`, `desk/brokers/`). A settings change needs a new backtest and the re-audit bar in `research/edge-hunt-2026-10/REAUDIT.md`. It is never part of a UI change.
+- **Don't change the strategy.** That means `desk/thresholds.py` (every setting) and the trading logic (`desk/engine.py`, `desk/filter.py`, `desk/indicators.py`, `desk/voltrend.py`, `desk/venue.py`, `desk/brokers/`, `desk/feeds/`). A settings change needs a new backtest and the re-audit bar in `research/edge-hunt-2026-10/REAUDIT.md`. It is never part of a UI change.
 - **Don't touch the running experiment.** Leave `.github/workflows/paper.yml`, the `paper-ledger` branch, and any `ledger/` or `state/` files alone. Never reset, edit or delete a ledger.
 - **No secrets.** Never add, print, log or commit keys: `.env`, `JEV_API_KEY`, `NTFY_TOPIC`, `HL_WALLET_ADDRESS`, `HL_PRIVATE_KEY`, `EXCHANGE_API_*`, `DESK_LIVE_CONFIRM`. They live in GitHub Secrets or a local `.env`, which is gitignored. When running the desk locally, unset `JEV_API_KEY` and `NTFY_TOPIC` so a test run can't call the paid API or send phone alerts.
 - **No trading.** Never run `python -m desk live` and never place orders.
