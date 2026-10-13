@@ -135,7 +135,9 @@ def _short_setup(s, f: ind.Features, i: int, trend: Side) -> tuple[str | None, G
 
 def evaluate_entry(p: Params, f: ind.Features, i: int, *, equity: float, kills: list[GateResult],
                    ctx: MarketContext | None = None, now_ms: int | None = None, jev=None,
-                   jev_enabled: bool = True) -> EntryDecision:
+                   jev_enabled: bool = True, venue=None) -> EntryDecision:
+    """`venue`: a venue's own rules (desk/venue.py Rules) on top of the desk's, or None (Hyperliquid: none). Its gates
+    come where they belong: the session with the HARD gates, whole contracts and margin with SIZE."""
     s, h, so, z = p.strategy, p.hard, p.soft, p.sizing
     bar = f.bars[i]
     close = bar.close
@@ -164,6 +166,8 @@ def evaluate_entry(p: Params, f: ind.Features, i: int, *, equity: float, kills: 
     gates.append(_hard("abs_funding_apr", abs(f.funding_apr[i]), h.max_abs_funding_apr, "max", "crowd"))
     gates.append(_hard("spread_bps", ctx.spread_bps if ctx else None, h.max_spread_bps, "max", "fills"))
     gates.append(_hard("depth_usd", ctx.depth_usd if ctx else None, h.min_depth_usd, "min", "fills"))
+    if venue is not None:   # the fill is the next bar's open
+        gates.append(venue.session_gate(bar.ts + f.bar_ms, ctx))
 
     # 4. SCAN — with-trend setups (strategy.entry_mode), then the optional counter-trend shorts
     setup, scan_gate = None, None
@@ -200,6 +204,10 @@ def evaluate_entry(p: Params, f: ind.Features, i: int, *, equity: float, kills: 
     qty = min(qty, equity * z.max_leverage / close) if equity > 0 else 0.0
     notional = qty * close
     gates.append(_hard("ticket_usd", notional, z.min_notional_usd, "min", "size"))
+    if venue is not None:   # whole contracts, the venue's leverage cap, overnight margin
+        qty, more = venue.size(qty, close, stop, equity, d, z.risk_per_trade)
+        gates.extend(more)
+        notional = qty * close
 
     dec = EntryDecision(None, direction, gates, qty=qty, stop=stop, notional=notional,
                         leverage=notional / equity if equity > 0 else 0.0, scores=scores, setup=setup)

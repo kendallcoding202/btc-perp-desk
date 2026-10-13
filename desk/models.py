@@ -31,6 +31,7 @@ class MarketContext:
     open_interest_usd: float | None = None
     funding_rate_now: float | None = None   # current predicted rate, per funding period
     funding_period_hours: float = 8.0
+    session_open: bool | None = None        # a venue with sessions (Coinbase): is it open right now
 
 
 class Side(str, Enum):

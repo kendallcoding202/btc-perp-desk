@@ -35,6 +35,10 @@ class SimBroker:
     def slip(self) -> float:
         return self.p.costs.slippage_bps / 1e4
 
+    def _fee(self, qty: float, price: float) -> float:
+        """One fill's fee: the taker rate on the notional (VenueSimBroker: the venue's schedule)."""
+        return qty * price * self.fee_rate
+
     # ---- queries -----------------------------------------------------------
     def equity(self, price: float) -> float:
         return self.cash + (self.position.unrealized(price) if self.position else 0.0)
@@ -57,7 +61,7 @@ class SimBroker:
 
     def _open(self, o: Order, price: float, ts: int) -> None:
         fill = price * (1 + self.slip * o.side.sign)
-        fee = o.qty * fill * self.fee_rate
+        fee = self._fee(o.qty, fill)
         self.cash -= fee
         self.fees_total += fee
         self.position = Position(o.side, o.qty, fill, ts, stop=o.stop or 0.0, best_close=fill, fees_paid=fee,
@@ -70,7 +74,7 @@ class SimBroker:
         pos = self.position
         assert pos is not None
         fill = price * (1 - self.slip * pos.side.sign)
-        fee = pos.qty * fill * self.fee_rate
+        fee = self._fee(pos.qty, fill)
         gross = pos.side.sign * pos.qty * (fill - pos.entry_price)
         self.cash += gross - fee
         self.fees_total += fee
@@ -161,3 +165,17 @@ class SimBroker:
                        for t in d.get("trades", [])]
         self.pending = [Order(o["action"], Side(o["side"]), o["qty"], o["reason"], o.get("stop"))
                         for o in d.get("pending", [])]
+
+
+class VenueSimBroker(SimBroker):
+    """SimBroker under a venue's own rules (desk/venue.py): its fee schedule (Coinbase: max($0.20 a contract, 5 bps),
+    an estimate). Sizes arrive already cut to whole contracts (the SIZE gates), entries never into a closure (the
+    session gate), and a closed venue has no candles, so fills, stops and gaps work as in SimBroker: a stop gapped
+    through at the reopen fills at that bar's open."""
+
+    def __init__(self, p: Params, rules):
+        super().__init__(p)
+        self.rules = rules
+
+    def _fee(self, qty: float, price: float) -> float:
+        return self.rules.fee(qty, price, self.fee_rate)

@@ -76,6 +76,13 @@ class LiveSetupError(RuntimeError):
 def market_symbol(venue: str, coin: str) -> str:
     """The perp this coin's desk trades on `venue`: the coin's own market, never another coin's."""
     if venue not in SYMBOL_FORMATS:
+        from ..thresholds import VENUES
+
+        if venue in VENUES:     # a venue paper simulates (BTC on Coinbase): live can't trade it yet
+            v = VENUES[venue]
+            raise LiveSetupError(f"{coin} is set up for {v.display} ({v.product}, desk/thresholds.py), which its paper "
+                                 f"account simulates; live trading there isn't built yet (this broker knows "
+                                 f"{', '.join(SYMBOL_FORMATS)})")
         raise LiveSetupError(f"no perp symbol known for venue {venue!r} (known: {', '.join(SYMBOL_FORMATS)})")
     return SYMBOL_FORMATS[venue].format(coin=coin.upper())
 

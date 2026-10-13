@@ -22,7 +22,19 @@ import pytest
 from desk.brokers import live as live_mod
 from desk.brokers.live import LiveBroker, LiveSetupError
 from desk.models import Order, Side
-from desk.thresholds import params_for
+from desk.thresholds import DEFAULT
+from desk.thresholds import params_for as _account_params
+
+
+def params_for(coin):
+    """A coin's desk on Hyperliquid, the venue these tests' fake exchange plays. BTC's paper account now simulates
+    Coinbase (thresholds.COINBASE, which live can't trade yet: test_live_refuses_btc_on_coinbase), so here it's BTC
+    as it was on Hyperliquid: 5x, the 4.5 bps taker fee."""
+    p = _account_params(coin)
+    if p.market.venue != "hyperliquid":
+        p = p.with_(market={"venue": "hyperliquid"}, sizing={"max_leverage": DEFAULT.sizing.max_leverage},
+                    costs={"taker_fee_bps": DEFAULT.costs.taker_fee_bps})
+    return p
 
 # szDecimals from Hyperliquid's public meta (POST /info {"type": "meta"}, read 2026-10-13): BTC 5, ETH 4, SOL 2.
 SZ_DECIMALS = {"BTC": 5, "ETH": 4, "SOL": 2}

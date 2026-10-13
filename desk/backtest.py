@@ -12,15 +12,17 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import flows as flows_mod
 from . import indicators as ind
-from .brokers.sim import SimBroker
+from . import venue as venue_mod
+from .brokers.sim import SimBroker, VenueSimBroker
 from .engine import Desk
 from .models import Bar, FundingEvent, Trade
-from .thresholds import Params
+from .thresholds import INTERVAL_SECONDS, Params, venue_for
 
 OOS_FRACTION = 0.4   # last 40% of the history is the out-of-sample check
 
@@ -31,24 +33,55 @@ class Result:
     desk: Desk
     broker: SimBroker
     features: ind.Features
+    flows: list = field(default_factory=list)     # deposits and withdrawals recorded (run(flows=...)), as paper does
+    dropped_bars: int = 0                          # bars wholly inside a venue closure, left out (venue only)
 
     @property
     def curve(self) -> list[tuple[int, float]]:
         return self.desk.equity_curve
 
 
-def run(bars: list[Bar], funding: list[FundingEvent], p: Params, jev=None, on_step=None) -> Result:
+def make_desk(p: Params, jev=None, windows=(), margin: dict | None = None, spec=None):
+    """(broker, desk) for an account: SimBroker and a plain Desk, or, for a venue with its own rules
+    (thresholds.VENUES: Coinbase for BTC; `spec` overrides them), VenueSimBroker and a Desk that sizes in whole
+    contracts under them."""
+    spec = spec or venue_for(p)
+    if spec is None:
+        broker = SimBroker(p)
+        return broker, Desk(p, broker, jev=jev)
+    rules = venue_mod.Rules(spec, windows, margin)
+    broker = VenueSimBroker(p, rules)
+    return broker, Desk(p, broker, jev=jev, venue=rules)
+
+
+def run(bars: list[Bar], funding: list[FundingEvent], p: Params, jev=None, on_step=None, windows=(),
+        flows=None, start_ms: int | None = None, spec=None) -> Result:
+    """The desk over `bars`. With venue rules, the bars wholly inside one of its closures (known, plus `windows`) are
+    left out first: the history is Binance's, which trades through them, and the venue has no candle then. `flows`
+    (flows.Flow, in date order) go in as paper puts them in when it catches up: at the open of the first bar on or after
+    their date's 00:00 UTC, before that bar's fills. `start_ms`: the account opens then; the bars before it only warm
+    up the indicators."""
+    broker, desk = make_desk(p, jev=jev, windows=windows, spec=spec)
+    dropped = 0
+    if desk.venue is not None:
+        kept = venue_mod.tradable(bars, desk.venue.sessions, INTERVAL_SECONDS[p.market.interval] * 1000)
+        dropped, bars = len(bars) - len(kept), kept
     f = ind.compute(bars, funding, p)
-    broker = SimBroker(p)
-    desk = Desk(p, broker, jev=jev)
+    todo, recorded = list(flows or []), []
     for i, bar in enumerate(bars):
+        if start_ms is not None and bar.ts < start_ms:
+            continue
+        while todo and todo[0].ts <= bar.ts:
+            if flows_mod.apply_desk(desk, todo[0], bar.ts, bar.open, p.sizing.starting_equity, recorded) is None:
+                break
+            todo.pop(0)
         broker.fill_pending(bar.open, bar.ts)
         broker.check_stop_bar(bar)
         broker.apply_funding(f.funding_bar[i], bar.close)
         desk.on_bar_close(f, i, now_ms=bar.ts + f.bar_ms)
         if on_step is not None:
             on_step(desk, f, i)
-    return Result(p, desk, broker, f)
+    return Result(p, desk, broker, f, recorded, dropped)
 
 
 # ---------------------------------------------------------------- metrics
@@ -137,7 +170,7 @@ def summarize(r: Result) -> dict:
         "halt_reason": r.desk.risk.halt_reason,
         "open_position": None if r.broker.position is None else r.broker.position.side.value,
     })
-    return {
+    out = {
         "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "interval": r.p.market.interval,
         "coin": r.p.market.symbol,
@@ -147,6 +180,144 @@ def summarize(r: Result) -> dict:
         "out_of_sample": segment(curve, trades, bars, split + 1, t_end),
         "per_year": per_year,
         "trades": [t.as_dict() for t in trades],
+    }
+    if r.desk.venue is not None:        # only an account with venue rules: the others' reports are as they were
+        out["venue"] = venue_summary(r)
+    return out
+
+
+def venue_comparison(bars, funding, p: Params, summary: dict) -> tuple[str, dict]:
+    """The venue's rules against fractional sizing on the same history, one rule at a time: from the result as it
+    stood before (Hyperliquid's 4.5 bps, 5x, any size) to this report, so each rule's cost shows on its own."""
+    from dataclasses import replace
+
+    spec = venue_for(p)
+    frac = p.with_(market={"venue": "hyperliquid"})
+    steps = [
+        ("fractional_before", "fractional as before: Hyperliquid 4.5 bps, 5x (the previous report)",
+         dict(q=frac.with_(sizing={"max_leverage": 5.0}, costs={"taker_fee_bps": 4.5}))),
+        ("fractional_same_costs", f"fractional, {p.sizing.max_leverage:g}x, {p.costs.taker_fee_bps:g} bps", dict(q=frac)),
+        ("contracts", f"+ whole {spec.contract_size:g} BTC contracts, the margin check",
+         dict(q=p, spec=replace(spec, fee_min_per_contract=0.0, weekly_break=None, known_closures=()))),
+        ("fee_minimum", f"+ the ${spec.fee_min_per_contract:.2f} a contract fee minimum",
+         dict(q=p, spec=replace(spec, weekly_break=None, known_closures=()))),
+        ("coinbase", "+ the sessions: **Coinbase rules** (this report)", None),
+    ]
+    lines = ["## Coinbase rules vs fractional sizing", "",
+             "The same strategy on the same Binance history, Coinbase's rules added one at a time. The first row is this "
+             "report as it stood before the BTC account moved to Coinbase rules. The fee minimum binds while a contract "
+             f"is worth under ${spec.fee_min_per_contract / (p.costs.taker_fee_bps / 1e4):,.0f}, BTC under "
+             f"${spec.fee_min_per_contract / (p.costs.taker_fee_bps / 1e4) / spec.contract_size:,.0f} (2020-22); the "
+             "sessions skip entries into the weekly break and leave out the bars inside known maintenance windows.", "",
+             "| sizing | total return | CAGR | max drawdown | out-of-sample (CAGR) | PF | trades | fees | funding | "
+             "final |", "|---|---|---|---|---|---|---|---|---|---|"]
+    out = {}
+    for key, label, how in steps:
+        s = summary if how is None else summarize(run(bars, funding, how["q"], spec=how.get("spec")))
+        f, o = s["full"], s["out_of_sample"]
+        lines.append(f"| {label} | {_pct(f['return'])} | {_pct(f['cagr'])} | {f['max_drawdown']:.1%} | "
+                     f"{_pct(o['return'])} ({_pct(o['cagr'])}/yr) | {f['profit_factor']:.2f} | {f['trades']} | "
+                     f"${f['fees']:,.0f} | ${f['funding']:,.0f} | ${f['final_equity']:,.0f} |")
+        out[key] = {k: f[k] for k in ("return", "cagr", "max_drawdown", "trades", "fees", "funding", "final_equity",
+                                      "profit_factor")} | {"oos_return": o["return"], "oos_cagr": o["cagr"]}
+    return "\n".join(lines), out
+
+
+def pace(bars, funding, p: Params, oos_cagr: float | None = None, start: str = "2024-01-01", monthly: float = 100.0,
+         months: int = 60, target: float = 100_000.0) -> tuple[str, dict]:
+    """The pace to `target` with the planned money: a fresh account opened at `start` with the start equity, plus
+    `monthly` dollars on the 1st of every month after (as paper puts them in), traded to the end of the history. Its
+    pace is the time-weighted one (the units' value: deposits aren't growth); the years to the target count the plan's
+    deposits as they come (flows.years_to), from the start equity, at that pace and at the full run's out-of-sample
+    one."""
+    from datetime import date
+
+    d0 = date.fromisoformat(start)
+    t0 = int(datetime(d0.year, d0.month, d0.day, tzinfo=timezone.utc).timestamp() * 1000)
+    plan, y, m = [], d0.year, d0.month
+    for k in range(months):
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+        d = date(y, m, 1)
+        plan.append(flows_mod.Flow(f"monthly-{d:%Y-%m}", d.isoformat(),
+                                   int(datetime(y, m, 1, tzinfo=timezone.utc).timestamp() * 1000), monthly, "plan"))
+    end = bars[-1].ts
+    plan = [fl for fl in plan if fl.ts <= end]
+    def fresh(q):
+        r = run(bars, funding, q, flows=plan, start_ms=t0)
+        st = flows_mod.State(q.sizing.starting_equity, r.flows)
+        nav, k, units = [], 0, q.sizing.starting_equity        # the units' value at each close: deposits left out
+        for ts, e in r.curve:
+            while k < len(r.flows) and r.flows[k]["ts"] < ts:
+                units += r.flows[k]["units"]
+                k += 1
+            nav.append(e / units)
+        yrs = (r.curve[-1][0] - r.curve[0][0]) / (365.25 * 86400 * 1000)
+        twr = st.nav(r.curve[-1][1]) - 1
+        return r, st, yrs, twr, ((1 + twr) ** (1 / yrs) - 1 if yrs > 0.25 and twr > -1 else None), max_drawdown(nav)
+
+    r, st, years, twr, cagr, dd = fresh(p)
+    eq = r.curve[-1][1]
+    frac = fresh(p.with_(market={"venue": "hyperliquid"}, sizing={"max_leverage": 5.0}, costs={"taker_fee_bps": 4.5}))
+    future = [((k + 1) / 12, monthly) for k in range(months)]
+    out = {"start": start, "to": _ymd(r.curve[-1][0]), "years": years, "start_equity": p.sizing.starting_equity,
+           "monthly": monthly, "deposits": len(r.flows), "deposited": st.net, "final_equity": eq, "twr": twr,
+           "cagr": cagr, "trades": len(r.broker.trades), "max_drawdown": dd,
+           "fractional_before": {"final_equity": frac[0].curve[-1][1], "cagr": frac[4], "max_drawdown": frac[5],
+                                 "trades": len(frac[0].broker.trades)},
+           "skipped": dict(r.desk.venue_memo.get("skipped", {})) if r.desk.venue is not None else {},
+           "target": target, "plan_months": months,
+           "years_to_target": flows_mod.years_to(target, p.sizing.starting_equity, cagr, future),
+           "oos_cagr": oos_cagr,
+           "years_to_target_at_oos": flows_mod.years_to(target, p.sizing.starting_equity, oos_cagr, future)}
+
+    def five(rate):     # what the plan leaves after its 5 years at `rate`
+        e = p.sizing.starting_equity
+        for _ in range(months):
+            e = e * (1 + rate) ** (1 / 12) + monthly
+        return e
+
+    if cagr is not None:
+        out["after_plan"] = five(cagr)
+    lines = [f"## Pace to ${target:,.0f} with ${p.sizing.starting_equity:,.0f} + ${monthly:,.0f} a month", "",
+             f"A fresh ${p.sizing.starting_equity:,.0f} account opened {start} under these rules, ${monthly:,.0f} put in "
+             f"on the 1st of every month after it ({out['deposits']} deposits, ${st.net:,.0f}, to {out['to']}), as the "
+             f"paper account will: it ended at ${eq:,.0f} with {out['trades']} trades, its worst drop "
+             f"{out['max_drawdown']:.0%} (time-weighted). Its time-weighted pace (deposits aren't growth) was "
+             f"{_pct(cagr)}/yr"
+             + (f"; entries the venue skipped: {', '.join(f'{v} {k}' for k, v in out['skipped'].items())}"
+                if out["skipped"] else "; the venue skipped no entry")
+             + f". Fractional sizing as before (Hyperliquid, 4.5 bps, 5x) from the same start: "
+               f"${out['fractional_before']['final_equity']:,.0f}, {_pct(frac[4])}/yr.", ""]
+    yt = out["years_to_target"]
+    lines.append(f"At that pace, ${p.sizing.starting_equity:,.0f} plus ${monthly:,.0f} a month for {months // 12} years "
+                 f"reaches ${target:,.0f} in about {yt:.0f} years" if yt else
+                 f"At that pace it doesn't reach ${target:,.0f}")
+    if cagr is not None:
+        lines[-1] += (f" (about ${out['after_plan']:,.0f} after the {months // 12} years, "
+                      f"${p.sizing.starting_equity + months * monthly:,.0f} of it put in).")
+    yo = out["years_to_target_at_oos"]
+    if oos_cagr is not None:
+        lines += ["", f"At the full run's out-of-sample pace ({_pct(oos_cagr)}/yr, the pace the board projects the "
+                      f"account at), the same plan reaches it in about {yo:.0f} years." if yo else
+                  f"At the full run's out-of-sample pace ({_pct(oos_cagr)}/yr) the plan doesn't reach it."]
+    lines += ["", "Backtest paces, not forecasts: the settings were picked on 2020-23, and 2026 so far has lost money."]
+    return "\n".join(lines), out
+
+
+def venue_summary(r: Result) -> dict:
+    """What the venue's rules did over the backtest: contracts per trade, entries skipped (per reason, once per
+    episode), fees, and what's estimated."""
+    rules = r.desk.venue
+    n = sorted(rules.contracts(t.qty) for t in r.broker.trades)
+    memo = r.desk.venue_memo
+    return {
+        "name": rules.name, "spec": asdict(rules.spec), "margin": dict(rules.margin),
+        "contracts": {"min": n[0], "median": n[len(n) // 2], "max": n[-1]} if n else None,
+        "skipped": dict(memo.get("skipped", {})), "dropped_bars": r.dropped_bars,
+        "fee_estimate": f"max(${rules.spec.fee_min_per_contract:.2f} x contracts, {r.p.costs.taker_fee_bps:g} bps of "
+                        f"notional) per side, plus {r.p.costs.slippage_bps:g} bps slippage",
+        "estimated": ["fees (the real fee tier isn't known)", rules.spec.history_note,
+                      "stop-limit fills at the stop (or the open, gapped through), as a stop-market would"],
     }
 
 
@@ -180,7 +351,8 @@ def write_report(summary: dict, p: Params, out_dir: str | Path = "reports", extr
     out_dir.mkdir(parents=True, exist_ok=True)
     full, ins, oos = summary["full"], summary["in_sample"], summary["out_of_sample"]
     checks = promotion_check(summary, p)
-    lines = [
+    v = summary.get("venue")
+    head = [
         f"# Backtest — {summary.get('coin', 'BTC')} perp, {summary['interval']} bars",
         "",
         f"{full['from']} → {full['to']} ({full['years']:.1f} years). Generated {summary['generated']}.",
@@ -188,6 +360,26 @@ def write_report(summary: dict, p: Params, out_dir: str | Path = "reports", extr
         f"plus real funding prints. Start equity ${p.sizing.starting_equity:,.0f}, "
         f"risk {p.sizing.risk_per_trade:.1%}/trade, max {p.sizing.max_leverage:.0f}x.",
         "",
+    ]
+    if v:
+        sp, c, sk = v["spec"], v["contracts"] or {}, v["skipped"]
+        head[0] = (f"# Backtest — {summary.get('coin', 'BTC')} perp on {sp['name'].capitalize()} rules "
+                   f"({sp['product']}, whole {sp['contract_size']:g} BTC contracts), {summary['interval']} bars")
+        head[3:4] = [
+            f"**{sp['display']} rules** ({sp['product']}, simulated): whole contracts of {sp['contract_size']:g} BTC at "
+            f"each bar's price, at most {sp['max_leverage']:g}x, the overnight margin check at "
+            f"{v['margin']['overnight_long']:.2%}, no entry into the weekly break (Fri 17:00-18:00 New York) or a "
+            f"known maintenance window ({v['dropped_bars']} Binance bars wholly inside one left out). "
+            f"Fees: {v['fee_estimate']}, an ESTIMATE until the real fee tier is known. History: "
+            f"{sp['history_note']}; Coinbase keeps no funding history, so funding is an ESTIMATE too. Stops are "
+            f"filled at the stop (or the open, gapped through), as Coinbase's stop-limit would if its limit is met. "
+            f"Start equity ${p.sizing.starting_equity:,.0f}, risk {p.sizing.risk_per_trade:.1%}/trade.",
+            "",
+            f"Contracts per trade: {c.get('min', 0)} to {c.get('max', 0)} (median {c.get('median', 0)}). Entries "
+            f"skipped by the venue (once per episode): {sk.get('contracts', 0)} too small for one contract, "
+            f"{sk.get('margin', 0)} short of overnight margin, {sk.get('session', 0)} into a closure.",
+        ]
+    lines = head + [
         f"| | Desk | Buy & hold {summary.get('coin', 'BTC')} |",
         "|---|---|---|",
         f"| Total return | {_pct(full['return'])} | {_pct(full['buy_hold_return'])} |",

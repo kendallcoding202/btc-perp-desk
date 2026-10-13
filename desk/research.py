@@ -177,7 +177,7 @@ def costs(bars, funding, p: Params) -> str:
 def jev_experiment(bars, funding, p: Params, client) -> str:
     """Replay every historical entry through Jev and see if its answers predict the outcome."""
     r = bt.run(bars, funding, p)
-    idx = {b.ts: k for k, b in enumerate(bars)}
+    idx = {b.ts: k for k, b in enumerate(r.features.bars)}    # the bars it traded (a venue's closures left out)
     rows = []
     for t in r.broker.trades:
         i = idx[t.entry_ts] - 1  # the decision bar is the one before the fill

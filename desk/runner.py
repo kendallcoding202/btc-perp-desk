@@ -18,11 +18,10 @@ from pathlib import Path
 from . import board as board_mod
 from . import flows as flows_mod
 from . import indicators as ind
-from .brokers.sim import SimBroker
 from .engine import Desk, Kills
 from .filter import evaluate_entry
 from .server import Board, serve
-from .thresholds import Params
+from .thresholds import INTERVAL_SECONDS, Params
 
 LOOKBACK_BARS = 1500
 # A close counts as fresh only this soon after it: paper fills its entry at the next bar's open, the moment the bar
@@ -394,12 +393,16 @@ def replay(bars, funding, p: Params, *, speed: float = 25.0, start_index: int = 
     board = Board(Path("state") / "replay_kills.json")
     serve(board, host, port)
     log(f"replay board: http://{host}:{port}  ({speed:g} bars/sec)")
-    f = ind.compute(bars, funding, p)
-    from .backtest import run as bt_run, summarize
+    from .backtest import make_desk, run as bt_run, summarize
+    from .venue import tradable
+
     goal_pace = board_mod.oos_pace(summarize(bt_run(bars, funding, p)))
+    rules = make_desk(p)[1].venue
+    if rules is not None:       # BTC on Coinbase: the bars the backtest trades (none inside a closure)
+        bars = tradable(bars, rules.sessions, INTERVAL_SECONDS[p.market.interval] * 1000)
+    f = ind.compute(bars, funding, p)
     while True:
-        broker = SimBroker(p)
-        desk = Desk(p, broker, jev=jev)
+        broker, desk = make_desk(p, jev=jev)
         for i, bar in enumerate(bars):
             broker.fill_pending(bar.open, bar.ts)
             broker.check_stop_bar(bar)

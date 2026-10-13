@@ -77,6 +77,8 @@ class Desk:
     last_i: int = -1
     equity_curve: list[tuple[int, float]] = field(default_factory=list)
     events: deque = field(default_factory=lambda: deque(maxlen=200))
+    venue: object | None = None          # a venue's own rules (desk/venue.py Rules), or None (Hyperliquid: none)
+    venue_memo: dict = field(default_factory=dict)   # with a venue: the entry it's skipping now, skips counted
 
     def __post_init__(self):
         if not self.risk.peak_equity:
@@ -163,9 +165,11 @@ class Desk:
 
         decision = evaluate_entry(
             self.p, f, i, equity=equity, kills=self.kill_gates(ts_close, equity), ctx=ctx, now_ms=now_ms,
-            jev=self.jev, jev_enabled=not self.kills.jev_kill,
+            jev=self.jev, jev_enabled=not self.kills.jev_kill, venue=self.venue,
         )
         self.last_decision, self.last_i = decision, i
+        if self.venue is not None:
+            self._venue_skips(decision, ts_close, pos is None and not orders)
 
         if decision.side is not None and pos is None and not orders:
             tp_atr = self.p.strategy.take_profit_atr
@@ -173,13 +177,30 @@ class Desk:
             orders.append(Order("open", decision.side, decision.qty, decision.setup or "entry", stop=decision.stop,
                                 meta={"leverage": decision.leverage, "notional": decision.notional,
                                       "take_profit": take_profit}))
-            self.say(ts_close, "chief", f"go ({decision.setup}): {decision.side.value} {decision.qty:.4f} {self.p.market.symbol} "
+            size = (self.venue.describe(decision.qty, self.p.market.symbol) if self.venue is not None
+                    else f"{decision.qty:.4f} {self.p.market.symbol}")
+            self.say(ts_close, "chief", f"go ({decision.setup}): {decision.side.value} {size} "
                                         f"(${decision.notional:,.0f}, {decision.leverage:.1f}x), stop {decision.stop:,.0f}")
 
         for o in orders:
             self.broker.submit(o)
         self.equity_curve.append((ts_close, equity))
         return orders
+
+    def _venue_skips(self, decision, ts: int, flat: bool) -> None:
+        """An entry everything else let through but the venue didn't (no whole contract fits the risk budget, not
+        enough overnight margin, the market closed at the fill): said once when it starts, to the board and the phone,
+        not again every bar it lasts. Counted per reason."""
+        from .venue import skip_note
+
+        g = skip_note(decision.gates) if flat else None
+        key = g.name if g is not None else ""
+        if key and key != self.venue_memo.get("skip", ""):
+            self.say(ts, g.owner, f"{g.owner.upper()}: skipped — {g.note}")
+            counts = self.venue_memo.setdefault("skipped", {})
+            counts[key] = counts.get(key, 0) + 1
+            self.venue_memo["last_skip"] = {"ts": ts, "gate": key, "note": g.note}
+        self.venue_memo["skip"] = key
 
     def _manage(self, f: ind.Features, i: int) -> list[Order]:
         """RISK's job while a position is open: trail the stop, get out when the trend is gone."""
@@ -216,10 +237,14 @@ class Desk:
 
     # ---- persistence ----------------------------------------------------
     def to_dict(self) -> dict:
-        return {"risk": self.risk.__dict__, "equity_curve": self.equity_curve[-5000:],
-                "events": [e.__dict__ for e in self.events]}
+        d = {"risk": self.risk.__dict__, "equity_curve": self.equity_curve[-5000:],
+             "events": [e.__dict__ for e in self.events]}
+        if self.venue is not None:      # only an account with venue rules has it: the others' ledgers are as they were
+            d["venue"] = self.venue_memo
+        return d
 
     def load_dict(self, d: dict) -> None:
         self.risk = RiskState(**d.get("risk", {}))
         self.equity_curve = [tuple(x) for x in d.get("equity_curve", [])]
         self.events = deque((Event(**e) for e in d.get("events", [])), maxlen=200)
+        self.venue_memo = dict(d.get("venue") or {})

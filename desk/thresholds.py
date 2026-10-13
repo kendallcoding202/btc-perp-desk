@@ -19,7 +19,8 @@ class Market:
     symbol: str = "BTC"                 # Hyperliquid coin name; see COINS below for the paper accounts
     interval: str = "2h"                # bar size the desk thinks in. 2h beat 4h on 2020-23 (+157% vs +104%
                                         # at 2% risk) and held up out-of-sample; 1h was worse (fees, noise)
-    venue: str = "hyperliquid"          # where live prices / orders go (see brokers/)
+    venue: str = "hyperliquid"          # where live prices / orders go (see brokers/); a venue in VENUES below
+                                        # also brings its own rules (whole contracts, sessions, margin, fees)
 
 
 @dataclass(frozen=True)
@@ -193,6 +194,63 @@ class VolTrend:
 
 VOLTREND = VolTrend()
 
+
+@dataclass(frozen=True)
+class ContractVenue:
+    """A venue with its own rules: whole contracts, a trading session, margin, a fee schedule. These are the
+    exchange's rules, not the strategy's: the desk decides exactly as before, and desk/venue.py decides what of it this
+    venue lets through and what it costs. Used by the backtest and the paper step alike.
+
+    The one there is: Coinbase's US-regulated nano BTC perp (Coinbase Financial Markets, "BTC PERP", product
+    BIP-20DEC30-CDE), the venue the BTC account is planned to trade with real money. The numbers below were read from
+    Coinbase's public API on 2026-10-13 (GET api.coinbase.com/api/v3/brokerage/market/products/BIP-20DEC30-CDE).
+    """
+    name: str = "coinbase"
+    product: str = "BIP-20DEC30-CDE"
+    display: str = "COINBASE · BTC PERP"
+    contract_size: float = 0.01         # BTC per contract (future_product_details.contract_size)
+    min_contracts: int = 1              # whole contracts only: base_increment 1, base_min_size 1...
+    max_contracts: int = 5000           # ...base_max_size 5000
+    max_leverage: float = 4.0           # the desk's cap: overnight margin (~21%) allows at most ~4.76x; 4x leaves room
+    # Margin, a fraction of notional (future_product_details.*_margin_rate). Paper reads these every run (falling back to
+    # the last value it saved); the backtest uses these. The entry check uses the overnight rate: equity minus the loss
+    # at the stop must cover contracts x contract notional x this.
+    overnight_long_margin: float = 0.21025
+    overnight_short_margin: float = 0.256625
+    intraday_long_margin: float = 0.100079
+    intraday_short_margin: float = 0.0999811
+    # FEE ESTIMATE, to be replaced by the real fee tier: per side, max(this x contracts, costs.taker_fee_bps of the
+    # notional). Coinbase's all-in rate isn't confirmed: an exchange fee of ~$0.10/side/contract, marketing that says
+    # "as low as 0.02%, $0.15 minimum" (2025), an older footnote that says 0.05% with a $0.20 minimum. The desk charges
+    # the higher, older one (BTC's costs.taker_fee_bps is 5.0), plus the usual 3 bps slippage.
+    fee_min_per_contract: float = 0.20
+    # Sessions. 24/7 except a weekly break, Friday 17:00-18:00 New York time (21:00-22:00 UTC in summer, 22:00-23:00
+    # in winter; Coinbase's own 5-minute candles show it), and listed maintenance windows (fcm_trading_session_details,
+    # recorded by paper at every run). No entry is decided while the fill would fall in one; Coinbase has no candles
+    # while it's closed, so a stop isn't checked then and a gap fills at the reopen.
+    weekly_break: tuple[int, int, int] | None = (4, 17, 60)   # (weekday, Mon=0: Friday; New York hour; minutes)
+    # Closures seen in Coinbase's own 15-minute candles since BIP listed (Saturday maintenance, about quarterly), as
+    # [start, end) UTC. The backtest drops the Binance bars that fall wholly inside one, as Coinbase has none.
+    known_closures: tuple[tuple[str, str], ...] = (
+        ("2025-10-25T10:00", "2025-10-25T21:00"), ("2026-01-24T15:00", "2026-01-24T18:00"),
+        ("2026-04-02T21:00", "2026-04-02T22:00"),   # the weekly break, moved to Thursday for Good Friday
+        ("2026-04-18T14:00", "2026-04-18T17:00"), ("2026-07-25T14:00", "2026-07-25T17:00"))
+    funding_interval_hours: int = 1     # funding_interval 3600s; no funding history API: paper logs each run's rate
+    funding_log_days: float = 8.0       # how far back the ledger keeps those snapshots (the 3-day APR needs 3)
+    history_note: str = ("Binance BTCUSDT perp prices and funding prints, the proxy for Coinbase's "
+                         "(BIP listed 2025-07-18)")
+
+
+COINBASE = ContractVenue()
+VENUES: dict[str, ContractVenue] = {"coinbase": COINBASE}
+
+
+def venue_for(p: "Params") -> ContractVenue | None:
+    """The venue rules this account trades under, or None for a venue with no rules of its own (Hyperliquid:
+    fractional sizes, 24/7, the taker fee in costs)."""
+    return VENUES.get(p.market.venue)
+
+
 # The paper accounts the desk runs: BTC $500, ETH and SOL $150 each. Same strategy for every coin; only what's
 # listed here differs.
 COINS = ("BTC", "ETH", "SOL")
@@ -201,8 +259,10 @@ ACCOUNTS = (*COINS, "VT")
 COIN_OVERRIDES: dict[str, dict] = {
     # BTC is the account planned for real money first, on Coinbase's US nano BTC perp: whole contracts of 0.01 BTC
     # (about $830 at $83k) with ~21% overnight margin, so $150 can't hold even one. Its paper account starts at the
-    # planned $500 (restarted 2026-10-13; the $150 run is archived on the paper-ledger branch).
-    "BTC": {"sizing": {"starting_equity": 500.0}},
+    # planned $500 and simulates Coinbase (COINBASE above): whole contracts, at most 4x, the overnight margin check,
+    # sessions and the fee estimate (5 bps a side, $0.20 a contract at least). The strategy is BTC's as before.
+    "BTC": {"market": {"venue": "coinbase"}, "sizing": {"starting_equity": 500.0, "max_leverage": 4.0},
+            "costs": {"taker_fee_bps": 5.0}},
     # ETH and SOL swing harder than BTC: at BTC's 5% risk both hit the 40% drawdown halt in the
     # 2020-26 backtest (ETH in 2024, SOL in 2021). At 2%: ETH +65% (26% worst drop), SOL +40% (17%).
     # ETH also shorts breakdowns (a close below the 60-bar low while the 100-EMA is under the 400-EMA).
