@@ -213,6 +213,9 @@ class FakeHyperliquid:
                             bool(params.get("reduceOnly")))
         self.status[oid] = {"id": oid, "symbol": symbol, "status": "closed", "side": side, "amount": sz,
                             "filled": filled, "average": px, "fee": None}
+        if self.fail_after.get(kind, 0) > 0:
+            self.fail_after[kind] -= 1
+            raise ExchangeDown(f"{kind}: read timed out")
         return {"info": {"filled": {"totalSz": str(filled), "avgPx": str(px), "oid": int(oid)}}, "id": oid,
                 "symbol": symbol, "status": None, "side": None, "amount": filled, "filled": filled, "average": px,
                 "price": None, "fee": None, "trades": []}
@@ -579,7 +582,8 @@ def _run_paper(tmp_path, p, bars, funding, start, end, monkeypatch):
 
 def _run_live(tmp_path, p, bars, funding, start, script, ex=None, desk_meta=None, kills=None):
     """runner.run against the fake exchange. The first poll is a minute after bar start-1 closes; then each entry of
-    `script` sleeps through that many bar closes (1 = a normal poll each bar, 5 = the laptop slept through 5),
+    `script` sleeps through that many bar closes (1 = a normal poll each bar, 5 = the laptop slept through 5, 0 = the
+    next 15 s check inside the same bar),
     with the exchange's price walking through each bar's low, high and close meanwhile (resting stops trigger)."""
     coin = p.market.symbol
     feed = LiveFeed(bars, funding, start)
@@ -594,7 +598,11 @@ def _run_live(tmp_path, p, bars, funding, start, script, ex=None, desk_meta=None
     def sleep(_):
         if not steps:
             raise StopLoop
-        for _ in range(steps.pop(0)):
+        n = steps.pop(0)
+        if n == 0:                      # the next 15 s check, inside the same bar
+            clock["now"] = ex.now = clock["now"] + 15_000
+            return
+        for _ in range(n):
             bar = bars[feed.upto]
             for k, px in enumerate((bar.low, bar.high, bar.close)):
                 ex.now = bar.ts + (k + 1) * 1000
@@ -1000,3 +1008,54 @@ def test_a_position_grown_on_the_exchange_gets_a_stop_for_all_of_it(tmp_path):
     t = b.trades[-1]
     assert len(b.trades) == 1 and t.qty == pytest.approx(0.006) and t.exit_price == pytest.approx(77_850.0)
     assert t.net_pnl == pytest.approx(_realised(ex, cash0))
+
+
+# ---------------------------------------------------------------- review: a desk close that fails is sent again
+
+def test_a_close_that_fails_once_is_sent_again_at_the_next_check_not_the_next_bar(tmp_path, monkeypatch):
+    """The trend flip at 424 (seed 1): its close gets one 429. It used to be dropped: nothing re-sent it until the
+    desk decided again at the next bar close (4 h later here, 2 h on the real desk), and a daily-loss flatten is
+    decided only once a day. Paper can't fail a close: it is out at 425's open."""
+    bars, funding = series(seed=1, drift=0.0003, n=700)
+    p = P.with_(hard={"max_data_age_bars": 1e9}, strategy={"stop_atr": 12.0, "trail_atr": 12.0})
+    ex = FakeHyperliquid({"BTC": bars[379].close}, usdc=10_000.0)
+    ex.fail["close"] = 1
+    broker, ex, logs = _run_live(tmp_path, p, bars, funding, 380, [1] * 45 + [0, 0], ex=ex)
+    closes = [o for o in ex.orders if o["kind"] == "close"]
+    assert closes[0]["ts"] == bars[424].ts + H4 + 60_000                   # sent at the 424 close, and refused
+    assert len(closes) == 2 and closes[1]["ts"] - closes[0]["ts"] == 15_000  # sent again at the next check
+    assert broker.position is None and broker.trades[-1].reason == "trend_flip" and ex.positions == {}
+    assert broker.close_wanted is None and ex.fetch_open_orders() == []
+
+
+def test_a_wanted_close_survives_a_restart(tmp_path):
+    ex = FakeHyperliquid({"BTC": 80_000.0}, slip_bps=0.0)
+    b = _broker("BTC", ex, tmp_path, cap=500.0, sleep=Sleeps())
+    b.submit(Order("open", Side.LONG, 0.004, "breakout", stop=78_000.0))
+    b.execute_now(80_000.0, T0)
+    ex.fail["close"] = 1
+    b.submit(Order("close", Side.LONG, 0.004, "daily_loss"))
+    with pytest.raises(ExchangeDown):
+        b.execute_now(79_000.0, T0 + 60_000)
+    b2 = _broker("BTC", ex, tmp_path, cap=500.0, sleep=Sleeps())          # the process restarts
+    assert b2.close_wanted == "daily_loss"
+    t = b2.retry_close(79_000.0, T0 + 120_000)
+    assert t.reason == "daily_loss" and b2.position is None and ex.positions == {}
+
+
+def test_a_close_the_exchange_filled_but_whose_answer_was_lost_is_booked_as_the_desks_close(tmp_path):
+    """The trend-flip close fills, then its answer times out. The next check found the exchange flat and booked it as
+    'stop (exchange)': the board and the record said a stop fired when the desk closed on a trend flip."""
+    ex = FakeHyperliquid({"BTC": 82_000.0}, slip_bps=0.0)
+    b = _broker("BTC", ex, tmp_path, cap=500.0, sleep=Sleeps())
+    b.submit(Order("open", Side.LONG, 0.005, "breakout", stop=80_000.0))
+    b.execute_now(82_000.0, T0)
+    ex.move("BTC", 83_000.0)
+    ex.fail_after["close"] = 1
+    b.submit(Order("close", Side.LONG, 0.005, "trend_flip"))
+    with pytest.raises(ExchangeDown, match="timed out"):
+        b.execute_now(83_000.0, ex.now)
+    b.check_stop_price(83_000.0, ex.now + 1)
+    t = b.trades[-1]
+    assert t.reason == "trend_flip" and t.exit_price == pytest.approx(83_000.0)
+    assert len([o for o in ex.orders if o["kind"] == "close"]) == 1 and ex.fetch_open_orders() == []

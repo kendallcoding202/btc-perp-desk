@@ -177,6 +177,8 @@ class LiveBroker:
         self.stop_order_id: str | None = None
         self.stop_px: float | None = None     # trigger of that resting stop, as the venue rounded it
         self.entry_order_id: str | None = None  # the desk's own entry order (an opening fill from any other is an add)
+        self.close_wanted: str | None = None  # a desk close (its reason) not yet done on the exchange: sent again at
+        self.close_failures = 0               # every check (retry_close) until it is, and kept across a restart
         self.last_price: float | None = None
         self.stops_to_clean = False           # a close left reduce-only stops behind that couldn't be cancelled yet
         self.defer_stops = False              # catching up missed bars: trail moves are kept, sent once at the end
@@ -467,17 +469,22 @@ class LiveBroker:
             except Exception as exc:
                 self.log(f"{self.coin}: could not read stop order {self.stop_order_id}: {type(exc).__name__}: {exc}")
         if px is None:
-            px = pos.stop or self.last_price or pos.entry_price
+            px = (self.last_price if self.close_wanted else pos.stop) or pos.stop or self.last_price or pos.entry_price
             fee = est_fee(px)
-            reason = "stop (exchange, fill not found)"
+            reason = f"{self.close_wanted or 'stop'} (exchange, fill not found)"
             self.alert(f"the exchange closed the {pos.side.value} {pos.qty:g} {self.coin} but its fill couldn't be "
                        f"read: booked at the stop {px:,.2f} with an estimated fee. Check the venue's trade history.")
         return self._book(pos, px, fee, int(ts or self.clock()), reason)
 
     def _exit_reason(self, closing: list[dict]) -> str:
+        """Why the exchange is flat: a liquidation, the stop, or the desk's own close whose answer was lost (it went
+        through, but the call failed) when none of the fills is the stop's."""
         if any((t.get("info") or {}).get("liquidationMarkPx") or (t.get("info") or {}).get("liquidation")
                for t in closing):
             return "liquidation"
+        by_stop = self.stop_order_id and any(str(t.get("order")) == self.stop_order_id for t in closing)
+        if self.close_wanted and not by_stop:
+            return self.close_wanted
         return "stop (exchange)"
 
     def _book_fills(self, pos: Position, closing: list[dict], adds: list[dict], reason: str) -> Trade:
@@ -510,7 +517,8 @@ class LiveBroker:
                   funding)
         self.trades.append(t)
         self.position = None
-        self.stop_order_id = self.stop_px = self.entry_order_id = None
+        self.stop_order_id = self.stop_px = self.entry_order_id = self.close_wanted = None
+        self.close_failures = 0
         self.stops_to_clean = True
         self.last_fill = {"action": "close", "side": pos.side.value, "qty": qty, "price": px, "fee": fee,
                           "ts": ts, "reason": reason, "net_pnl": t.net_pnl}
@@ -587,15 +595,28 @@ class LiveBroker:
             n = len(self.trades)
             self.sync(price)
             return self.trades[-1] if len(self.trades) > n else None
+        # Wanted until it's done: if this call fails (or the answer is lost after the exchange took it), the next
+        # check sends it again, and a restart picks it up from the state file.
+        self.close_wanted = reason
+        self._save_local()
         ref = price or self.last_price or pos.entry_price
         side = self._closing_side(pos.side)
-        res = self._accepted(self.ex.create_order(self.symbol, "market", side, self._amount(ex_qty), ref,
-                                                  {"reduceOnly": True}), f"close ({reason})")
+        try:
+            res = self._accepted(self.ex.create_order(self.symbol, "market", side, self._amount(ex_qty), ref,
+                                                      {"reduceOnly": True}), f"close ({reason})")
+        except Exception as exc:
+            self.close_failures += 1
+            if self.close_failures == 1 or self.close_failures % 20 == 0:
+                self.alert(f"could not close the {pos.side.value} {pos.qty:g} {self.coin} ({reason}): "
+                           f"{type(exc).__name__}: {exc}. The stop stays in place; the close is sent again at every "
+                           f"check until it goes through")
+            raise
         after_side, after_qty, _ = self._exchange_position()
         if after_side is not None:
             pos.qty = after_qty
             self._save_local()
-            raise RuntimeError(f"close ({reason}) left {after_qty:g} {self.coin} open; its stop stays in place")
+            raise RuntimeError(f"close ({reason}) left {after_qty:g} {self.coin} open; its stop stays in place and "
+                               f"the rest is sent again at the next check")
         t = self._book_desk_close(pos, res, ts, ref, reason)
         self._cancel_stops(keep=None)
         self.orders_filled += 1
@@ -626,6 +647,18 @@ class LiveBroker:
     def close_now(self, price: float, ts: int, reason: str) -> Trade | None:
         self.pending = []
         return self._close(price, ts, reason)
+
+    def retry_close(self, price: float, ts: int) -> Trade | None:
+        """Send again a desk close that hasn't gone through (an exchange error, a partial fill, a restart). Paper
+        can't fail a close, so a desk that wanted out must keep trying: a daily-loss flatten, say, is decided only
+        once a day."""
+        if self.close_wanted is None:
+            return None
+        if self.position is None:
+            self.close_wanted = None
+            self._save_local()
+            return None
+        return self._close(price, ts, self.close_wanted)
 
     # ---- the protective stop ------------------------------------------------
     def _place_stop(self, stop: float) -> str:
@@ -766,7 +799,7 @@ class LiveBroker:
         self.state_path.write_text(json.dumps({
             "coin": self.coin, "venue": self.venue, "symbol": self.symbol,
             "stop_order_id": self.stop_order_id, "stop_px": self.stop_px, "stops_to_clean": self.stops_to_clean,
-            "entry_order_id": self.entry_order_id,
+            "entry_order_id": self.entry_order_id, "close_wanted": self.close_wanted,
             "position": None if pos is None else {
                 "side": pos.side.value, "qty": pos.qty, "entry_price": pos.entry_price, "entry_ts": pos.entry_ts,
                 "stop": pos.stop, "best_close": pos.best_close, "fees_paid": pos.fees_paid,
@@ -784,6 +817,7 @@ class LiveBroker:
         self.stop_px = d.get("stop_px")
         self.stops_to_clean = bool(d.get("stops_to_clean", False))
         self.entry_order_id = d.get("entry_order_id")
+        self.close_wanted = d.get("close_wanted")
         pd = d.get("position")
         if pd:
             self.position = Position(Side(pd["side"]), pd["qty"], pd["entry_price"], pd["entry_ts"], pd["stop"],

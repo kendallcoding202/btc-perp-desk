@@ -237,6 +237,19 @@ def run(p: Params, mode: str, *, state_dir: str = "state", poll_s: float = 15.0,
             mid = feed.mid()
             broker.check_stop_price(mid, now)
 
+            if broker.close_wanted and broker.position is not None:
+                # a close the desk decided that didn't go through: send it again now, not at the next bar close
+                reason = broker.close_wanted
+                try:
+                    t = broker.retry_close(mid, now)
+                    if t is not None:
+                        desk.say(now, "fills", f"the {reason.replace('_', ' ')} exit went through on a retry @ "
+                                               f"{t.exit_price:,.2f}, net {t.net_pnl:+,.2f}")
+                except Exception as exc:  # the bars still get processed; the next check tries again
+                    log(f"close retry ({reason}) failed: {type(exc).__name__}: {exc}")
+                    desk.kills.entry_kill = True
+                    desk.kills.save(kills_path)
+
             if desk.kills.flat_kill and broker.position is not None:
                 desk.flatten_now(mid, now, "flat_kill")
 
