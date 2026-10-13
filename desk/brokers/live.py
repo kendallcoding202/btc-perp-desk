@@ -132,6 +132,7 @@ STOP_ATTEMPTS = 4
 STOP_BACKOFF_S = 1.0
 FILL_LOOKBACK_MS = 60_000   # an order's own fills are looked up from a minute before it was sent (clock skew)
 FUNDING_MAX_PAGES = 100     # 500 rows a page: years of hourly funding for a few coins
+PROVISIONAL_TRIES = 240     # an exit booked without its fills is re-read at every check for about an hour (15 s polls)
 
 
 def _trigger(o: dict) -> float | None:
@@ -179,6 +180,7 @@ class LiveBroker:
         self.entry_order_id: str | None = None  # the desk's own entry order (an opening fill from any other is an add)
         self.close_wanted: str | None = None  # a desk close (its reason) not yet done on the exchange: sent again at
         self.close_failures = 0               # every check (retry_close) until it is, and kept across a restart
+        self.provisional: list[dict] = []     # exits booked without their fills: re-booked once the fills read
         self.last_price: float | None = None
         self.stops_to_clean = False           # a close left reduce-only stops behind that couldn't be cancelled yet
         self.defer_stops = False              # catching up missed bars: trail moves are kept, sent once at the end
@@ -381,6 +383,8 @@ class LiveBroker:
             self._check_stop_resting()
         elif self.position is None and self.stops_to_clean:
             self._cancel_stops(keep=None)
+        if self.provisional:
+            self._resolve_provisional()
         self.cash = self._balance()
         self._save_local()
 
@@ -453,10 +457,14 @@ class LiveBroker:
         ask for the stop order itself; failing that, book it at the stop level with the configured fee and alert,
         so a human checks the venue's trade history."""
         pos = self.position
-        fills = self._fills_since(pos.entry_ts)
-        closing, adds = self._exit_fills(pos, fills or [])
-        if closing:
-            return self._book_fills(pos, closing, adds, self._exit_reason(closing))
+        closing, adds = [], []
+        if (getattr(self.ex, "has", None) or {}).get("fetchMyTrades", True):
+            for attempt in range(STOP_ATTEMPTS):     # a rate limit, or fills not visible yet: back off and look again
+                if attempt:
+                    self.sleep(STOP_BACKOFF_S * 2 ** (attempt - 1))
+                closing, adds = self._exit_fills(pos, self._fills_since(pos.entry_ts) or [])
+                if closing:
+                    return self._book_fills(pos, closing, adds, self._exit_reason(closing))
         est_fee = lambda px: pos.qty * px * self.p.costs.taker_fee_bps / 1e4   # noqa: E731
         reason, px, fee, ts = "stop (exchange)", None, None, None
         if self.stop_order_id and (getattr(self.ex, "has", None) or {}).get("fetchOrder", True):
@@ -468,13 +476,75 @@ class LiveBroker:
                     ts = o.get("lastTradeTimestamp") or o.get("lastUpdateTimestamp") or o.get("timestamp")
             except Exception as exc:
                 self.log(f"{self.coin}: could not read stop order {self.stop_order_id}: {type(exc).__name__}: {exc}")
-        if px is None:
-            px = (self.last_price if self.close_wanted else pos.stop) or pos.stop or self.last_price or pos.entry_price
-            fee = est_fee(px)
-            reason = f"{self.close_wanted or 'stop'} (exchange, fill not found)"
-            self.alert(f"the exchange closed the {pos.side.value} {pos.qty:g} {self.coin} but its fill couldn't be "
-                       f"read: booked at the stop {px:,.2f} with an estimated fee. Check the venue's trade history.")
-        return self._book(pos, px, fee, int(ts or self.clock()), reason)
+        if px is not None:
+            return self._book(pos, px, fee, int(ts or self.clock()), reason)
+        # Provisional: at the stop level (or, for a desk close whose answer was lost, the last price), with the
+        # configured fee. Every check reads the fills again and re-books the trade from them once they come back.
+        px = (self.last_price if self.close_wanted else pos.stop) or pos.stop or self.last_price or pos.entry_price
+        fee = est_fee(px)
+        rec = {"entry_ts": pos.entry_ts, "side": pos.side.value, "entry_price": pos.entry_price,
+               "entry_fee": pos.fees_paid, "entry_order_id": self.entry_order_id, "stop_order_id": self.stop_order_id,
+               "close_wanted": self.close_wanted, "tries": 0}
+        t = self._book(pos, px, fee, self.clock(), f"{self.close_wanted or 'stop'} (exchange, fill not found)")
+        self.provisional = (self.provisional + [{**rec, "booked_ts": t.exit_ts}])[-20:]
+        self.alert(f"the exchange closed the {pos.side.value} {pos.qty:g} {self.coin} but its fill couldn't be "
+                   f"read: booked for now at {px:,.2f} with an estimated fee. It is re-booked from the exchange's "
+                   f"fills as soon as they can be read; if this alert isn't followed by a re-booking, check the "
+                   f"venue's trade history.")
+        return t
+
+    def _resolve_provisional(self) -> None:
+        """Re-book each exit that was booked without its fills, once the exchange's fills for it can be read: the
+        same closing fills since its entry that a normal exit is booked from (up to when it was booked)."""
+        for rec in list(self.provisional):
+            fills = self._fills_since(rec["entry_ts"])
+            until = rec["booked_ts"] + FILL_LOOKBACK_MS
+            if self.position is not None and self.position.entry_ts > rec["entry_ts"]:
+                until = min(until, self.position.entry_ts - 1)        # the next position's fills aren't this one's
+            side = Side(rec["side"])
+            window = [t for t in fills or [] if (t.get("timestamp") or 0) <= until]
+            closing = [t for t in window if t.get("side") == self._closing_side(side)]
+            k = next((j for j in range(len(self.trades) - 1, -1, -1) if self.trades[j].entry_ts == rec["entry_ts"]
+                      and self.trades[j].side is side and "fill not found" in self.trades[j].reason), None)
+            if k is None:
+                self.provisional.remove(rec)
+                continue
+            if not closing:
+                rec["tries"] += 1
+                if rec["tries"] >= PROVISIONAL_TRIES:
+                    self.provisional.remove(rec)
+                    self.alert(f"the {rec['side']} {self.coin} exit booked without its fills still can't be read "
+                               f"after {PROVISIONAL_TRIES} tries: it stays at {self.trades[k].exit_price:,.2f}. Check "
+                               f"the venue's trade history.")
+                continue
+            old = self.trades[k]
+            adds = [] if rec["entry_order_id"] is None and rec["entry_fee"] else [
+                t for t in window if t.get("side") != self._closing_side(side)
+                and str(t.get("order")) != str(rec["entry_order_id"])]
+            qty, px, fee, ts = self._sum_fills(closing)
+            if fee is None:
+                fee = qty * px * self.p.costs.taker_fee_bps / 1e4
+            if adds:
+                aq, ap, af, _ = self._sum_fills(adds)
+                fee += af if af is not None else aq * ap * self.p.costs.taker_fee_bps / 1e4
+            ts = int(ts or old.exit_ts)
+            funding = self._exchange_funding(rec["entry_ts"], until=ts)
+            funding = old.funding if funding is None else funding
+            if any((t.get("info") or {}).get("liquidationMarkPx") or (t.get("info") or {}).get("liquidation")
+                   for t in closing):
+                reason = "liquidation"
+            elif rec["close_wanted"] and not any(str(t.get("order")) == str(rec["stop_order_id"]) for t in closing):
+                reason = rec["close_wanted"]
+            else:
+                reason = "stop (exchange)"
+            new = Trade(side, qty, old.entry_ts, old.entry_price, ts, px, reason,
+                        side.sign * qty * (px - old.entry_price), rec["entry_fee"] + fee, funding)
+            self.fees_total += new.fees - old.fees
+            self.funding_total += new.funding - old.funding
+            self.trades[k] = new
+            self.provisional.remove(rec)
+            self.alert(f"re-booked the {rec['side']} {self.coin} exit from the exchange's fills: {px:,.2f} (booked for "
+                       f"now at {old.exit_price:,.2f}), net {new.net_pnl:+,.2f} (was {old.net_pnl:+,.2f})")
 
     def _exit_reason(self, closing: list[dict]) -> str:
         """Why the exchange is flat: a liquidation, the stop, or the desk's own close whose answer was lost (it went
@@ -799,7 +869,7 @@ class LiveBroker:
         self.state_path.write_text(json.dumps({
             "coin": self.coin, "venue": self.venue, "symbol": self.symbol,
             "stop_order_id": self.stop_order_id, "stop_px": self.stop_px, "stops_to_clean": self.stops_to_clean,
-            "entry_order_id": self.entry_order_id, "close_wanted": self.close_wanted,
+            "entry_order_id": self.entry_order_id, "close_wanted": self.close_wanted, "provisional": self.provisional,
             "position": None if pos is None else {
                 "side": pos.side.value, "qty": pos.qty, "entry_price": pos.entry_price, "entry_ts": pos.entry_ts,
                 "stop": pos.stop, "best_close": pos.best_close, "fees_paid": pos.fees_paid,
@@ -818,6 +888,7 @@ class LiveBroker:
         self.stops_to_clean = bool(d.get("stops_to_clean", False))
         self.entry_order_id = d.get("entry_order_id")
         self.close_wanted = d.get("close_wanted")
+        self.provisional = list(d.get("provisional") or [])
         pd = d.get("position")
         if pd:
             self.position = Position(Side(pd["side"]), pd["qty"], pd["entry_price"], pd["entry_ts"], pd["stop"],

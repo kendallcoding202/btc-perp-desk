@@ -239,10 +239,12 @@ class FakeHyperliquid:
                 for o in self.resting.values() if symbol in (None, o["symbol"])]
 
     def fetch_order(self, id, symbol=None, params=None):
+        """ccxt 4.5's hyperliquid builds this from orderStatus, which carries no average fill price: 'average' is
+        None even for a filled order."""
         self._maybe_fail("order")
         if id not in self.status:
             raise OrderNotFound(id)
-        return dict(self.status[id])
+        return {**self.status[id], "average": None}
 
     def fetch_my_trades(self, symbol=None, since=None, limit=None, params=None):
         self._maybe_fail("my_trades")
@@ -466,23 +468,37 @@ def test_a_stop_that_filled_while_the_desk_was_down_is_booked_at_its_fill_after_
     assert b2.position is None and b2.trades[-1].exit_price == pytest.approx(77_400.0)
 
 
-@pytest.mark.parametrize("readable", ["the stop order", "nothing"])
+@pytest.mark.parametrize("readable", ["after one 429", "on a later check", "never"])
 def test_when_the_fills_cant_be_read_the_exit_falls_back_loudly(tmp_path, readable):
+    """The fills read fails as the stop's exit is booked. One failure is retried with backoff. If they stay unreadable
+    the exit is booked for now at the stop level with an alert, never at the next mid, and re-booked from the fills
+    once they read: Hyperliquid's fetch_order has no average price to fall back on, so that used to be for good."""
     ex, said = FakeHyperliquid({"BTC": 80_000.0}, slip_bps=0.0), []
     b = _broker("BTC", ex, tmp_path, cap=500.0, sleep=Sleeps(), on_alert=said.append)
+    cash0 = ex.cash
     b.submit(Order("open", Side.LONG, 0.002, "breakout", stop=78_000.0))
     b.execute_now(80_000.0, T0)
     ex.move("BTC", 77_900.0, fill_at=77_850.0)
-    ex.fail["my_trades"] = 99
-    if readable == "nothing":
-        ex.fail["order"] = 99
+    ex.fail["my_trades"] = {"after one 429": 1, "on a later check": live_mod.STOP_ATTEMPTS + 1, "never": 10 ** 6}[readable]
     b.check_stop_price(81_500.0, ex.now)
     t = b.trades[-1]
-    if readable == "the stop order":                                        # ccxt's fetch_order has the average
+    if readable == "after one 429":
         assert t.exit_price == pytest.approx(77_850.0) and t.reason == "stop (exchange)" and not said
-    else:                                                                   # never the next mid: the stop level
-        assert t.exit_price == pytest.approx(78_000.0) and "fill not found" in t.reason
-        assert any("couldn't be read" in a for a in said)
+        assert b.sleep == [1.0]
+        return
+    assert t.exit_price == pytest.approx(78_000.0) and "fill not found" in t.reason     # the stop level, not 81,500
+    assert any("couldn't be read" in a for a in said)
+    saved = json.loads(b.state_path.read_text())
+    assert saved["provisional"] and saved["trades"][-1]["exit_price"] == pytest.approx(78_000.0)
+    b2 = _broker("BTC", ex, tmp_path, cap=500.0, sleep=Sleeps(), on_alert=said.append)   # kept across a restart
+    b2.check_stop_price(81_500.0, ex.now + 15_000)
+    t = b2.trades[-1]
+    if readable == "never":
+        assert t.exit_price == pytest.approx(78_000.0) and b2.provisional
+        return
+    assert len(b2.trades) == 1 and t.reason == "stop (exchange)" and t.exit_price == pytest.approx(77_850.0)
+    assert t.net_pnl == pytest.approx(ex.cash - cash0) and not b2.provisional and any("re-booked" in a for a in said)
+    assert json.loads(b2.state_path.read_text())["trades"][-1]["exit_price"] == pytest.approx(77_850.0)
 
 
 def test_an_exit_partly_made_by_hand_is_booked_from_every_closing_fill(tmp_path):
