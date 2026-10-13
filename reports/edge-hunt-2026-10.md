@@ -9,7 +9,7 @@ The audit of the BTC/ETH/SOL perp desk, and the hunt for anything worth adding t
 - **Two ideas are contested** (one checker said real, the other was unsure). One is the 20-coin trend portfolio, which needs $1–5k and can't run at $150. The other is fading Binance's retail long/short ratio (C1). Five more are unconfirmed, a sixth had only one check, one was never checked, two are refuted or not usable, two are a fee-saving execution tweak (limit-order entries) that passed, and the other 10 failed.
 - **Adding VT to the desk looked better in 2024–26** (Sharpe 0.98 vs 0.85). That gain can't be told apart from luck: there is a 32% chance it is zero or negative.
 - **The SOL desk account has no demonstrated edge.** Its Sharpe was 0.27 in 2020–23 and 0.24 since, with about a 39% chance that its true Sharpe is zero or below. ETH is thin too.
-- **Live trading isn't safe yet.** ETH and SOL live orders would go to BTC at about 30× (ETH) to 550–770× (SOL) the size cap. On any coin, BTC included, a failed stop placement can leave a position with no stop. So far only the paper ledger-reset bug is fixed (ef00987). Paper trading is not affected.
+- **Live trading has never run with money.** The audit found five live-only bugs. ETH and SOL orders would have gone to BTC at about 30× (ETH) to 550–770× (SOL) the size cap, and on any coin a failed stop placement could leave a position with no stop. All five are now fixed, with tests against a fake exchange (2026-10-13, see "Code and execution" below). A review of those fixes found more live-only problems (13, one of them HIGH: a Hyperliquid sub-account's orders went to the main account). Those are fixed too. The paper ledger-reset bug was fixed earlier (ef00987). Paper trading is not affected.
 - **The 2024–26 data is now used up.** Only data from 2026-10-01 on can confirm anything. The quarterly re-audit's pass bar needs tightening before its first use in April 2027.
 
 *Sharpe* = return per unit of bumpiness, on daily returns. In a backtest, 1+ is strong, 0.5 is modest and 0 is nothing.
@@ -127,15 +127,29 @@ All figures are for 2024–26, with the bootstrap chance that the gain is really
 ## Code and execution: fixed and open
 
 - **Fixed:** a failed git fetch could reset all three paper ledgers to fresh accounts and overwrite the real ones (commit ef00987, pushed).
-- **Open, HIGH:** live ETH or SOL orders go to BTC-PERP. The code is still in `desk/brokers/live.py` at f681af5, where SYMBOLS hard-codes BTC. The size depends on which repro you read:
-  - code audit: 31.5× (ETH) and 547× (SOL) the $50 cap
-  - execution checker: about 33× (ETH) and about 770× (SOL, 0.467 BTC, about $38.6k)
-  - execution auditor: SOL about $24.8k
-
-  The stop also goes on BTC at the ETH or SOL price level, so in practice there is no stop. Hyperliquid's margin check would probably reject the biggest orders.
-- **Open, MEDIUM:** if the stop order fails right after an entry, the position has no exchange stop. This affects every coin, BTC included. The trail usually re-places it at the next 2h close (83–86% of trades). The few trades where it doesn't are exactly the ones going wrong.
-- **Open, MEDIUM:** an exchange stop fill is booked at the next mid price, not the fill price. In the repro, a −$4.14 loss was booked as a +$2.85 win. On a restart it is booked at the local stop, so the auditor's "runner was down" case was wrong. After a gap, the live loop processes only the newest bar. The code audit and its checker also confirmed from the code that live state files are shared across coins (`desk/runner.py`).
-- **Live has never run,** and paper is not affected by any of these.
+- **Fixed 2026-10-13, the five live-only bugs** (branch `live-broker-fixes`). Each has tests in `tests/test_live.py`, run against a fake exchange that answers the way ccxt's Hyperliquid class does, and each test fails on the code before its fix:
+  - **HIGH, live ETH or SOL orders went to BTC-PERP** (fe3ff60). `desk/brokers/live.py` hard-coded BTC for every venue. The size depended on which repro you read: 31.5× (ETH) and 547× (SOL) the $50 cap in the code audit, about 33× and about 770× (0.467 BTC, about $38.6k) for the execution checker, and about $24.8k (SOL) for the execution auditor. The stop also went on BTC at the ETH or SOL price level. Now each coin trades its own perp (`<COIN>/USDC:USDC` on Hyperliquid, checked against its public market list). Sizes are cut down to the size step and kept under the cap, and a ticket under the $10 minimum isn't sent. Live refuses to start on a coin the venue doesn't list.
+  - **MEDIUM, a failed stop after an entry left the position with no exchange stop** (6f458b6). This affected every coin, BTC included. The stop now counts as placed only once it's read back from the open orders. It's tried 4 times with backoff; then the position is closed and an alert goes out. Every sync checks that a stop is resting and puts it back if not.
+  - **MEDIUM, an exchange stop fill was booked at the next mid, not the fill** (f80b18d). In the repro, a −$4.14 loss was booked as a +$2.85 win. (On a restart it was booked at the local stop, so the auditor's "runner was down" case was wrong.) It's now booked at the exchange's own fills (price and fee), with the exchange's funding. When the fills can't be read it is booked at the stop level with an alert, never at the next mid, and re-booked from the fills once they can be read (dca83a8; the fallback to the stop order's own average never answers on Hyperliquid).
+  - **MEDIUM, after a gap the live loop processed only the newest bar** (9f79284). It now processes every missed bar in order, and on each one the desk makes paper's decision as long as it holds what paper holds. Exits and trail stops paper would have acted on are acted on now. Entries from missed bars are not taken, so after one live can be flat where paper is long, and their decisions differ until paper is flat again. Sizing at missed bars uses the account's current value. A gap longer than the history window stops live rather than guess.
+  - **MEDIUM, live state files were shared across coins** (5237aef). This was in `desk/runner.py` and `desk/__main__.py`. Each coin's files now live in `state/<COIN>/`. An old shared file makes live refuse, and a second process for the same coin is refused.
+- **Fixed 2026-10-13, after a review of those five fixes** (same branch). Three reviewers looked at exchange semantics (the real ccxt 4.5.85 Hyperliquid class against a fake Hyperliquid server), failure paths, and isolation from paper. Each fix has a test in `tests/test_live.py` that fails on the code before it. For the sub-account and builder-fee fixes that is only because the setting didn't exist before; their effect was checked on the real ccxt class against the fake server:
+  - **HIGH, a sub-account's orders went to the main account** (c1b1633). This was the README's setup for two coins. A sub-account has no key, so an order applies to it only with vaultAddress set, and the desk never set it. The desk read the sub-account while its orders opened positions on the main account, past the cap. `HL_SUBACCOUNT_ADDRESS` now sets it. Live also refuses an account that reads $0.
+  - **MEDIUM, a trade's funding included every other coin's on the account** (b1b02b4). ccxt labels every funding row with the symbol asked for. Only the first 500 rows were read. Now rows are kept by their own coin, page by page.
+  - **MEDIUM, part of a position closed early was lost from the record** (6500711). A 15 s check between two closes is the normal case: a hand close of a quarter of the position, or a desk close that only partly filled, then the stop. A position grown by hand kept a stop sized for less. Now one trade is booked per position from all its closing fills, and the stop must cover the whole position.
+  - **MEDIUM, a desk close that hit one exchange error was dropped** (85b2b95). For a daily-loss flatten that meant the rest of the UTC day. It's now kept and sent again at every check, across restarts. A close that filled but whose answer was lost is booked with the desk's reason, not as a stop.
+  - **MEDIUM, after a gap the newest close counted as fresh however old it was** (6765ccc). An entry went out 3h59m after its signal. A close is now fresh only for 5 minutes.
+  - **MEDIUM, an exchange error during startup ended the process** (2b51b1e). That included a restart that had to put a missing stop back. Startup now keeps trying.
+  - **LOW:** fills unreadable at an exit (dca83a8); ccxt's builder fee and referrer (d9ec8ec; ccxt pinned to 4.5.85); a restart mid catch-up stopping out on a bar paper held through (3af338b); unconfirmed stops piling up (e5ab920); `reset-halt --mode live` reporting success under a running live process (ec54323); a cap just above the $10 minimum that started and never traded (ba9e5c8).
+- **Live has still never run against a funded account.** Only the Hyperliquid path was checked. Still open, live only:
+  - the real venue's order and fill shapes, how fast new orders appear in its open orders, and its rate limits
+  - other venues' symbols and stop-order queries were not checked
+  - two coins on one account each size from the whole account (give each coin its own sub-account)
+  - an exchange error while placing an order still sets `entry_kill`, even when a retry then gets the order through
+- **Paper is not affected by any of these, and the fixes don't touch its code.** Before and after the fixes:
+  - `python -m desk backtest` for BTC, ETH and SOL, and `vt-backtest`, wrote the same reports apart from the generated time
+  - `python -m desk step` on copies of the four real ledgers, given the same recorded Hyperliquid answers, wrote the same files byte for byte
+  - so did 1,632 paper steps per coin over June 2025 to September 2026 on real 2h history, with missed runs (21, 49 and 21 trades)
 - **Open, LOW (these do touch paper):**
   - one account's ledger with the wrong bar interval stops every account's step and skips the save
   - paper's stale-data gate never fires
@@ -174,14 +188,17 @@ All figures are for 2024–26, with the bootstrap chance that the gain is really
    - require the 2024–26 and new-data excess together to have a block-bootstrap P ≤ 0.05, split across a fixed number of looks
    - tighten the account-change rule to P < 0.05
    - put this power table in REAUDIT.md
-3. **The live bugs are open, and the go-live gate rests on 14 days of paper,** which is pure noise. The first live ETH or SOL entry would open a BTC position about 30× (ETH) to 550–770× (SOL) too big.
-   *Next,* before anyone arms live:
+3. **The go-live gate rests on 14 days of paper,** which is pure noise. Before the fixes, the first live ETH or SOL entry would have opened a BTC position about 30× (ETH) to 550–770× (SOL) too big.
+   *Done 2026-10-13* (see "Code and execution" above):
    - take the symbol from the coin setting
    - give each coin its own state files
    - retry a failed stop, or flatten the position
    - book exchange stops at the real fill
    - add a stub-exchange test that an ETH desk sends ETH orders under the cap
-   - tie going live to the re-audit's evidence bar, not to 14 days of paper
+   - catch up on missed bars as paper does
+   - and, after the review: trade a sub-account through vaultAddress, retry failed closes and startup, book positions closed in pieces from all their fills
+
+   *Still next:* tie going live to the re-audit's evidence bar, not to 14 days of paper. Live has never run with money.
 4. **VT's paper-account code is new and still under review.**
    - The checkers verified the research version. The account trades the held-quantity form, and the code checker's drifting-holdings test gave 0.92, close to the 0.90 verified.
    - VT doesn't depend on exact fill timing. Fills delayed by 1, 4 or 12 hours gave 0.89–0.96, and a full day gave 0.72.

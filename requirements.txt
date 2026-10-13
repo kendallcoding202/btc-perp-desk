@@ -1,4 +1,6 @@
 # The desk itself (backtest, paper, dashboard) uses only the Python standard library (3.10+).
 # Live trading needs ccxt; the tests need pytest.
-ccxt>=4.5
+# Pinned: desk/brokers/live.py switches off ccxt hyperliquid's builder fee through its internals, checked on
+# this version (tests/test_live.py checks it on whatever is installed). Re-check before upgrading.
+ccxt==4.5.85
 pytest>=8

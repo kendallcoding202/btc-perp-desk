@@ -25,7 +25,8 @@ from .thresholds import Params
 
 @dataclass
 class Kills:
-    """Manual switches, flipped from the dashboard or by editing state/kills.json."""
+    """Manual switches, flipped from the dashboard or by editing the account's kills.json (ledger/<COIN>/ for paper,
+    state/<COIN>/ for live)."""
     flat_kill: bool = False     # close the position now and take no new entries
     entry_kill: bool = False    # keep the position and its stop, take no new entries
     jev_kill: bool = False      # stop consulting Jev

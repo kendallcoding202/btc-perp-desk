@@ -265,6 +265,14 @@ def promotion_status(p: Params) -> list[tuple[str, bool, str]]:
     return checks
 
 
+LIVE_CONFIRM_PHRASE = "I understand this trades real money and can lose all of it"
+
+
+def _live_confirmed() -> bool:
+    """Gate 3: DESK_LIVE_CONFIRM (in .env) is the exact phrase."""
+    return os.environ.get("DESK_LIVE_CONFIRM") == LIVE_CONFIRM_PHRASE
+
+
 def cmd_live(args) -> int:
     from . import runner
 
@@ -280,28 +288,55 @@ def cmd_live(args) -> int:
     if args.max_notional is None:
         print("  live requires --max-notional (start with something you can lose, e.g. 50)")
         return 2
-    phrase = "I understand this trades real money and can lose all of it"
-    if os.environ.get("DESK_LIVE_CONFIRM") != phrase:
-        print(f'  set DESK_LIVE_CONFIRM="{phrase}" in .env to arm live trading.')
+    if not _live_confirmed():
+        print(f'  set DESK_LIVE_CONFIRM="{LIVE_CONFIRM_PHRASE}" in .env to arm live trading.')
         return 2
-    runner.run(p, "live", poll_s=args.poll, host=args.host, port=args.port, dashboard=not args.no_dashboard,
-               max_notional=args.max_notional, jev=_jev(p))
+    from .brokers.live import LiveSetupError
+
+    try:
+        runner.run(p, "live", poll_s=args.poll, host=args.host, port=args.port, dashboard=not args.no_dashboard,
+                   max_notional=args.max_notional, jev=_jev(p))
+    except LiveSetupError as exc:
+        print(f"\n  Not going live: {exc}")
+        return 2
     return 0
 
 
 def cmd_reset_halt(args) -> int:
+    from .runner import SHARED_LIVE_FILES, live_paths
+
     coin = args.coin.upper()
-    path = Path(f"ledger/{coin}/paper.json") if args.mode == "paper" else Path("state/live_desk.json")
+    path = Path(f"ledger/{coin}/paper.json") if args.mode == "paper" else live_paths("state", coin)["desk"]
     if not path.exists():
         print(f"no desk state found at {path}")
+        if args.mode == "live" and any(Path("state", n).exists() for n in SHARED_LIVE_FILES):
+            print("  state/ still holds live files from before they were kept per coin: move them into "
+                  "state/<COIN>/ for the coin they belong to (see README, Going live)")
         return 1
-    d = json.loads(path.read_text())
-    holder = d["desk"] if args.mode == "paper" else d
-    risk = holder.get("risk", {})
-    print(f"  {coin} halted: {risk.get('halted')} — {risk.get('halt_reason') or 'n/a'}")
-    risk.update({"halted": False, "halt_reason": "", "peak_equity": 0.0})
-    holder["risk"] = risk
-    path.write_text(json.dumps(d))
+    held = None
+    if args.mode == "live":
+        # A running live process rewrites its desk file from memory every check, so a reset made under it is lost
+        # at the next one. Its lock says whether it is running; hold it while resetting.
+        from .brokers.live import LiveSetupError
+        from .runner import _lock
+
+        try:
+            held = _lock(live_paths("state", coin)["lock"])
+        except LiveSetupError:
+            print(f"  {coin}'s live process is running: it rewrites {path} at every check, so a reset now would be "
+                  f"undone. Stop it first, then reset the halt.")
+            return 2
+    try:
+        d = json.loads(path.read_text())
+        holder = d["desk"] if args.mode == "paper" else d
+        risk = holder.get("risk", {})
+        print(f"  {coin} halted: {risk.get('halted')} — {risk.get('halt_reason') or 'n/a'}")
+        risk.update({"halted": False, "halt_reason": "", "peak_equity": 0.0})
+        holder["risk"] = risk
+        path.write_text(json.dumps(d))
+    finally:
+        if held is not None:
+            held.close()
     print("  halt cleared; peak equity resets to current equity on the next bar.")
     return 0
 
