@@ -58,7 +58,7 @@
   <!-- the VT basket's tab: its three coins instead of the price chart and the agents -->
   <section class="panel basket basket-only" id="basket">
     <div class="ticker" id="vt-ticker">‹ BASKET</div>
-    <div class="panel-head"><span>HOLDINGS · AT THE 00:00 UTC CLOSE</span><span class="pink" id="vt-next">NEXT DECISION 00:00 UTC</span></div>
+    <div class="panel-head"><span>HOLDINGS · AT THE 00:00 UTC CLOSE</span><span class="wait" id="vt-next">NEXT DECISION 00:00 UTC</span></div>
     <div class="vt-body">
       <div class="ol-exp" id="vt-exp"></div>
       <p class="vt-rule" id="vt-rule"></p>
@@ -92,7 +92,7 @@
 
   <section class="bottom">
     <div class="panel analysis">
-      <div class="panel-head"><span id="analysis-title">DESK · ANALYSIS</span><span class="pink" id="scanned">0 SCANNED</span></div>
+      <div class="panel-head"><span id="analysis-title">DESK · ANALYSIS</span><span class="scan-count" id="scanned">0 SCANNED</span></div>
       <div class="stats" id="stats"></div>
       <div class="outlook desk-only" id="outlook"></div>
       <div class="analysis-body">
@@ -101,7 +101,7 @@
       </div>
     </div>
     <div class="panel thresholds">
-      <div class="panel-head"><span class="mono-title">thresholds.py</span><span class="pink">EVERY NUMBER THE DESK BELIEVES</span></div>
+      <div class="panel-head"><span class="mono-title">thresholds.py</span><span class="accent">EVERY NUMBER THE DESK BELIEVES</span></div>
       <div id="thr"></div>
       <div class="filter-line desk-only">filter.py · <b>THE ORDER IS THE WHOLE POINT</b></div>
       <div class="filter-line basket-only">voltrend.py · <b>ONE CODE PATH: PAPER = BACKTEST</b> · paper only, no kill switches</div>

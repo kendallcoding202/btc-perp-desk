@@ -5,8 +5,8 @@
   const $ = (id) => document.getElementById(id);
   const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
   const COLORS = {
-    chief: "--white", scan: "--green", vet: "--red", crowd: "--blue",
-    size: "--pink", fills: "--white", risk: "--orange", crawler: "--pink",
+    chief: "--white", scan: "--green", vet: "--amber", crowd: "--blue",
+    size: "--lime", fills: "--ice", risk: "--orange", crawler: "--cyan",
   };
 
   // ---- pixel sprites (X = body, k = eye) --------------------------------
@@ -36,9 +36,10 @@
     c.className = "sprite";
     const g = c.getContext("2d");
     const body = css(COLORS[key]);
+    const ink = css("--ink") || "#070b10";
     map.forEach((row, y) => [...row].forEach((ch, x) => {
       if (ch === ".") return;
-      g.fillStyle = ch === "k" ? "#0d0f1f" : body;
+      g.fillStyle = ch === "k" ? ink : body;
       g.fillRect(x * px, y * px, px, px);
     }));
     return c;
@@ -67,6 +68,14 @@
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
     g.clearRect(0, 0, w, h);
     return { g, w, h };
+  }
+
+  function rgba(name, a) {
+    const raw = (css(name) || "#3ee08f").replace("#", "");
+    const hex = raw.length === 3 ? raw.split("").map((c) => c + c).join("") : raw;
+    const n = parseInt(hex, 16);
+    if (!Number.isFinite(n)) return `rgba(62,224,143,${a})`;
+    return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
   }
 
   function line(g, pts, color, width = 1.5, dash = []) {
@@ -111,10 +120,10 @@
       g.fillText(`${d.toISOString().slice(5, 10)}`, X(k) - 14, h - 4);
     }
 
-    line(g, chart.don_hi.map((v, k) => [X(k), v == null ? null : Y(v)]), "rgba(138,143,176,.55)", 1, [3, 4]);
-    line(g, chart.don_lo.map((v, k) => [X(k), v == null ? null : Y(v)]), "rgba(138,143,176,.3)", 1, [3, 4]);
-    line(g, chart.ema_slow.map((v, k) => [X(k), v == null ? null : Y(v)]), css("--blue"), 1.4);
-    line(g, chart.ema_fast.map((v, k) => [X(k), v == null ? null : Y(v)]), css("--pink"), 1.4);
+    line(g, chart.don_hi.map((v, k) => [X(k), v == null ? null : Y(v)]), rgba("--muted", .55), 1, [3, 4]);
+    line(g, chart.don_lo.map((v, k) => [X(k), v == null ? null : Y(v)]), rgba("--muted", .35), 1, [3, 4]);
+    line(g, chart.ema_slow.map((v, k) => [X(k), v == null ? null : Y(v)]), css("--blue"), 1.6);
+    line(g, chart.ema_fast.map((v, k) => [X(k), v == null ? null : Y(v)]), css("--cyan"), 1.6);
 
     const bw = Math.max(1, cw * 0.62);
     cs.forEach(([, o, hgh, l, c], k) => {
@@ -136,15 +145,20 @@
       if (k == null) continue;
       const x = X(k), y = Y(m.price);
       if (m.kind === "entry") {
-        g.fillStyle = css("--green"); g.beginPath(); g.moveTo(x, y + 4); g.lineTo(x - 5, y + 12); g.lineTo(x + 5, y + 12); g.fill();
+        const short = m.side === "short";
+        g.fillStyle = css(short ? "--red" : "--green");
+        g.beginPath();
+        if (short) { g.moveTo(x, y - 4); g.lineTo(x - 5, y - 12); g.lineTo(x + 5, y - 12); }
+        else { g.moveTo(x, y + 4); g.lineTo(x - 5, y + 12); g.lineTo(x + 5, y + 12); }
+        g.fill();
       } else {
         g.fillStyle = m.pnl >= 0 ? css("--green") : css("--red");
         g.beginPath(); g.arc(x, y, 4, 0, Math.PI * 2); g.fill();
-        g.strokeStyle = "#0d0f1f"; g.stroke();
+        g.strokeStyle = css("--ink") || "#070b10"; g.stroke();
       }
     }
-    const last = cs[cs.length - 1][4];
-    tag(g, w - padR, Y(last), pxAxis(last), css("--green"), true);
+    const last = cs[cs.length - 1];
+    tag(g, w - padR, Y(last[4]), pxAxis(last[4]), css(last[4] >= last[1] ? "--green" : "--red"), true);
     lastGeom = { X, Y, cs, w, h, padR };
   }
 
@@ -158,9 +172,10 @@
   function tag(g, x, y, text, color, filled = false) {
     g.save(); g.font = "bold 10px JetBrains Mono, monospace";
     const tw = g.measureText(text).width + 8;
-    g.fillStyle = filled ? color : "#0d0f1f"; g.strokeStyle = color;
+    const ink = css("--ink") || "#070b10";
+    g.fillStyle = filled ? color : ink; g.strokeStyle = color;
     g.fillRect(x + 2, y - 8, tw, 16); g.strokeRect(x + 2, y - 8, tw, 16);
-    g.fillStyle = filled ? "#0d0f1f" : color; g.fillText(text, x + 6, y + 4); g.restore();
+    g.fillStyle = filled ? ink : color; g.fillText(text, x + 6, y + 4); g.restore();
   }
 
   // ---- the crawler's web: legs reaching out to the last candles' highs ------------
@@ -171,11 +186,11 @@
     const { X, Y, cs } = lastGeom;
     const chartTop = $("chart").offsetTop;
     const cx = w * 0.56, cy = h * 0.78;
-    const pink = css("--pink");
+    const silk = css("--cyan") || "#2ee6ff";
     const picks = [];
     for (let k = cs.length - 1; k >= 0 && picks.length < 9; k -= Math.max(1, Math.floor(cs.length / 18))) picks.push(k);
     g.save();
-    g.strokeStyle = "rgba(255,95,210,.75)"; g.lineWidth = 1.3; g.shadowColor = pink; g.shadowBlur = 6;
+    g.strokeStyle = silk; g.lineWidth = 1.3; g.shadowColor = silk; g.shadowBlur = 6;
     picks.forEach((k, n) => {
       const tx = X(k) + 6, ty = Y(n % 2 ? cs[k][3] : cs[k][2]) + chartTop;
       const kx = (cx + tx) / 2 + (n % 2 ? 18 : -18), ky = (cy + ty) / 2 + 22;
@@ -187,7 +202,7 @@
     g.shadowBlur = 0;
     g.fillStyle = "#1a1d33"; g.strokeStyle = "#fff"; g.lineWidth = 2;
     g.beginPath(); g.ellipse(cx, cy, 13, 10, -0.4, 0, Math.PI * 2); g.fill(); g.stroke();
-    g.fillStyle = pink; g.beginPath(); g.ellipse(cx + 12, cy + 6, 8, 6, -0.4, 0, Math.PI * 2); g.fill();
+    g.fillStyle = silk; g.beginPath(); g.ellipse(cx + 12, cy + 6, 8, 6, -0.4, 0, Math.PI * 2); g.fill();
     g.restore();
   }
 
@@ -213,11 +228,13 @@
     const Y = (v) => top + (hi - v) / (hi - lo) * (h - top - 8);
     g.font = "10px JetBrains Mono, monospace"; g.fillStyle = css("--dim");
     [hi, (hi + lo) / 2, lo].forEach((v) => { g.fillText(usdShort(v), 0, Y(v) + 3); line(g, [[padL, Y(v)], [w, Y(v)]], css("--line"), 1); });
+    const up = ys[ys.length - 1] >= ys[0];
+    const tone = up ? "--green" : "--red";
     const grad = g.createLinearGradient(0, 0, 0, h);
-    grad.addColorStop(0, "rgba(62,224,143,.28)"); grad.addColorStop(1, "rgba(62,224,143,0)");
+    grad.addColorStop(0, rgba(tone, .28)); grad.addColorStop(1, rgba(tone, 0));
     g.beginPath(); g.moveTo(X(0), h); eq.forEach((p, k) => g.lineTo(X(k), Y(p[1]))); g.lineTo(X(eq.length - 1), h); g.closePath();
     g.fillStyle = grad; g.fill();
-    line(g, eq.map((p, k) => [X(k), Y(p[1])]), css("--green"), 2);
+    line(g, eq.map((p, k) => [X(k), Y(p[1])]), css(tone), 2);
     // a deposit or withdrawal is a step in the bank, not profit or loss (a label that would overlap another is left
     // off, the line stays; one after the newest point is drawn at it)
     const at = (ts) => { const k = eq.findIndex((p) => p[0] > ts); return X(k < 0 ? eq.length - 1 : k); };
@@ -233,8 +250,8 @@
       ends[row] = tx + tw;
     });
     const lx = X(eq.length - 1), ly = Y(ys[ys.length - 1]);
-    g.fillStyle = css("--green"); g.beginPath(); g.arc(lx, ly, 4, 0, Math.PI * 2); g.fill();
-    g.strokeStyle = "rgba(62,224,143,.35)"; g.lineWidth = 4; g.beginPath(); g.arc(lx, ly, 8, 0, Math.PI * 2); g.stroke();
+    g.fillStyle = css(tone); g.beginPath(); g.arc(lx, ly, 4, 0, Math.PI * 2); g.fill();
+    g.strokeStyle = rgba(tone, .4); g.lineWidth = 4; g.beginPath(); g.arc(lx, ly, 8, 0, Math.PI * 2); g.stroke();
   }
 
   function drawPnlBars(pnls) {
@@ -267,6 +284,7 @@
     agents.forEach((a) => {
       const el = $(`card-${a.key}`);
       el.className = `card ${a.state || ""}`;
+      el.style.setProperty("--card", `var(${COLORS[a.key]})`);
       el.querySelector(".detail").textContent = a.detail || "";
       el.querySelector(".value").textContent = a.value ?? "";
       const bar = el.querySelector(".bar i");
@@ -298,15 +316,21 @@
   // percentage is the time-weighted performance, not the P&L over the money put in, so it's named
   const pnlTag = (s) => s.flows ? `P&amp;L ${usd(s.ticker.pnl)} · PERF ${pct(s.ticker.pnl_pct)} TIME-WEIGHTED · ` +
     `${s.flows.net >= 0 ? "DEPOSITED" : "WITHDRAWN"} ${usd(Math.abs(s.flows.net))}, NOT P&amp;L` : `P&amp;L ${usd(s.ticker.pnl)} (${pct(s.ticker.pnl_pct)})`;
+  const pnlHtml = (s) => pnlTag(s).replace(`P&amp;L ${usd(s.ticker.pnl)}`, `<span class="${s.ticker.pnl < 0 ? "bad" : "ok"}">P&amp;L ${usd(s.ticker.pnl)}</span>`);
 
   function renderStage(s) {
     const t = s.ticker, k = s.kills, coin = s.header.coin || "BTC";
-    const liveTag = live.at ? `<span class="live-dot" aria-hidden="true"></span>LIVE · ` : "";
+    const liveTag = live.at ? `<span class="live-dot" aria-hidden="true"></span><span class="live-word">LIVE</span> · ` : "";
+    const pos = String(t.position || "");
+    const posCls = pos.startsWith("SHORT") ? "short" : pos.startsWith("LONG") ? "long" : "flat";
+    const chgCls = t.change_24h == null || isNaN(t.change_24h) ? "" : t.change_24h >= 0 ? "ok" : "bad";
     $("ticker").innerHTML = `‹ ${liveTag}TRADES · ${esc(coin)} ${px(t.price)} · BANK ${usd(t.bank)} · ` +
-      `<span class="hl">${esc(t.position)}${t.position_detail ? " " + esc(t.position_detail) : ""}</span>` +
-      ` · ${esc(t.record)} · HOLD ${pct(t.hold_pct)} · ${pnlTag(s)} · FEES ${usd(t.fees)} · FUNDING ${usd(t.funding)}`;
+      `<span class="hl ${posCls}">${esc(t.position)}${t.position_detail ? " " + esc(t.position_detail) : ""}</span>` +
+      ` · ${esc(t.record)} · HOLD <span class="${t.hold_pct < 0 ? "bad" : "ok"}">${pct(t.hold_pct)}</span>` +
+      ` · ${pnlHtml(s)} · FEES ${usd(t.fees)} · FUNDING ${usd(t.funding)}`;
     $("chart-title").textContent = `${coin}-PERP · ${s.header.interval} · ${px(t.price)}`;
-    $("chart-sub").textContent = `24h ${pct(t.change_24h)} · ema.fast pink · ema.slow blue · channel dashed`;
+    $("chart-sub").innerHTML = `<span class="${chgCls}">24h ${pct(t.change_24h)}</span>` +
+      ` · fast <i class="swatch fast"></i> · slow <i class="swatch slow"></i> · channel <i class="swatch channel"></i> · stop <i class="swatch stop"></i>`;
     const chips = $("chips");
     chips.innerHTML = s.agents.map((a) => `<span class="chip ${a.state === "idle" ? "off" : ""}" title="${esc(a.name)}: ${esc(a.state)}"
       style="background:var(${COLORS[a.key]})">${esc(a.name[0])}</span>`).join("");
@@ -331,6 +355,7 @@
     $("bal-mode").textContent = s.header.mode;
     $("bal-record").textContent = t.record;
     $("bal-hold").textContent = pct(t.hold_pct);
+    $("bal-hold").className = t.hold_pct < 0 ? "bad" : "ok";
     $("balance").textContent = usd(t.bank);
     $("balance").style.color = t.pnl >= 0 ? "var(--green)" : "var(--red)";
     if (goal) {
@@ -371,9 +396,10 @@
     $("scanned").textContent = `${s.analysis.scanned.toLocaleString("en-US")} ${basket ? "DAILY CLOSES DECIDED" : "BARS SCANNED"}`;
     const cells = basket ? [
       ["$" + s.header.coin, "basket", "sym"], ["Cash", usd(t.cash)], ["Held", usd(t.notional)],
-      ["Exposure", `${num(t.exposure)}x`], ["Unrealised", usd(t.unrealised)], ["Fees", usd(t.fees)], ["Funding", usd(t.funding)],
+      ["Exposure", `${num(t.exposure)}x`], ["Unrealised", usd(t.unrealised), t.unrealised < 0 ? "bad" : "ok"], ["Fees", usd(t.fees)], ["Funding", usd(t.funding)],
     ] : [
-      ["$" + (s.header.coin || "BTC"), "perp · " + s.header.venue, "sym"], ["Price", px(st.price)], ["24h", pct(st.change_24h)],
+      ["$" + (s.header.coin || "BTC"), "perp · " + s.header.venue, "sym"], ["Price", px(st.price)],
+      ["24h", pct(st.change_24h), st.change_24h == null || isNaN(st.change_24h) ? "" : st.change_24h >= 0 ? "ok" : "bad"],
       ["ATR", `${num(st.atr_pct)}%`], ["Funding APR", `${num(st.funding_apr, 1)}%`],
       ["Open interest", usdShort(st.open_interest_usd)], ["Spread", st.spread_bps == null ? "—" : `${num(st.spread_bps, 2)} bps`],
     ];
@@ -412,10 +438,13 @@
   // ---- the VT basket's tab ---------------------------------------------------------
   function renderBasket(s) {
     const t = s.ticker, b = s.basket, r = b.rules, now = Date.now();
-    const liveTag = live.at ? `<span class="live-dot" aria-hidden="true"></span>LIVE · ` : "";
+    const liveTag = live.at ? `<span class="live-dot" aria-hidden="true"></span><span class="live-word">LIVE</span> · ` : "";
+    const pos = String(t.position || "");
+    const posCls = pos.startsWith("SHORT") ? "short" : pos.startsWith("LONG") ? "long" : "flat";
     $("vt-ticker").innerHTML = `‹ ${liveTag}BASKET · ${esc(s.header.coins.join(" · "))} · BANK ${usd(t.bank)} · ` +
-      `<span class="hl">${esc(t.position)}${t.position_detail ? " " + esc(t.position_detail) : ""}</span>` +
-      ` · ${esc(t.record)} · HOLD ${pct(t.hold_pct)} · ${pnlTag(s)} · FEES ${usd(t.fees)} · FUNDING ${usd(t.funding)}`;
+      `<span class="hl ${posCls}">${esc(t.position)}${t.position_detail ? " " + esc(t.position_detail) : ""}</span>` +
+      ` · ${esc(t.record)} · HOLD <span class="${t.hold_pct < 0 ? "bad" : "ok"}">${pct(t.hold_pct)}</span>` +
+      ` · ${pnlHtml(s)} · FEES ${usd(t.fees)} · FUNDING ${usd(t.funding)}`;
     const next = Math.floor(now / DAY_MS + 1) * DAY_MS, left = next - now;   // every 00:00 UTC
     $("vt-next").textContent = `NEXT DECISION 00:00 UTC · IN ${Math.floor(left / 3600000)}H ${Math.floor(left % 3600000 / 60000)}M`;
     $("vt-exp").textContent = s.header.experiment ? `EXPERIMENT · ${s.header.experiment}` : "";
@@ -436,7 +465,7 @@
         : h.target_units > 0 ? ["FLAT", `entry under the $${r.min_order_usd} minimum; checked again at the next close`]
         : ["FLAT", h.warm ? `waits for a close above the ${r.sma_bars}-day average` : "warming up the averages"];
       return `<div class="h-row">` +
-        `<div class="h-coin"><span>COIN</span><b>${esc(h.coin)}</b><i>${px(h.mark)}</i></div>` +
+        `<div class="h-coin coin-${["BTC", "ETH", "SOL"].includes(h.coin) ? h.coin.toLowerCase() : "x"}"><span>COIN</span><b>${esc(h.coin)}</b><i>${px(h.mark)}</i></div>` +
         cell(1, gap, h.sma50 ? `avg ${px(h.sma50)}` : "warming up") +
         cell(2, h.vol10 == null ? "—" : `${(h.vol10 * 100).toFixed(0)}%`, "annualised") +
         cell(3, `${num(h.held_units)} held`, `target ${num(h.target_units ?? 0)}${band}`) +
@@ -588,13 +617,16 @@
       start += c.start; bank += b; net += c.net_flows || 0;
       const label = basket ? (c.holdings || []).map((h) => h.coin).join("·") : lp ? px(lp) : px(c.price);
       const sub = basket ? " · basket" : ` · risk ${(c.risk_per_trade * 100).toFixed(0)}%${c.shorts ? " · +shorts" : ""}`;
+      const made = c.units != null ? b - c.start - (c.net_flows || 0) : b - c.start;
+      const pnlCls = b == null || c.start == null ? "" : made >= 0 ? "ok" : "bad";
       return `<button class="coin ${c.coin === coin ? "on" : ""}" data-coin="${esc(c.coin)}" aria-pressed="${c.coin === coin}">` +
-        `<span class="c-name">${esc(c.coin)}<i>${esc(label)}</i></span><span class="c-bank">${usd(b)}</span>` +
+        `<span class="c-name">${esc(c.coin)}<i>${esc(label)}</i></span><span class="c-bank ${pnlCls}">${usd(b)}</span>` +
         `<span class="c-sub">${c.units ? `${pct(b / c.units - 1)} perf · P&amp;L ${usd(b - c.start - c.net_flows, 0)}` : pct(b / c.start - 1)} · ${esc(c.position)} · ${esc(c.record)}${sub}</span></button>`;
     });
     const left = index.coins.filter((c) => c.error).map((c) => c.coin);   // no bank this run: not in the total
     const put = start + net;   // with deposits: the P&L on everything put in, never counting the deposits as profit
-    cards.push(`<div class="coin total"><span class="c-name">ALL</span><span class="c-bank">${usd(bank)}</span>` +
+    const allCls = (net ? put > 0 : !!start) ? ((net ? bank - put : bank - start) >= 0 ? "ok" : "bad") : "";
+    cards.push(`<div class="coin total"><span class="c-name">ALL</span><span class="c-bank ${allCls}">${usd(bank)}</span>` +
       (net ? `<span class="c-sub">${pct(put > 0 ? (bank - put) / put : 0)} · P&amp;L ${usd(bank - put)} on ${usd(put, 0)} put in` :
        `<span class="c-sub">${pct(start ? bank / start - 1 : 0)} on ${usd(start, 0)} paper`) +
       `${left.length ? ` · without ${esc(left.join(", "))}` : ""}</span></div>`);
@@ -636,6 +668,8 @@
     $("time").textContent = hdr.time;
     const basket = hdr.kind === "basket";
     document.body.classList.toggle("kind-basket", basket);
+    document.body.dataset.coin = String(hdr.coin || "BTC").toUpperCase();
+    document.body.classList.toggle("has-live", !!live.at);
     renderCoins(); notice();
     if (basket) renderBasket(s);
     else { renderAgents(s.agents); renderStage(s); renderBubbles(s.agents); drawChart(s.chart); drawWeb(); }

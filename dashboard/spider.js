@@ -74,25 +74,28 @@
   layer.append(silkEl, body);
   frameEl.append(layer);
 
-  const pink = getComputedStyle(root).getPropertyValue("--pink").trim() || "#ff5fd2";
-  const frames = POSES.map((map) => {
+  const tone = (name, fallback) => getComputedStyle(root).getPropertyValue(name).trim() || fallback;
+  const bodyCol = tone("--cyan", "#2ee6ff");
+  const eyeCol = tone("--amber", "#ffc53d");
+  const frames = POSES.map((map) => [false, true].map((blink) => {
     const c = document.createElement("canvas");
     c.width = c.height = 12;
     const g = c.getContext("2d");
     map.forEach((row, y) => [...row].forEach((ch, x) => {
       if (ch === ".") return;
-      g.fillStyle = ch === "k" ? "#0d0f1f" : pink;
+      g.fillStyle = ch === "k" ? (blink ? bodyCol : eyeCol) : bodyCol;
       g.fillRect(x, y, 1, 1);
     }));
     return c;
-  });
+  }));
   const g = body.getContext("2d");
   let drawn = -1;
-  function pose(n) {
-    if (n === drawn) return;
-    drawn = n;
+  function pose(n, blink) {
+    const key = n * 2 + (blink ? 1 : 0);
+    if (key === drawn) return;
+    drawn = key;
     g.clearRect(0, 0, 12, 12);
-    g.drawImage(frames[n], 0, 0);
+    g.drawImage(frames[n][blink ? 1 : 0], 0, 0);
   }
 
   // ---- geometry: element boxes in page coordinates, measured when a visit starts, never per frame -------
@@ -258,7 +261,7 @@
 
   // ---- motion: a visit becomes a plan of small actions; each returns ms until it next needs a frame, -1 = done,
   // Infinity = nothing until something wakes it. A run to a fill gets every frame, a tour walk ~30 a second, a stroll ~16.
-  const sp = { x: 0, y: 0, ox: 0, oy: 0, legs: 0, pose: 0, asleep: false };   // legs: ms per step while walking
+  const sp = { x: 0, y: 0, ox: 0, oy: 0, legs: 0, pose: 0, asleep: false, mood: "read" };   // legs: ms per step while walking
   let silk = null;                // {x, y}: where the thread is tied while it hangs from one
   let perch = null;               // {el, top}: the edge it is sitting on
   let queue = [], visit = null, plan = [], act = null;
@@ -276,6 +279,7 @@
         sp.x = x0 + (x - x0) * e;
         sp.y = y0 + (y - y0) * e - Math.sin(Math.PI * k) * arc;
         sp.legs = arc ? 0 : legs;
+        sp.mood = "walk";
         return k < 1 ? every : -1;
       },
     };
@@ -287,7 +291,7 @@
       begin(now) { y0 = sp.y; t0 = now; silk = { x: sp.x, y: sp.y - S * 0.1 }; },
       run(now) {
         const k = Math.min(1, (now - t0) / ms);
-        sp.y = y0 + (y - y0) * ease(k); sp.legs = 0;
+        sp.y = y0 + (y - y0) * ease(k); sp.legs = 0; sp.mood = "walk";
         return k < 1 ? every : -1;
       },
     };
@@ -329,6 +333,7 @@
       run(now) {
         const t = now - t0;
         sp.legs = 0;
+        sp.mood = how === "sleep" ? "asleep" : how === "found" && t < 680 ? "found" : how === "trade" ? "trade" : how === "idle" ? "idle" : "read";
         if (how === "sleep") { sp.ox = sp.oy = 0; sp.pose = 2; sp.asleep = true; return Infinity; }
         if (t >= ms) { sp.ox = sp.oy = 0; sp.pose = 0; return -1; }
         if (how === "found" && t < 680) {
@@ -427,7 +432,7 @@
       sp.y = !seen(to.y, -S / 2) ? to.y : sp.y < scrollY ? scrollY - S : scrollY + innerHeight + S;
     }
     plan = route(to, pace, visit.hop);
-    const how = spot.found ? "found" : visit.kind === "idle" ? "idle" : "read";
+    const how = spot.found ? "found" : visit.kind === "event" ? "trade" : visit.kind === "idle" ? "idle" : "read";
     plan.push(arrive(spot.perch || null), sit(spot.found ? 2600 : spot.dwell || visit.dwell, how));
   }
   function sleep() {              // no board, or a stale one: home, curl up, and no frames until a fresh board
@@ -508,13 +513,16 @@
     return 0;
   }
 
-  let lastX = NaN, lastY = NaN, silkOn = false, dim = false;
+  let lastX = NaN, lastY = NaN, silkOn = false, dim = false, lastMood = "";
   function paint(now) {           // writes two transforms; reads nothing from the layout
     const x = Math.round(clamp(sp.x + sp.ox - fx, S / 2, fw - S / 2) - S / 2);
     const y = Math.round(clamp(sp.y + sp.oy - fy, S / 2, fh - S / 2) - S / 2);
     if (x !== lastX || y !== lastY) { body.style.transform = `translate3d(${x}px,${y}px,0)`; lastX = x; lastY = y; }
-    pose(sp.legs ? Math.floor(now / sp.legs) % 2 : sp.pose);
+    const blink = !sp.asleep && !reduced.matches && (now % 3200) < 150;
+    pose(sp.legs ? Math.floor(now / sp.legs) % 2 : sp.pose, blink);
     if (sp.asleep !== dim) { dim = sp.asleep; body.classList.toggle("asleep", dim); }
+    const mood = sp.asleep ? "asleep" : sp.legs ? "walk" : (sp.mood || "read");
+    if (mood !== lastMood) { lastMood = mood; body.dataset.mood = mood; }
     if (silk) {
       const ax = silk.x - fx, ay = silk.y - fy, dx = x + S / 2 - ax, dy = y + S * 0.17 - ay, len = Math.hypot(dx, dy);
       if (dy > 2) {
@@ -534,9 +542,14 @@
     if (!running) return;
     const wait = step(now);
     paint(now);
-    if (wait === Infinity) return;                         // asleep: kick() wakes it
-    if (wait < 24) raf = requestAnimationFrame(frame);
-    else timer = setTimeout(() => { timer = 0; if (running) raf = requestAnimationFrame(frame); }, wait - 16);
+    let next = wait;
+    if (next !== Infinity && !reduced.matches && !sp.asleep) {   // wake once per blink, so a long sit still shows it
+      const period = 3200, blinkFor = 150, into = now % period;
+      next = Math.min(next, into < blinkFor ? blinkFor - into : period - into);
+    }
+    if (next === Infinity) return;                         // asleep: kick() wakes it
+    if (next < 24) raf = requestAnimationFrame(frame);
+    else timer = setTimeout(() => { timer = 0; if (running) raf = requestAnimationFrame(frame); }, next - 16);
   }
   function kick() {
     if (!running) return;
@@ -557,7 +570,8 @@
   function rest() {               // reduced motion: sit still at home (curled up while the desk is not running)
     touch();
     const h = keepIn(home()), up = alive();
-    sp.x = h.x; sp.y = h.y; sp.ox = sp.oy = sp.legs = 0; sp.pose = up ? 0 : 2; sp.asleep = !up; silk = null;
+    sp.x = h.x; sp.y = h.y; sp.ox = sp.oy = sp.legs = 0; sp.pose = up ? 0 : 2; sp.asleep = !up;
+    sp.mood = up ? "read" : "asleep"; silk = null;
     paint(0);
   }
 
@@ -581,6 +595,7 @@
   function label() {              // the footer button says what the spider is doing, and why when it is still
     if (!btn) return;
     const age = Date.now() - board.updated, h = Math.floor(age / 3600000), m = Math.floor(age / 60000) % 60;
+    root.dataset.desk = alive() ? "up" : "down";
     btn.textContent = !on ? "spider: off"
       : reduced.matches ? "spider: still (reduce motion is on)"
       : alive() ? "spider: on"
