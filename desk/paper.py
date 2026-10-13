@@ -34,7 +34,7 @@ LOOKBACK_BARS = 1500
 FUNDING_WINDOW_MS = 4 * 86400_000
 VT_LOOKBACK_DAYS = 120    # daily candles per VT coin per run: the 50-day average and vol need 50, the rest is margin
 VT_MEMORY_BARS = 70       # closed daily bars per VT coin the ledger keeps: the 50-day window, plus 20 days to spare
-VT_GAP_WAIT_DAYS = 3      # a bar no answer has had yet is waited for this long after its close, then it's a real gap
+VT_GAP_WAIT_DAYS = 3      # a bar no answer has had is waited for this long after its close (and for a second answer)
 
 
 def _new_events(before: list, events) -> list:
@@ -219,15 +219,20 @@ def step_basket(vt: VolTrend = VOLTREND, ledger_dir: str | Path = "ledger/VT", f
     # in the backtest, but only once a later bar of its has closed: a bar missing from one answer is waited for.
     covered = min(closed[c][-1].ts for c in vt.coins)
     # So is a bar missing between two of a coin's bars that no answer has had (the first run after a day without one,
-    # say, got an answer with a hole): the days from it on wait for it, until an answer that reaches past it still
-    # lacks it VT_GAP_WAIT_DAYS after its close. Then it's a day the exchange has no bar for, and the coin sits it
-    # out, as in the backtest.
+    # say, got an answer with a hole): the days from it on wait for it. It's a day the exchange has no bar for only
+    # once two answers lacked it: the saved memory already reached past it, this run's answer reaches past it too,
+    # and it closed VT_GAP_WAIT_DAYS ago. Then the coin sits it out, as in the backtest. (A bar missed during a cron
+    # outage, or before the ledger had a memory, waits one saved run more.) Holes too old to move a 50-day window
+    # still to be decided don't count.
+    seen = {c: max((x[0] for x in remembered.get(c, [])), default=0) for c in vt.coins}   # the saved memory's newest
+    lo = meta["last_bar_ts"] - (need + 10) * day
     hole = min(((t, c) for c in vt.coins for a, b in zip(closed[c], closed[c][1:]) for t in range(a.ts + day, b.ts, day)
-                if t > reach[c] or t + day + VT_GAP_WAIT_DAYS * day > now), default=None)
+                if t > lo and (t > reach[c] or t > seen[c] or t + day + VT_GAP_WAIT_DAYS * day > now)), default=None)
     if hole and hole[0] <= covered:
         if 0 < meta["last_bar_ts"] < covered:     # it holds back days that would be processed now
             log(f"VT: no answer has had {hole[1]}'s {time.strftime('%Y-%m-%d', time.gmtime(hole[0] / 1000))} bar yet; "
-                f"the days from it wait for it (a day with no bar if still missing {VT_GAP_WAIT_DAYS} days after its close)")
+                f"the days from it wait for it (a day with no bar once a later answer still lacks it, "
+                f"{VT_GAP_WAIT_DAYS} days after its close)")
         covered = hole[0] - day
 
     processed = 0
@@ -287,6 +292,8 @@ def step_basket(vt: VolTrend = VOLTREND, ledger_dir: str | Path = "ledger/VT", f
     state["paper"] = {"days": (now - meta["started_ts"]) / 86400_000, "start_equity": meta["start_equity"],
                       "runs": meta["runs"], "bars_processed_this_run": processed,
                       "new_events": [{"ts": e.ts, "agent": e.agent, "text": e.text} for e in new_events],
-                      "changed": bool(processed or new_events)}
+                      # or the memory reaches a newer bar (once a day, with the close): saved, so the next run knows
+                      # an answer reached past a bar that's missing
+                      "changed": bool(processed or new_events or any(memory[c][-1].ts > seen[c] for c in vt.coins))}
     _write(ledger_dir / "board.json", state)
     return state
