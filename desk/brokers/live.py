@@ -62,18 +62,46 @@ def market_symbol(venue: str, coin: str) -> str:
     return SYMBOL_FORMATS[venue].format(coin=coin.upper())
 
 
-def make_exchange(venue: str):
-    import ccxt  # imported lazily so backtest/paper never need it
+def exchange_config(venue: str, *, wallet: str | None = None, key: str | None = None, sub_account: str | None = None,
+                    api_key: str | None = None, secret: str | None = None, password: str | None = None) -> dict:
+    """ccxt's constructor config for `venue`. A missing credential refuses to start (it never comes back by
+    retrying).
 
-    cls = getattr(ccxt, venue)
+    Hyperliquid: `wallet` is the address of the account the API wallet (`key`) was approved for, never the API
+    wallet's own address. A sub-account has no key of its own: every order and cancel for it must carry
+    vaultAddress = the sub-account, and every read must ask for it. ccxt does both when the sub-account is given as
+    options["subAccountAddress"]; without it, orders land on the main account while the desk reads the sub-account."""
+    def need(value: str | None, name: str) -> str:
+        if not (value or "").strip():
+            raise LiveSetupError(f"{name} is not set (see .env.example): live can't connect to {venue}")
+        return value.strip()
+
     if venue == "hyperliquid":
-        cfg = {"walletAddress": os.environ["HL_WALLET_ADDRESS"], "privateKey": os.environ["HL_PRIVATE_KEY"]}
+        cfg = {"walletAddress": need(wallet, "HL_WALLET_ADDRESS"), "privateKey": need(key, "HL_PRIVATE_KEY"),
+               "options": {}}
+        if (sub_account or "").strip():
+            cfg["options"]["subAccountAddress"] = sub_account.strip()
     else:
-        cfg = {"apiKey": os.environ["EXCHANGE_API_KEY"], "secret": os.environ["EXCHANGE_API_SECRET"]}
-        if os.environ.get("EXCHANGE_API_PASSWORD"):
-            cfg["password"] = os.environ["EXCHANGE_API_PASSWORD"]
+        cfg = {"apiKey": need(api_key, "EXCHANGE_API_KEY"), "secret": need(secret, "EXCHANGE_API_SECRET")}
+        if password:
+            cfg["password"] = password
     cfg["enableRateLimit"] = True
-    ex = cls(cfg)
+    return cfg
+
+
+def make_exchange(venue: str):
+    try:
+        import ccxt  # imported lazily so backtest/paper never need it
+    except ImportError:
+        raise LiveSetupError("ccxt is not installed: pip install -r requirements.txt") from None
+
+    cls = getattr(ccxt, venue, None)
+    if cls is None:
+        raise LiveSetupError(f"ccxt has no exchange called {venue!r}")
+    env = os.environ.get
+    ex = cls(exchange_config(venue, wallet=env("HL_WALLET_ADDRESS"), key=env("HL_PRIVATE_KEY"),
+                             sub_account=env("HL_SUBACCOUNT_ADDRESS"), api_key=env("EXCHANGE_API_KEY"),
+                             secret=env("EXCHANGE_API_SECRET"), password=env("EXCHANGE_API_PASSWORD")))
     ex.load_markets()
     return ex
 
@@ -135,6 +163,10 @@ class LiveBroker:
         self.defer_stops = False              # catching up missed bars: trail moves are kept, sent once at the end
         self.cash = self._balance()
         self._load_local()
+        if self.cash <= 0 and self.position is None:
+            raise LiveSetupError(f"the {self.venue} account reads ${self.cash:,.2f}: nothing to trade with. On "
+                                 f"Hyperliquid, HL_WALLET_ADDRESS (and HL_SUBACCOUNT_ADDRESS for a sub-account) must "
+                                 f"name the account that holds the money, not the API wallet's own address")
         self.sync()
 
     # ---- the market ------------------------------------------------------

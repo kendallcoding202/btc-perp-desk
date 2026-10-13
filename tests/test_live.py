@@ -831,3 +831,35 @@ def test_live_refuses_on_old_shared_state_even_with_the_gate_passed(tmp_path, mo
     (tmp_path / "state" / "live_position.json").write_text("{}")
     assert cli.cmd_live(_live_args()) == 2
     assert "Not going live: found live state from before it was kept per coin" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------- review: a Hyperliquid sub-account is the account traded
+
+MASTER, SUB = "0x" + "aa" * 20, "0x" + "bb" * 20
+NOT_A_KEY = "0x" + "11" * 32          # a placeholder: no account anywhere is behind it
+
+
+def test_a_sub_account_is_traded_through_vault_address_and_read_as_itself():
+    """A Hyperliquid sub-account has no key: orders and cancels for it must carry vaultAddress = the sub-account,
+    and reads must ask for it. Without that, orders land on the main account while the desk reads the sub-account
+    (an unconfirmed stop, a phantom exit, positions piling up past the cap on the main account). The real ccxt
+    class is used, with no network: only how it resolves the addresses from the desk's config is checked."""
+    ccxt = pytest.importorskip("ccxt")
+    ex = ccxt.hyperliquid(live_mod.exchange_config("hyperliquid", wallet=MASTER, key=NOT_A_KEY, sub_account=SUB))
+    assert ex.handle_public_address("fetchPositions", {})[0] == SUB                  # every read: the sub-account
+    for method in ("createOrder", "cancelOrders"):                                      # every order and cancel
+        assert ex.handle_option_string_and_params_2({}, method, "vaultAddress", "subAccountAddress")[0] == SUB
+    main = ccxt.hyperliquid(live_mod.exchange_config("hyperliquid", wallet=MASTER, key=NOT_A_KEY))
+    assert main.handle_public_address("fetchPositions", {})[0] == MASTER
+    assert main.handle_option_string_and_params_2({}, "createOrder", "vaultAddress", "subAccountAddress")[0] is None
+
+
+def test_missing_credentials_or_an_empty_account_refuse_to_start(tmp_path):
+    with pytest.raises(LiveSetupError, match="HL_PRIVATE_KEY"):
+        live_mod.exchange_config("hyperliquid", wallet=MASTER)
+    with pytest.raises(LiveSetupError, match="EXCHANGE_API_KEY"):
+        live_mod.exchange_config("bybit")
+    ex = FakeHyperliquid(PRICES, usdc=0.0)          # e.g. HL_WALLET_ADDRESS is the API wallet's own address
+    with pytest.raises(LiveSetupError, match="HL_WALLET_ADDRESS"):
+        _broker("BTC", ex, tmp_path)
+    assert ex.orders == []
