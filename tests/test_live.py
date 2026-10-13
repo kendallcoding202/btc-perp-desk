@@ -1099,3 +1099,45 @@ def test_an_entry_from_a_close_that_isnt_fresh_is_not_taken(tmp_path, monkeypatc
         assert any("too late to act on" in e.text for e in _desk_events(tmp_path))
     else:
         assert len(entries) == 1 and entries[0]["ts"] - (bars[251].ts + H4) == 60_000
+
+
+# ---------------------------------------------------------------- review: a restart keeps trying
+
+def test_a_restart_that_hits_an_exchange_error_keeps_trying_and_puts_the_missing_stop_on(tmp_path, monkeypatch):
+    """The process dies between an entry's fill and its stop. On restart one 429 (on the open-orders read the stop
+    check makes) used to propagate out of LiveBroker() and runner.run before the retrying loop existed: the process
+    exited and the position stayed on the exchange with no stop."""
+    bars, funding = series(seed=3, drift=0.002, n=700)
+    paths = runner.live_paths(tmp_path / "live", "BTC")
+    ex = FakeHyperliquid({"BTC": bars[299].close}, usdc=10_000.0)
+    b = LiveBroker(P, exchange=ex, state_path=paths["position"], log=lambda *a: None, sleep=Sleeps())
+
+    class Killed(BaseException):
+        pass
+
+    def die(*a, **k):
+        raise Killed
+
+    b._ensure_stop = die
+    b.submit(Order("open", Side.LONG, 0.1, "breakout", stop=bars[299].close * 0.95))
+    with pytest.raises(Killed):
+        b.execute_now(bars[299].close, ex.now)
+    assert ex.positions and ex.fetch_open_orders() == []            # open, with no stop
+    ex.fail["open_orders"] = 1
+    real = live_mod.LiveBroker
+    monkeypatch.setattr(live_mod, "LiveBroker", lambda p, **kw: real(p, exchange=ex, sleep=Sleeps(), **kw))
+    pushed, naps = [], []
+    monkeypatch.setattr(runner, "_push", lambda title, body: pushed.append(body))
+
+    def sleep(s):
+        naps.append(s)
+        if len(naps) > 1:                                            # the loop's first poll: enough
+            raise StopLoop
+
+    with pytest.raises(StopLoop):
+        runner.run(P, "live", state_dir=str(tmp_path / "live"), dashboard=False, log=lambda *a: None,
+                   feed=LiveFeed(bars, funding, 300), clock=lambda: bars[300].ts + 60_000, sleep=sleep)
+    stops = ex.fetch_open_orders("BTC/USDC:USDC")
+    assert len(stops) == 1 and stops[0]["amount"] == pytest.approx(0.1)
+    assert naps[0] == 15.0 and json.loads(paths["kills"].read_text())["entry_kill"]
+    assert "connecting to the exchange failed" in pushed[0] and any("no stop resting" in x for x in pushed[1:])

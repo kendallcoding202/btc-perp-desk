@@ -117,6 +117,32 @@ def _lock(path: Path):
     return fh
 
 
+def _keep_trying(what: str, fn, *, coin: str, kills_path: Path, wait_s: float, sleep, log=print):
+    """Startup, retried the way the loop retries: an exchange error while starting (a 429, a timeout) must not end
+    the process, least of all on a restart whose job is to put a missing stop back on. Each failure is logged, sets
+    entry_kill and, the first time and every 20th, goes to the phone. A LiveSetupError still refuses at once."""
+    from .brokers.live import LiveSetupError
+
+    n = 0
+    while True:
+        try:
+            return fn()
+        except LiveSetupError:
+            raise
+        except Exception as exc:
+            n += 1
+            text = f"{what} failed ({type(exc).__name__}: {exc}); trying again in {wait_s:g} s (try {n})"
+            log(f"startup: {text}")
+            if n == 1 or n % 20 == 0:
+                _push(f"{coin} LIVE: not started yet", f"{text}. Until it starts, nothing checks that an open position "
+                                                       f"has its stop on the exchange.")
+            kills = Kills.load(kills_path)
+            if not kills.entry_kill:
+                kills.entry_kill = True
+                kills.save(kills_path)
+            sleep(wait_s)
+
+
 def _utc(ms: int) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.gmtime(ms / 1000))
 
@@ -200,9 +226,11 @@ def run(p: Params, mode: str, *, state_dir: str = "state", poll_s: float = 15.0,
     kills_path, desk_path = paths["kills"], paths["desk"]
     feed = feed or HyperliquidFeed(p.market.symbol, p.market.interval)
 
+    retrying = dict(coin=p.market.symbol, kills_path=kills_path, wait_s=poll_s, sleep=sleep, log=log)
     if broker is None:
         from .brokers.live import LiveBroker
-        broker = LiveBroker(p, state_path=paths["position"], max_notional_usd=max_notional, log=log)
+        broker = _keep_trying("connecting to the exchange", lambda: LiveBroker(
+            p, state_path=paths["position"], max_notional_usd=max_notional, log=log, clock=clock), **retrying)
     elif Path(broker.state_path) != paths["position"]:
         from .brokers.live import LiveSetupError
         raise LiveSetupError(f"the broker keeps its position in {broker.state_path}, not {paths['position']}")
@@ -227,10 +255,12 @@ def run(p: Params, mode: str, *, state_dir: str = "state", poll_s: float = 15.0,
         serve(board, host, port)
         log(f"board: http://{host}:{port}")
 
-    bars = feed.candles(start_ms=clock() - LOOKBACK_BARS * feed.bar_ms)
-    funding = feed.funding(bars[0].ts)
+    def first_read():
+        bars = feed.candles(start_ms=clock() - LOOKBACK_BARS * feed.bar_ms)
+        return bars, feed.funding(bars[0].ts), feed.context()
+
+    bars, funding, ctx = _keep_trying("reading the market's candles", first_read, **retrying)
     f = ind.compute(bars, funding, p)
-    ctx = feed.context()
     if not meta["last_bar_ts"]:
         # Don't act on a bar that closed before we started: show it, trade from the next one.
         meta["last_bar_ts"] = bars[-1].ts
