@@ -90,7 +90,7 @@ def _trigger(o: dict) -> float | None:
 class LiveBroker:
     is_live = True
 
-    def __init__(self, p: Params, venue: str | None = None, state_path: str | Path = "state/live_position.json",
+    def __init__(self, p: Params, venue: str | None = None, state_path: str | Path | None = None,
                  max_notional_usd: float | None = None, exchange=None, log=print, on_alert=None, sleep=time.sleep,
                  clock=None):
         self.p = p
@@ -106,7 +106,8 @@ class LiveBroker:
         if max_notional_usd is not None and self.min_cost and max_notional_usd < self.min_cost:
             raise LiveSetupError(f"--max-notional ${max_notional_usd:,.2f} is below {self.venue}'s minimum order of "
                                  f"${self.min_cost:,.2f} on {self.symbol}: every entry would be refused")
-        self.state_path = Path(state_path)
+        # one coin's position file (runner.live_paths): two coins never share one
+        self.state_path = Path(state_path or f"state/{self.coin}/live_position.json")
         self.max_notional_usd = max_notional_usd
         self.position: Position | None = None
         self.pending: list[Order] = []
@@ -596,6 +597,7 @@ class LiveBroker:
         pos = self.position
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         self.state_path.write_text(json.dumps({
+            "coin": self.coin, "venue": self.venue, "symbol": self.symbol,
             "stop_order_id": self.stop_order_id, "stop_px": self.stop_px, "stops_to_clean": self.stops_to_clean,
             "position": None if pos is None else {
                 "side": pos.side.value, "qty": pos.qty, "entry_price": pos.entry_price, "entry_ts": pos.entry_ts,
@@ -608,6 +610,8 @@ class LiveBroker:
         if not self.state_path.exists():
             return
         d = json.loads(self.state_path.read_text())
+        if d.get("symbol", self.symbol) != self.symbol:
+            raise LiveSetupError(f"{self.state_path} holds the {d['symbol']} desk's position, not {self.symbol}'s")
         self.stop_order_id = d.get("stop_order_id")
         self.stop_px = d.get("stop_px")
         self.stops_to_clean = bool(d.get("stops_to_clean", False))

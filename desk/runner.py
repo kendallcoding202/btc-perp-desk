@@ -1,7 +1,7 @@
 """The trading loop for paper and live, plus a replay mode that drives the board from history.
 
 Every `poll` seconds:
-    - read the kill switches (dashboard or state/kills.json)
+    - read the kill switches (dashboard or state/<COIN>/kills.json)
     - read the mid price; paper checks its stop, live reconciles with the exchange
     - when a new bar has closed: CRAWLER refreshes candles/funding/book, the desk decides, FILLS executes
     - publish the board
@@ -21,9 +21,13 @@ from .brokers.sim import SimBroker
 from .engine import Desk, Kills
 from .filter import evaluate_entry
 from .server import Board, serve
-from .thresholds import Params
+from .thresholds import Params, report_name
 
 LOOKBACK_BARS = 1500
+
+# Live state lives in state/<COIN>/: one coin's position, desk and kill switches can't clobber another's.
+# These are the files the desk kept before that, shared by every coin.
+SHARED_LIVE_FILES = ("live_position.json", "live_desk.json", "kills.json")
 
 
 def _now_ms() -> int:
@@ -67,6 +71,47 @@ def run_paper(p: Params, *, ledger_dir: str = "ledger", poll_s: float = 60.0, ho
         except Exception as exc:  # a network blip just means we catch up on the next poll
             log(f"step error: {type(exc).__name__}: {exc}")
         time.sleep(poll_s)
+
+
+def live_paths(state_dir: str | Path, coin: str, mode: str = "live") -> dict[str, Path]:
+    """Every file one coin's live desk keeps, all under state/<COIN>/."""
+    d = Path(state_dir) / coin.upper()
+    return {"dir": d, "position": d / "live_position.json", "desk": d / f"{mode}_desk.json",
+            "kills": d / "kills.json", "lock": d / "live.lock"}
+
+
+def refuse_shared_state(state_dir: str | Path) -> None:
+    """Live state used to be shared by every coin (state/live_position.json, live_desk.json, kills.json). Such a
+    file can't be given to a coin safely: the desk file may be any coin's, and the old code sent every coin's
+    orders to BTC-PERP, so a position it describes is on BTC whatever --coin was. Refuse until a human sorts it."""
+    from .brokers.live import LiveSetupError
+
+    old = [Path(state_dir) / n for n in SHARED_LIVE_FILES if (Path(state_dir) / n).exists()]
+    if old:
+        raise LiveSetupError(
+            f"found live state from before it was kept per coin: {', '.join(str(o) for o in old)}. It can't be "
+            f"given to a coin safely (the old code sent every coin's orders to BTC-PERP, so a position it describes "
+            f"is on BTC). Check the exchange for open positions and orders, then move each file into "
+            f"{Path(state_dir)}/<COIN>/ for the coin it belongs to, or delete it. Live won't start until then.")
+
+
+def _lock(path: Path):
+    """Hold an exclusive lock for this coin's live desk while the process runs: a second `live --coin X` would
+    trade the same position from the same files. The OS drops it when the process exits, even on a crash."""
+    from .brokers.live import LiveSetupError
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(path, "a+")
+    try:
+        import fcntl
+    except ImportError:     # not on a POSIX system: no lock, as before
+        return fh
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        raise LiveSetupError(f"another live process holds {path}: one desk per coin")
+    return fh
 
 
 def _utc(ms: int) -> str:
@@ -135,14 +180,18 @@ def run(p: Params, mode: str, *, state_dir: str = "state", poll_s: float = 15.0,
     from .feeds.hyperliquid import HyperliquidFeed
 
     clock = clock or _now_ms
-    state_dir_p = Path(state_dir)
-    kills_path = state_dir_p / "kills.json"
-    desk_path = state_dir_p / f"{mode}_desk.json"
+    paths = live_paths(state_dir, p.market.symbol, mode)
+    refuse_shared_state(state_dir)
+    lock = _lock(paths["lock"])     # noqa: F841 (held until the process exits)
+    kills_path, desk_path = paths["kills"], paths["desk"]
     feed = feed or HyperliquidFeed(p.market.symbol, p.market.interval)
 
     if broker is None:
         from .brokers.live import LiveBroker
-        broker = LiveBroker(p, state_path=state_dir_p / "live_position.json", max_notional_usd=max_notional, log=log)
+        broker = LiveBroker(p, state_path=paths["position"], max_notional_usd=max_notional, log=log)
+    elif Path(broker.state_path) != paths["position"]:
+        from .brokers.live import LiveSetupError
+        raise LiveSetupError(f"the broker keeps its position in {broker.state_path}, not {paths['position']}")
 
     desk = Desk(p, broker, jev=jev)
 
@@ -175,7 +224,7 @@ def run(p: Params, mode: str, *, state_dir: str = "state", poll_s: float = 15.0,
                                             kills=desk.kill_gates(clock(), broker.equity(ctx.mid)), ctx=ctx,
                                             now_ms=clock())
     goal_cagr = None
-    rep = Path("reports/backtest.json")
+    rep = Path(f"reports/{report_name(p.market.symbol)}.json")
     if rep.exists():
         goal_cagr = json.loads(rep.read_text()).get("full", {}).get("cagr")
     log(f"{mode}: {len(bars)} {p.market.interval} bars, {len(funding)} funding prints, "

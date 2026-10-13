@@ -284,16 +284,27 @@ def cmd_live(args) -> int:
     if os.environ.get("DESK_LIVE_CONFIRM") != phrase:
         print(f'  set DESK_LIVE_CONFIRM="{phrase}" in .env to arm live trading.')
         return 2
-    runner.run(p, "live", poll_s=args.poll, host=args.host, port=args.port, dashboard=not args.no_dashboard,
-               max_notional=args.max_notional, jev=_jev(p))
+    from .brokers.live import LiveSetupError
+
+    try:
+        runner.run(p, "live", poll_s=args.poll, host=args.host, port=args.port, dashboard=not args.no_dashboard,
+                   max_notional=args.max_notional, jev=_jev(p))
+    except LiveSetupError as exc:
+        print(f"\n  Not going live: {exc}")
+        return 2
     return 0
 
 
 def cmd_reset_halt(args) -> int:
+    from .runner import SHARED_LIVE_FILES, live_paths
+
     coin = args.coin.upper()
-    path = Path(f"ledger/{coin}/paper.json") if args.mode == "paper" else Path("state/live_desk.json")
+    path = Path(f"ledger/{coin}/paper.json") if args.mode == "paper" else live_paths("state", coin)["desk"]
     if not path.exists():
         print(f"no desk state found at {path}")
+        if args.mode == "live" and any(Path("state", n).exists() for n in SHARED_LIVE_FILES):
+            print("  state/ still holds live files from before they were kept per coin: move them into "
+                  "state/<COIN>/ for the coin they belong to (see README, Going live)")
         return 1
     d = json.loads(path.read_text())
     holder = d["desk"] if args.mode == "paper" else d

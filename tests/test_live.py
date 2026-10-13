@@ -552,16 +552,18 @@ def _run_paper(tmp_path, p, bars, funding, start, end, monkeypatch):
         paper.step(p, led, feed=feed, log=lambda *a: None, now_ms=bars[upto].ts + H4 // 2)
 
 
-def _run_live(tmp_path, p, bars, funding, start, script, ex=None, desk_meta=None):
+def _run_live(tmp_path, p, bars, funding, start, script, ex=None, desk_meta=None, kills=None):
     """runner.run against the fake exchange. The first poll is a minute after bar start-1 closes; then each entry of
     `script` sleeps through that many bar closes (1 = a normal poll each bar, 5 = the laptop slept through 5),
     with the exchange's price walking through each bar's low, high and close meanwhile (resting stops trigger)."""
+    coin = p.market.symbol
     feed = LiveFeed(bars, funding, start)
-    ex = ex or FakeHyperliquid({"BTC": bars[start - 1].close}, usdc=10_000.0)
+    ex = ex or FakeHyperliquid({coin: bars[start - 1].close}, usdc=10_000.0)
     clock = {"now": bars[start].ts + 60_000}
     ex.now = clock["now"]
     logs, steps = [], list(script)
-    broker = LiveBroker(p, exchange=ex, state_path=tmp_path / "live" / "pos.json", log=logs.append, sleep=Sleeps(),
+    paths = runner.live_paths(tmp_path / "live", coin)
+    broker = LiveBroker(p, exchange=ex, state_path=paths["position"], log=logs.append, sleep=Sleeps(),
                         clock=lambda: clock["now"])
 
     def sleep(_):
@@ -571,13 +573,14 @@ def _run_live(tmp_path, p, bars, funding, start, script, ex=None, desk_meta=None
             bar = bars[feed.upto]
             for k, px in enumerate((bar.low, bar.high, bar.close)):
                 ex.now = bar.ts + (k + 1) * 1000
-                ex.move("BTC", px, dt_ms=0)
+                ex.move(coin, px, dt_ms=0)
             feed.upto += 1
         clock["now"] = ex.now = bars[feed.upto].ts + 60_000
 
     if desk_meta is not None:
-        (tmp_path / "live").mkdir(parents=True, exist_ok=True)
-        (tmp_path / "live" / "live_desk.json").write_text(json.dumps({"meta": desk_meta}))
+        paths["desk"].write_text(json.dumps({"meta": desk_meta}))
+    for name, on in (kills or {}).items():
+        paths["kills"].write_text(json.dumps({name: on}))
     try:
         runner.run(p, "live", state_dir=str(tmp_path / "live"), dashboard=False, log=logs.append, feed=feed,
                    broker=broker, clock=lambda: clock["now"], sleep=sleep)
@@ -666,5 +669,76 @@ def test_a_gap_longer_than_the_history_window_refuses_loudly_and_sends_nothing(t
 
 def _desk_events(tmp_path):
     from desk.engine import Event
-    d = json.loads((tmp_path / "live" / "live_desk.json").read_text())
+    d = json.loads(runner.live_paths(tmp_path / "live", "BTC")["desk"].read_text())
     return [Event(**e) for e in d["events"]]
+
+
+# ---------------------------------------------------------------- bug 5: one coin's live state per directory
+
+def test_two_coins_live_side_by_side_never_touch_each_others_state(tmp_path, monkeypatch):
+    """BTC trades (long from the 251 close); then an ETH desk runs on the same state directory with its own entry
+    kill. Before, both shared state/live_position.json, live_desk.json and kills.json: ETH would have read BTC's
+    position, desk and kill switches and written over them."""
+    bars, funding = series(seed=3, drift=0.002, n=700)
+    btc = P.with_(hard={"max_data_age_bars": 1e9})
+    eth = btc.with_(market={"symbol": "ETH"})
+    b_btc, ex_btc, _ = _run_live(tmp_path, btc, bars, funding, 240, [1] * 14)
+    assert b_btc.position is not None
+    mine = runner.live_paths(tmp_path / "live", "BTC")
+    before = {k: mine[k].read_bytes() for k in ("position", "desk")}
+    b_eth, ex_eth, _ = _run_live(tmp_path, eth, bars, funding, 240, [1] * 14, kills={"entry_kill": True})
+    assert {k: mine[k].read_bytes() for k in ("position", "desk")} == before   # not a byte of BTC's state changed
+    assert not mine["kills"].exists()                                      # ETH's kill switch isn't BTC's
+    assert b_eth.position is None and ex_eth.orders == []                  # ...and it held for ETH
+    pos = json.loads((tmp_path / "live" / "ETH" / "live_position.json").read_text())
+    assert pos["symbol"] == "ETH/USDC:USDC" and pos["position"] is None
+    assert json.loads((tmp_path / "live" / "BTC" / "live_position.json").read_text())["position"]["side"] == "long"
+    assert sorted(f.name for f in (tmp_path / "live").iterdir()) == ["BTC", "ETH"]   # nothing shared at the top
+
+
+@pytest.mark.parametrize("name", ["live_position.json", "live_desk.json", "kills.json"])
+def test_an_old_shared_state_file_makes_live_refuse_to_start(tmp_path, monkeypatch, name):
+    (tmp_path / "live").mkdir()
+    (tmp_path / "live" / name).write_text("{}")
+    bars, funding = series(seed=3, drift=0.002, n=700)
+    ex = FakeHyperliquid({"BTC": bars[299].close})
+    with pytest.raises(LiveSetupError, match=name):
+        _run_live(tmp_path, P, bars, funding, 300, [1], ex=ex)
+    assert ex.orders == [] and (tmp_path / "live" / name).read_text() == "{}"   # untouched, nothing traded
+
+
+def test_a_second_live_process_for_the_same_coin_is_refused(tmp_path):
+    held = runner._lock(runner.live_paths(tmp_path / "live", "BTC")["lock"])
+    bars, funding = series(seed=3, drift=0.002, n=700)
+    ex = FakeHyperliquid({"BTC": bars[299].close})
+    with pytest.raises(LiveSetupError, match="another live process"):
+        _run_live(tmp_path, P, bars, funding, 300, [1], ex=ex)
+    _run_live(tmp_path, P.with_(market={"symbol": "SOL"}), bars, funding, 300, [1])    # another coin is fine
+    held.close()
+    _run_live(tmp_path, P, bars, funding, 300, [1], ex=ex)                              # and so is BTC, once free
+
+
+def test_a_position_file_written_by_another_coins_desk_is_refused(tmp_path):
+    ex = FakeHyperliquid(PRICES)
+    path = tmp_path / "ETH" / "live_position.json"
+    path.parent.mkdir()
+    path.write_text(json.dumps({"symbol": "BTC/USDC:USDC", "position": None, "trades": []}))
+    with pytest.raises(LiveSetupError, match="BTC/USDC:USDC"):
+        LiveBroker(params_for("ETH"), exchange=ex, state_path=path, log=lambda *a: None)
+    assert LiveBroker(params_for("BTC"), exchange=ex, log=lambda *a: None).state_path == \
+        Path("state/BTC/live_position.json")
+
+
+def test_reset_halt_for_live_clears_only_that_coins_desk(tmp_path, monkeypatch, capsys):
+    import argparse
+
+    from desk import __main__ as cli
+
+    monkeypatch.chdir(tmp_path)
+    halted = {"risk": {"halted": True, "halt_reason": "test", "peak_equity": 1.0}, "meta": {}}
+    for coin in ("BTC", "ETH"):
+        runner.live_paths("state", coin)["dir"].mkdir(parents=True, exist_ok=True)
+        runner.live_paths("state", coin)["desk"].write_text(json.dumps(halted))
+    assert cli.cmd_reset_halt(argparse.Namespace(mode="live", coin="ETH")) == 0
+    assert json.loads(runner.live_paths("state", "ETH")["desk"].read_text())["risk"]["halted"] is False
+    assert json.loads(runner.live_paths("state", "BTC")["desk"].read_text())["risk"]["halted"] is True
