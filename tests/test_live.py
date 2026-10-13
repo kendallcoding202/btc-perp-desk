@@ -1141,3 +1141,54 @@ def test_a_restart_that_hits_an_exchange_error_keeps_trying_and_puts_the_missing
     assert len(stops) == 1 and stops[0]["amount"] == pytest.approx(0.1)
     assert naps[0] == 15.0 and json.loads(paths["kills"].read_text())["entry_kill"]
     assert "connecting to the exchange failed" in pushed[0] and any("no stop resting" in x for x in pushed[1:])
+
+
+# ---------------------------------------------------------------- review: killed mid catch-up, restarted
+
+@pytest.mark.parametrize("killed", ["while the flushed stop is retried", "after the flush, before the desk file"])
+def test_a_restart_after_a_kill_mid_catch_up_replays_the_gap_as_paper_did(tmp_path, monkeypatch, killed):
+    """Long from the 382 close, polled every bar through 430, asleep through 431-440, killed during the wake-up at 441
+    (Ctrl-C while flush_stop retries, up to 7 s; or just before the desk file is written). The state file used to keep
+    the gap's final trail (78,341) while the desk file still said 430, so the restart replayed 431 against it and
+    stopped out on a bar paper held through (431's low 78,334.7). Paper holds the long through 444."""
+    bars, funding = series(seed=3, drift=0.002, n=700)
+    p = P.with_(hard={"max_data_age_bars": 1e9})
+    rows = _spy_decisions(monkeypatch)
+    _run_paper(tmp_path, p, bars, funding, 370, 444, monkeypatch)
+    fired = {"done": False}
+
+    def kill_once(at):
+        def check(*a, **k):
+            if not fired["done"] and at():
+                fired["done"] = True
+                raise KeyboardInterrupt("Ctrl-C")
+        return check
+
+    if killed == "while the flushed stop is retried":
+        real_flush = LiveBroker.flush_stop
+        check = kill_once(lambda: True)
+
+        def flush(self):
+            if self.clock() >= bars[441].ts and self.position is not None and self.stop_px is not None \
+                    and abs(self.position.stop - self.stop_px) > 1:
+                check()
+            return real_flush(self)
+        monkeypatch.setattr(LiveBroker, "flush_stop", flush)
+    else:
+        real_write, clock_at = runner._atomic_write, {"ts": 0}
+        check = kill_once(lambda: clock_at["ts"] >= bars[440].ts)            # the write after the gap's catch-up
+
+        def write(path, data):
+            clock_at["ts"] = data.get("meta", {}).get("last_bar_ts", 0)
+            if path.name == "live_desk.json":
+                check()
+            return real_write(path, data)
+        monkeypatch.setattr(runner, "_atomic_write", write)
+    ex = FakeHyperliquid({"BTC": bars[369].close}, usdc=10_000.0)
+    with pytest.raises(KeyboardInterrupt):
+        _run_live(tmp_path, p, bars, funding, 370, [1] * 61 + [10], ex=ex)     # through 430, then asleep 431-440
+    assert fired["done"]
+    broker, ex, logs = _run_live(tmp_path, p, bars, funding, 441, [1] * 4, ex=ex)   # restarted from the files
+    assert broker.trades == [] and broker.position is not None                     # still long, like paper
+    for k in range(431, 445):
+        assert rows["live"][bars[k].ts] == rows["paper"][bars[k].ts]

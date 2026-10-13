@@ -192,7 +192,7 @@ def process_closed_bars(desk: Desk, broker, f, new: list[int], *, ctx, now: int,
             broker.apply_funding(f.funding_bar[i], bar.close)
             # 4. decide on this close, as paper does: live context and the real clock only for the fresh close
             orders = desk.on_bar_close(f, i, ctx=None if stale else ctx, now_ms=bar.ts + f.bar_ms if stale else now)
-            meta["last_bar_ts"] = bar.ts
+            broker.bar_ts = meta["last_bar_ts"] = bar.ts
             blocked = desk.last_decision.blocked_by if desk.last_decision else None
             log(f"[{_utc(bar.ts + f.bar_ms)}] close {bar.close:,.2f} eq ${broker.equity(mid):,.2f} "
                 + (("(missed bar) " if i != newest else f"(closed {age_ms / 60_000:.0f} min ago) ") if stale else "")

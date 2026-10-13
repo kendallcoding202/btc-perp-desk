@@ -181,6 +181,8 @@ class LiveBroker:
         self.close_wanted: str | None = None  # a desk close (its reason) not yet done on the exchange: sent again at
         self.close_failures = 0               # every check (retry_close) until it is, and kept across a restart
         self.provisional: list[dict] = []     # exits booked without their fills: re-booked once the fills read
+        self.bar_ts: int | None = None        # the last bar whose decision this position has been through (the runner)
+        self.replay_until: int | None = None  # bar_ts as saved when this process started
         self.last_price: float | None = None
         self.stops_to_clean = False           # a close left reduce-only stops behind that couldn't be cancelled yet
         self.defer_stops = False              # catching up missed bars: trail moves are kept, sent once at the end
@@ -824,13 +826,15 @@ class LiveBroker:
     def update_stop(self, stop: float) -> None:
         """Move the resting stop: the new one is placed and confirmed first, then the old one is cancelled (never
         unprotected). If the new one won't go on, the old one stays and the next sync tries again. While catching
-        up missed bars (defer_stops) the move is only recorded; flush_stop() sends the final level once."""
+        up missed bars (defer_stops) the move is only kept in memory: flush_stop() sends the final level once and saves
+        it. Until then the state file keeps the stop that is resting on the exchange, so a process killed mid catch-up
+        restarts from the bar it had saved, with that bar's stop, and replays the gap as it was."""
         if self.position is None:
             return
         self.position.stop = stop
-        self._save_local()
         if self.defer_stops:
             return
+        self._save_local()
         self._ensure_stop(stop, self.last_price, self.clock(), keep_old=True)
         if self.position is not None:
             self._save_local()
@@ -845,9 +849,17 @@ class LiveBroker:
 
     def missed_stop(self, bar) -> bool:
         """Catching up: did `bar` go through a trail the desk moved during the gap but never sent? The stop that was
-        resting on the exchange did its own job (sync books it); this is the tighter level paper would have held."""
+        resting on the exchange did its own job (sync books it); this is the tighter level paper would have held.
+
+        Never for a bar the saved position had already been through when this process started (replay_until: a restart
+        after its stop was saved but before the desk file was): its stop is that later bar's, not the one paper held
+        on the earlier bar."""
         pos = self.position
-        if pos is None or not pos.stop or self.stop_px is None or (pos.stop - self.stop_px) * pos.side.sign <= 0:
+        if pos is None or not pos.stop or self.stop_px is None:
+            return False
+        if self.replay_until is not None and bar.ts <= self.replay_until:
+            return False
+        if (self._px(pos.stop) - self.stop_px) * pos.side.sign <= 0:     # the resting stop is the desk's (as rounded)
             return False
         return bar.low <= pos.stop if pos.side is Side.LONG else bar.high >= pos.stop
 
@@ -870,6 +882,7 @@ class LiveBroker:
             "coin": self.coin, "venue": self.venue, "symbol": self.symbol,
             "stop_order_id": self.stop_order_id, "stop_px": self.stop_px, "stops_to_clean": self.stops_to_clean,
             "entry_order_id": self.entry_order_id, "close_wanted": self.close_wanted, "provisional": self.provisional,
+            "bar_ts": self.bar_ts,
             "position": None if pos is None else {
                 "side": pos.side.value, "qty": pos.qty, "entry_price": pos.entry_price, "entry_ts": pos.entry_ts,
                 "stop": pos.stop, "best_close": pos.best_close, "fees_paid": pos.fees_paid,
@@ -889,6 +902,7 @@ class LiveBroker:
         self.entry_order_id = d.get("entry_order_id")
         self.close_wanted = d.get("close_wanted")
         self.provisional = list(d.get("provisional") or [])
+        self.bar_ts = self.replay_until = d.get("bar_ts")
         pd = d.get("position")
         if pd:
             self.position = Position(Side(pd["side"]), pd["qty"], pd["entry_price"], pd["entry_ts"], pd["stop"],
