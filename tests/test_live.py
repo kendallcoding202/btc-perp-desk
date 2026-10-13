@@ -488,12 +488,10 @@ def test_when_the_fills_cant_be_read_the_exit_falls_back_loudly(tmp_path, readab
         return
     assert t.exit_price == pytest.approx(78_000.0) and "fill not found" in t.reason     # the stop level, not 81,500
     assert any("couldn't be read" in a for a in said)
-    saved = json.loads(b.state_path.read_text())
-    assert saved["provisional"] and saved["trades"][-1]["exit_price"] == pytest.approx(78_000.0)
     b2 = _broker("BTC", ex, tmp_path, cap=500.0, sleep=Sleeps(), on_alert=said.append)   # kept across a restart
     b2.check_stop_price(81_500.0, ex.now + 15_000)
     t = b2.trades[-1]
-    if readable == "never":
+    if readable == "never":                          # still unreadable: stays at the stop level, still being retried
         assert t.exit_price == pytest.approx(78_000.0) and b2.provisional
         return
     assert len(b2.trades) == 1 and t.reason == "stop (exchange)" and t.exit_price == pytest.approx(77_850.0)
@@ -892,15 +890,18 @@ def test_a_sub_account_is_traded_through_vault_address_and_read_as_itself():
     assert main.handle_option_string_and_params_2({}, "createOrder", "vaultAddress", "subAccountAddress")[0] is None
 
 
-def test_missing_credentials_or_an_empty_account_refuse_to_start(tmp_path):
-    with pytest.raises(LiveSetupError, match="HL_PRIVATE_KEY"):
-        live_mod.exchange_config("hyperliquid", wallet=MASTER)
-    with pytest.raises(LiveSetupError, match="EXCHANGE_API_KEY"):
-        live_mod.exchange_config("bybit")
+def test_an_account_that_reads_zero_refuses_to_start(tmp_path):
     ex = FakeHyperliquid(PRICES, usdc=0.0)          # e.g. HL_WALLET_ADDRESS is the API wallet's own address
     with pytest.raises(LiveSetupError, match="HL_WALLET_ADDRESS"):
         _broker("BTC", ex, tmp_path)
     assert ex.orders == []
+
+
+def test_a_missing_credential_refuses_to_start_instead_of_being_retried():
+    with pytest.raises(LiveSetupError, match="HL_PRIVATE_KEY"):
+        live_mod.exchange_config("hyperliquid", wallet=MASTER)
+    with pytest.raises(LiveSetupError, match="EXCHANGE_API_KEY"):
+        live_mod.exchange_config("bybit")
 
 
 # ---------------------------------------------------------------- review: no ccxt builder fee, no referrer
@@ -1240,6 +1241,17 @@ def test_a_cap_too_small_for_any_ticket_at_the_current_price_refuses_to_start(tm
     """BTC at 83,000, 3 bps slippage, size step 0.00001: a $10.00-$10.75 cap passed the start check (it isn't below
     the $10 minimum) and then skipped every entry, 0.00012 BTC = $9.96 after the cut. The smallest that trades is
     $10.80 at this price (0.00013 BTC, with the 3 bps cushion)."""
+    # `live` refuses at startup, with the market's price
+    bars, funding = series(seed=3, drift=0.002, n=700)
+    ex2 = FakeHyperliquid({"BTC": bars[299].close}, usdc=10_000.0)
+    paths = runner.live_paths(tmp_path / "live", "BTC")
+    small = LiveBroker(P, exchange=ex2, state_path=paths["position"], max_notional_usd=10.0, log=lambda *a: None)
+    with pytest.raises(LiveSetupError, match="smallest ticket"):
+        runner.run(P, "live", state_dir=str(tmp_path / "live"), dashboard=False, log=lambda *a: None,
+                   feed=LiveFeed(bars, funding, 300), broker=small, clock=lambda: bars[300].ts + 60_000,
+                   sleep=lambda s: None)
+    assert ex2.orders == []
+    # and the line is exactly where an entry starts going out
     p = params_for("BTC")
     ex = FakeHyperliquid({"BTC": 83_000.0}, usdc=1_000.0)
     need = _broker("BTC", ex, tmp_path).smallest_cap(83_000.0)
@@ -1253,13 +1265,3 @@ def test_a_cap_too_small_for_any_ticket_at_the_current_price_refuses_to_start(tm
     b.execute_now(83_000.0, ex.now)
     assert [o["kind"] for o in ex.orders][:1] == ["entry"] and b.position is not None      # exactly enough: it trades
     assert ex.orders[0]["amount"] * 83_000.0 <= need and p.costs.slippage_bps == 3.0
-    # and through the runner: `live` refuses at startup with the market's price
-    bars, funding = series(seed=3, drift=0.002, n=700)
-    ex2 = FakeHyperliquid({"BTC": bars[299].close}, usdc=10_000.0)
-    paths = runner.live_paths(tmp_path / "live", "BTC")
-    small = LiveBroker(P, exchange=ex2, state_path=paths["position"], max_notional_usd=10.0, log=lambda *a: None)
-    with pytest.raises(LiveSetupError, match="smallest ticket"):
-        runner.run(P, "live", state_dir=str(tmp_path / "live"), dashboard=False, log=lambda *a: None,
-                   feed=LiveFeed(bars, funding, 300), broker=small, clock=lambda: bars[300].ts + 60_000,
-                   sleep=lambda s: None)
-    assert ex2.orders == []

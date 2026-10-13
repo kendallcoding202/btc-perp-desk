@@ -72,7 +72,7 @@ python3 -m desk vt-backtest                  # the VT basket: reports/backtest-V
 python3 -m desk replay                       # watch it trade 2024→now at http://127.0.0.1:8787
 python3 -m desk paper                        # a $150 paper account (add --coin ETH), live board at :8787
 python3 -m desk step                         # one step for every account (BTC, ETH, SOL, VT), the way the Action runs it
-python3 -m pytest                            # 102 tests, incl. "paper ledger == backtest" for the desk and for VT,
+python3 -m pytest                            # 103 tests, incl. "paper ledger == backtest" for the desk and for VT,
                                              # and live mode against a fake exchange (tests/test_live.py)
 ```
 
