@@ -11,6 +11,7 @@ This is the research behind the desk's October 2026 audit, kept so it can be re-
   - The pass rule P1–P8 was fixed before any result was seen.
 - `download.py`: fetches the data into `data/` (gitignored), up to the last complete month. It covers 25 Binance USDT-M perps (1h candles and funding) and, for BTC/ETH/SOL, premium index, spot and positioning metrics.
 - `make_baseline.py` → `baseline_daily.csv`: the live desk's daily returns at the $150 account size, for correlation and blend checks.
+- `ALL_RESULTS.json`: every hunter's, checker's and auditor's structured result. `synthesis/combo.json`: the blend and bootstrap test. `checks/`: two quick checks the final critic ran, each reviewed by another agent (see its README).
 - `candidates/`: the frozen finalists that survived or are still waiting for evidence. Each has its `PLAN.md`: what was tested, the parameter grid, and the trial count.
   - `voltgt/`: the vol-trend basket, the one idea both skeptics passed. It now runs as the VT paper account. `held_quantity_version.py` is the held-quantity form the account trades, with the $10-minimum analysis.
   - `tsmom20/`: the 20-coin trend portfolio (contested).
@@ -25,6 +26,19 @@ python3 research/edge-hunt-2026-10/download.py                   # ~10k small fi
 python3 research/edge-hunt-2026-10/candidates/voltgt/final_voltgt.py   # prints IS/OOS/full stats as JSON
 ```
 
-The scripts find the harness and the repo relative to their own location, so they run from anywhere. Results at the audit's end date (2026-09-30) reproduce the audit exactly. For example, voltgt has IS Sharpe 1.795 and OOS 0.896 (+63.6%), and tsmom20_long has 1.573 and 0.938.
+The scripts find the harness and the repo relative to their own location, so they run from anywhere.
+
+**These harness candidates reproduce the audit exactly** when re-run from here at its end date (2026-09-30): voltgt, tsmom20_long, C1_ls_4h and xs_carry. tsmom20_ls was not re-run. For example, voltgt has IS Sharpe 1.795 and OOS 0.896 (+63.6%), and tsmom20_long has 1.573 and 0.938.
+
+**The desk-engine candidates (`stopwidth`, `rel_crowding`) run on the live desk code.** That code now starts accounts at $150 instead of the audit's $50, so their 2020–23 numbers moved. 2024–26 is unchanged.
+
+| desk-engine run | 2020–23 Sharpe (was, at $50) | 2024–26 Sharpe |
+|---|---|---|
+| SOL desk as is | 0.27 (0.76) | 0.24 |
+| SOL at 4 ATR | 1.13 (1.30) | 0.19 |
+| ETH desk as is | 0.68 (0.71) | 0.52 |
+| ETH at 3.5 ATR | 1.03 (0.96) | 0.71 |
+
+`rel_crowding` has not been re-run at $150. The re-audit's same-sign check (N3) compares against the 2024–26 column.
 
 The full write-up of the audit is [`reports/edge-hunt-2026-10.md`](../../reports/edge-hunt-2026-10.md).

@@ -79,7 +79,7 @@ python3 -m pytest                            # 38 tests, incl. "paper ledger == 
 
 **Three $150 paper accounts** (BTC, ETH, SOL; $450 in all) trade live Hyperliquid prices, plus the **$500 VT basket** ([below](#vt-the-vol-trend-basket-a-4th-paper-account)). Each account is separate, with its own cash, positions and record; the three desk accounts also have their own kill switches. A GitHub Actions job ([`.github/workflows/paper.yml`](.github/workflows/paper.yml)) runs `python -m desk step` every 15 minutes, so the experiments keep running with no computer on. If one account's step fails (say, a rate-limited API call), the others still run and save, and the failed one catches up next run.
 
-**Why $150, not $50.** Hyperliquid won't take an order under $10. The desk's ETH and SOL orders come to about 0.3–0.5× the account (BTC's about 1.7×), so at $50 some of their trades get skipped, and more after a losing streak. From every historical entry: BTC clears $10 on every trade from about $17 of equity; ETH and SOL need about $85–90, so $150 keeps them trading through a 40% drawdown. The accounts were restarted at $150 on 2026-10-12; the $50 runs (opened 10-09 and 10-10) had made no trades, and their ledgers are kept in `ledger/archive/` on the paper-ledger branch. One thing this changed: at $50 the minimum had blocked 18 SOL trades in 2021 that happened to lose, which flattered SOL's old report (+40%, now +16% at $150; 2024 onwards is the same either way).
+**Why $150, not $50.** Hyperliquid won't take an order under $10. The desk's ETH and SOL orders come to about 0.3–0.5× the account (BTC's about 1.7×), so at $50 some of their trades get skipped, and more after a losing streak. From every historical entry: BTC clears $10 on every trade from about $17 of equity; ETH and SOL need about $85–90, so $150 keeps them trading through a 40% drawdown. The accounts were restarted at $150 on 2026-10-12; the $50 runs (opened 10-09 and 10-10) had made no trades, and their ledgers are kept in `ledger/archive/` on the paper-ledger branch. One thing this changed: at $150 SOL takes 13 trades the $50 account had to skip (12 of them in 2021), and 12 of those 13 lost. Skipping them had flattered SOL's old report (+40%, now +16% at $150; 2024 onwards is the same either way).
 
 - **The record** lives on the [`paper-ledger`](../../tree/paper-ledger/ledger) branch, saved whenever something happens, so the history is permanent and public:
   - `ledger/<COIN>/paper.json` (`BTC`, `ETH`, `SOL`): the account, open position, every trade, and the desk's memory
@@ -166,7 +166,15 @@ This is for the BTC, ETH and SOL desk accounts only. VT has no live mode.
 3. `DESK_LIVE_CONFIRM` is set to the exact phrase in `.env.example`.
 4. You set a hard per-position dollar cap with `--max-notional`.
 
-The live broker (`desk/brokers/live.py`) uses ccxt. On Hyperliquid it uses an **API wallet**, not your main key. The protective stop rests **on the exchange** as a reduce-only order, so a crash of this process never leaves a position unprotected. **It has not yet been run against a funded account.** Start with the smallest cap, and watch the first fills by hand.
+The live broker (`desk/brokers/live.py`) uses ccxt. On Hyperliquid it uses an **API wallet**, not your main key. The protective stop rests **on the exchange** as a reduce-only order, so it holds even if this process stops. **It has not yet been run against a funded account.**
+
+**Live trading is not safe yet.** The October 2026 audit ([`reports/edge-hunt-2026-10.md`](reports/edge-hunt-2026-10.md)) found bugs that only affect live mode, and they are not fixed:
+- **ETH or SOL live orders would go to BTC**, at 30× the size cap or more, with the stop at the wrong coin's price. Don't run `live --coin ETH` or `--coin SOL`.
+- **If placing the stop fails right after an entry, nothing re-places it until the next 2h close**, so the position can sit unprotected.
+- **A stop that fills on the exchange is booked at the next price check, not the fill price.** A loss can be recorded as a win.
+- **After a gap of several candles, live processes only the newest one.** Paper catches up on every candle.
+
+Paper trading is not affected by any of these. Fix them, with tests, before arming live. Then start with the smallest cap, and watch the first fills by hand.
 
 Perpetual futures are restricted in some countries, including for US persons on most venues. Check that your venue is legal where you live.
 
@@ -186,4 +194,7 @@ desk/brokers/        sim.py (backtest + paper), live.py (ccxt)
 desk/feeds/          hyperliquid.py (live), binance_vision.py (history)
 desk/board.py        state → dashboard JSON (agent cards, bubbles, gates, thresholds; the VT holdings)
 dashboard/           the board: no build step, phone-friendly
+dashboard/spider.js  the walking CRAWLER: visits whatever the desk just did (gate cards in the order the desk
+                     checks them, the newest candle, the trigger line, new fills) and curls up when the board
+                     is stale. Decoration only; it changes no rule
 ```
