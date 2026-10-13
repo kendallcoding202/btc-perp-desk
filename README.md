@@ -72,7 +72,7 @@ python3 -m desk vt-backtest                  # the VT basket: reports/backtest-V
 python3 -m desk replay                       # watch it trade 2024→now at http://127.0.0.1:8787
 python3 -m desk paper                        # a $500 BTC paper account ($150 with --coin ETH or SOL), board at :8787
 python3 -m desk step                         # one step for every account (BTC, ETH, SOL, VT), the way the Action runs it
-python3 -m pytest                            # 158 tests, incl. "paper ledger == backtest" for the desk and for VT,
+python3 -m pytest                            # 184 tests, incl. "paper ledger == backtest" for the desk and for VT,
                                              # and live mode against a fake exchange (tests/test_live.py)
 ```
 
@@ -164,32 +164,69 @@ Money you put into an account, or take out, is never counted as profit or loss. 
 }
 ```
 
-- `monthly`: `amount` dollars on `day` (1 to 28) of each month, starting on `first` (which must fall on that day), `count` times. To change the amount later, make `monthly` a list: set the first plan's `count` to the months already done, and start a second plan the month after.
-- `extra`: one-off amounts on a date. **A negative amount is a withdrawal.** `note` is optional.
+- `monthly`: `amount` dollars on `day` (1 to 28) of each month, starting on `first` (which must fall on that day), `count` times.
+- `extra`: one-off amounts on a date. **A negative amount is a withdrawal.** `note` is optional. An extra dated more than a year ahead is taken for a typo in the year (2062 for 2026) and stops the step; if it really is planned that far ahead, add `"future": true` to it.
 - Any account works the same way: `"ETH"`, `"SOL"` and `"VT"` can each have their own `monthly` and `extra`.
 - Keys starting with `_` are comments (text only).
 
-**Adding a deposit from your phone.** In the GitHub app or in your phone's browser at github.com, open the repo, then `deposits.json` on the `main` branch, and tap the pencil (Edit). Add one line at the end of BTC's `extra` list (put a comma after the entry before it, if there is one):
+To change the monthly amount later, make `monthly` a list of two plans: end the first one with `count` set to the months it ran, and start the second the month after. From $100 to $150 in May 2027, say (the first plan ran November 2026 to April 2027, 6 deposits):
 
 ```json
-      {"date": "2026-12-15", "amount": 250, "note": "bonus"}
+    "monthly": [
+      {"amount": 100, "day": 1, "first": "2026-11-01", "count": 6},
+      {"amount": 150, "day": 1, "first": "2027-05-01", "count": 54}
+    ],
 ```
 
-Then tap **Commit changes** and commit to `main`. For a withdrawal, use a negative amount: `"amount": -50`. The next run (within about 15 minutes) records it once its date has come, at 00:00 UTC on that date. A date already past is recorded at the next run. With `NTFY_TOPIC` set, your phone gets `DEPOSIT $250.00 recorded (extra: bonus) — money in, not profit`.
+### Adding a deposit or a withdrawal from your phone
+
+1. In the GitHub app or your phone's browser at github.com, open the repo, then `deposits.json` on the `main` branch, and tap the pencil (Edit).
+2. BTC's `extra` list is open, with nothing in it yet:
+
+   ```json
+       "extra": [
+       ]
+   ```
+
+   Type your entry on its own line between the `[` and the `]`:
+
+   ```json
+       "extra": [
+         {"date": "2026-12-15", "amount": 250, "note": "bonus"}
+       ]
+   ```
+
+   For the next one, put a comma after the entry that's already there, and add yours below it (new entries always go at the end, and the last one has no comma):
+
+   ```json
+       "extra": [
+         {"date": "2026-12-15", "amount": 250, "note": "bonus"},
+         {"date": "2027-03-01", "amount": -50, "note": "took some out"}
+       ]
+   ```
+
+3. Tap **Commit changes** and commit to `main`.
+
+**The slips a phone makes:** straight quotes only (`"`, not `“ ”`: turn off Smart Punctuation in iOS Settings > General > Keyboard if it changes them); amounts as plain numbers (`1000`, not `$1,000`; `-50`, not `- 50`); no comma after the last entry. If you get one wrong, the error message starts with how to fix it.
+
+The next run (within about 15 minutes) records it once its date has come, at 00:00 UTC on that date; a date already past is recorded at the next run. With `NTFY_TOPIC` set, your phone gets `DEPOSIT $250.00 recorded (extra: bonus, 2026-12-15) — money in, not profit`.
 
 The step checks the file strictly and never guesses:
-- Amounts are dollars and cents (`250`, `99.5`, `-50`), and dates are `YYYY-MM-DD`. A typo stops that account's step: its tab shows the error, and the Actions run fails, until you fix it. The other accounts keep running. If the file isn't valid JSON at all, or names an account that doesn't exist, every account waits. Each step catches up every missed candle afterwards, so no trading is lost.
-- **Never edit or delete an entry that's already been recorded** (its date has passed). Fix a mistake with another `extra`; a negative one takes money back out. A recorded entry that's changed or missing stops that account until it's put back as it was. Add new `extra`s at the end of the list: two on the same date are told apart by their order.
+- A mistake in one account's section stops that account's step until you fix it; the other accounts keep running. If the file isn't valid JSON at all, or names an account that doesn't exist, every account waits. Each paused account's error is shown above the board on GitHub Pages (its own board isn't published while it's paused, so the page shows another account's), the Actions run fails, and with `NTFY_TOPIC` set your phone gets `BTC paused: deposits.json` with the message: at the first run after the edit, then every 6 hours until it's fixed. Each step then catches up every missed candle, so no trading is lost.
+- **Never edit or delete an entry that's already been recorded** (its date has passed). Fix a mistake with another `extra`; a negative one takes money back out. A recorded entry that's changed or missing stops that account until it's put back as it was. Add new extras at the end of the list: two on the same date are told apart by their order.
+- **A withdrawal the open position still needs waits**, as an exchange holds back the margin a position uses: the realised balance must stay above $0 and the position within the account's maximum leverage (5x; VT: the most its rules ever hold) of what's left. The board and your phone say so once (`WITHDRAWAL $1,000.00 waiting ...`); it goes out at the first bar open where it fits, usually once the position has closed. Entries dated after it wait with it. A withdrawal bigger than the whole account stops the step.
 
 **How it's counted.** Like a fund: the account starts with one unit per dollar, and a deposit buys units at what a unit is worth at that moment (a withdrawal sells them). So:
-- **The performance %** is the units' value: on the board's P&L, the tabs, your phone, and the go-live gate. A deposit or a withdrawal never moves it.
+- **The performance %** is the units' value, time-weighted: a deposit or a withdrawal never moves it. Once an account has had one, the board's ticker shows it as `PERF +x% TIME-WEIGHTED` next to the dollar P&L (the two can differ a lot: $100 a month into a small account), each tab shows `+x% perf · P&L $y`, and your phone says `(+x% time-weighted)`.
 - **P&L in dollars** is the balance, minus the start, minus what was deposited net of withdrawals.
+- **When it goes in.** A run on time (the usual 00:04 UTC run on the 1st) puts the deposit in at that run's price, the one the board marks the account at, so the performance % reads the same just before and just after it. A run that comes late and catches up candles it missed puts it in at the open of the first missed candle on or after 00:00 UTC on its date, before that candle's fills.
 - **The brakes read the same percentage just before and just after a flow.** At each one, the 40% drawdown halt and the 10% daily loss limit are rescaled with the balance. A deposit during a 35% drawdown still shows a 35% drawdown. A withdrawal never trips the halt.
 - **Trading sees a deposit only as a bigger account to size the next trade from.** 5% of a bigger account is a bigger bet, as it would be with real money. A position already open isn't topped up.
-- **On the board:** each flow is marked on the equity chart, it's in the events, and the deposited total is next to the P&L. The goal panel shows what's been deposited so far, and counts the deposits still planned in its years to $100,000. The ALL card's P&L leaves deposits out. The ledger's commit message reads, for example, `BTC $600.00 (+$100.00 deposited, not profit)`.
+- **The go-live gate's "up overall"** is the realised balance over the units (the realised performance %), and the dollar P&L must be up too.
+- **On the board:** the plan's deposits are ticks on the equity chart's bottom edge, and extras and withdrawals are dashed lines with their amount. Each one is in the events with its date, and the deposited total is next to the P&L. The goal panel shows what's been deposited (and withdrawn) so far, and counts the deposits still planned in its years to $100,000. The ALL card's P&L leaves deposits out. The ledger's commit message reads, for example, `BTC $600.00 (+$100.00 deposited, not profit)`.
 - **Until the first flow is recorded** (BTC's is 2026-11-01), every ledger and board is byte for byte what it was before deposits existed. That includes the goal panel: it starts counting the plan at the first deposit.
 
-**Live.** `deposits.json` is for the paper accounts only; live never applies it. Live reads real deposits, withdrawals and transfers from Hyperliquid's own ledger at every check: bridge deposits and withdrawals, sub-account transfers, transfers between accounts, spot ↔ perp, and vaults. It books them the same way, brakes included. (It uses ccxt's `fetch_ledger`; `fetch_deposits` and `fetch_withdrawals` only see the bridge.) An entry of a kind it doesn't know is alerted, never guessed at. If the account's value moves by more than the larger of $1 and 2% of the account beyond what the position's P&L, the trades booked and the recorded flows explain, it alerts your phone and sets `entry_kill`.
+**Live.** `deposits.json` is for the paper accounts only; live never applies it. Live reads real deposits, withdrawals and transfers from Hyperliquid's own ledger at every check: bridge deposits and withdrawals, sub-account transfers, transfers between accounts, spot ↔ perp, and vaults. It books them the same way, brakes included, each at the account's value at the moment it happened (if the desk only reads it later, after a restart or while the ledger couldn't be read, the open position's move since then is taken out at that minute's price; if that can't be done it alerts and sets `entry_kill`). (It uses ccxt's `fetch_ledger`; `fetch_deposits` and `fetch_withdrawals` only see the bridge.) An entry of a kind it doesn't know is alerted, never guessed at. While the ledger can't be read, the balance isn't trusted: the brakes keep the last one confirmed and the desk waits to decide on new candles (the exchange's stop still protects any position), then catches them up. If the account's value moves by more than the larger of $1 and 2% of the account beyond what the position's P&L, funding, the trades booked and the recorded flows explain, including across a restart, it re-reads the ledger, waits about two minutes for an entry to show up, and then alerts your phone and sets `entry_kill`.
 
 ## Kill switches
 
@@ -244,7 +281,7 @@ What is still open:
 - Only Hyperliquid was checked, against ccxt's code and Hyperliquid's public market list. The other venues' symbols follow ccxt's naming but weren't checked. Those venues may also need extra parameters before their stop orders show up in `fetch_open_orders`. Without them, the stop check would fail and close every new position.
 - Any exchange error while placing an order still sets `entry_kill`, even when a retry then gets the order through. Clear it from the board once you've checked.
 - The go-live gate still rests on 14 days of paper, which the audit calls noise.
-- Deposits on live are read from Hyperliquid's ledger as ccxt 4.5.85 returns it, with the fields Hyperliquid documents. That has only been checked against ccxt's code and the fakes, not a funded account. Two details are assumed: a withdrawal's fee is part of the amount taken out, and a transfer's fee is paid by the sender. If either is wrong, the reconciliation alert catches it. Hyperliquid's newer "send" entries aren't parsed yet; they're alerted.
+- Deposits on live are read from Hyperliquid's ledger as ccxt 4.5.85 returns it, with the fields Hyperliquid documents. That has only been checked against ccxt's code and the fakes, not a funded account. Two details are assumed: a withdrawal's fee is part of the amount taken out, and a transfer's fee is paid by the sender. If either is wrong, the reconciliation alert catches it. Hyperliquid's newer "send" entries aren't parsed yet; they're alerted. A deposit read late is priced from Hyperliquid's 1-minute candle at its minute (1-hour candles once it's older than about 3 days); funding over that stretch is left out of its price.
 
 Paper trading is not affected by any of this. The backtests (BTC, ETH, SOL, VT) and paper steps on copies of the real ledgers give byte-for-byte the same output before and after these fixes, apart from each report's generated time.
 

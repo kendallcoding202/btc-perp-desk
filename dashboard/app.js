@@ -205,8 +205,12 @@
     let lo = Math.min(...ys), hi = Math.max(...ys);
     if (hi === lo) { hi += 1; lo -= 1; }
     const padL = 46;
+    // deposits and withdrawals in the curve's window (older ones are off it): the plan's as ticks on the bottom axis,
+    // extras and withdrawals as a dashed line with their amount, in a band kept clear above the curve
+    const shown = marks.filter(([ts]) => ts >= eq[0][0] - (eq[1][0] - eq[0][0]));
+    const big = shown.filter(([, amt, kind]) => kind !== "plan" || amt < 0), top = big.length ? 30 : 6;
     const X = (k) => padL + k / (eq.length - 1) * (w - padL - 8);
-    const Y = (v) => 6 + (hi - v) / (hi - lo) * (h - 14);
+    const Y = (v) => top + (hi - v) / (hi - lo) * (h - top - 8);
     g.font = "10px JetBrains Mono, monospace"; g.fillStyle = css("--dim");
     [hi, (hi + lo) / 2, lo].forEach((v) => { g.fillText(usdShort(v), 0, Y(v) + 3); line(g, [[padL, Y(v)], [w, Y(v)]], css("--line"), 1); });
     const grad = g.createLinearGradient(0, 0, 0, h);
@@ -214,18 +218,18 @@
     g.beginPath(); g.moveTo(X(0), h); eq.forEach((p, k) => g.lineTo(X(k), Y(p[1]))); g.lineTo(X(eq.length - 1), h); g.closePath();
     g.fillStyle = grad; g.fill();
     line(g, eq.map((p, k) => [X(k), Y(p[1])]), css("--green"), 2);
-    // a deposit or withdrawal is a step in the bank, not profit or loss: a dashed line where it went in or out, and
-    // its amount wherever it fits (two rows; a label that would overlap another is left off, the line stays)
+    // a deposit or withdrawal is a step in the bank, not profit or loss (a label that would overlap another is left
+    // off, the line stays; one after the newest point is drawn at it)
+    const at = (ts) => { const k = eq.findIndex((p) => p[0] > ts); return X(k < 0 ? eq.length - 1 : k); };
+    shown.forEach(([ts, amt, kind]) => { if (kind === "plan" && amt > 0) line(g, [[at(ts), h - 7], [at(ts), h]], css("--blue"), 1.5); });
     const ends = [0, 0];
     g.fillStyle = css("--blue");
-    marks.forEach(([ts, amt]) => {
-      const k = eq.findIndex((p) => p[0] > ts);
-      if (k < 0) return;
-      const x = X(k), up = amt > 0, text = `${up ? "+" : "−"}$${Math.round(Math.abs(amt)).toLocaleString("en-US")} ${up ? "in" : "out"}`;
-      line(g, [[x, 6], [x, h - 4]], css("--blue"), 1, [2, 3]);
+    big.forEach(([ts, amt]) => {
+      const x = at(ts), up = amt > 0, text = `${up ? "+" : "−"}$${Math.round(Math.abs(amt)).toLocaleString("en-US")} ${up ? "in" : "out"}`;
+      line(g, [[x, 2], [x, h - 4]], css("--blue"), 1, [2, 3]);
       const tw = g.measureText(text).width, tx = Math.min(x + 3, w - tw - 2), row = ends.findIndex((e) => tx >= e + 6);
       if (row < 0) return;
-      g.fillText(text, tx, 14 + row * 12);
+      g.fillText(text, tx, 12 + row * 12);
       ends[row] = tx + tw;
     });
     const lx = X(eq.length - 1), ly = Y(ys[ys.length - 1]);
@@ -290,15 +294,17 @@
     $("chief-bubble").textContent = chief ? chief.quote : "";
   }
 
-  // Deposits and withdrawals, next to a P&L that leaves them out (the board only has "flows" once there's one)
-  const flowTag = (s) => s.flows ? ` · ${s.flows.net >= 0 ? "DEPOSITED" : "WITHDRAWN"} ${usd(Math.abs(s.flows.net))}, NOT P&amp;L` : "";
+  // With deposits or withdrawals (the board only has "flows" once there's one): the P&L leaves them out, and its
+  // percentage is the time-weighted performance, not the P&L over the money put in, so it's named
+  const pnlTag = (s) => s.flows ? `P&amp;L ${usd(s.ticker.pnl)} · PERF ${pct(s.ticker.pnl_pct)} TIME-WEIGHTED · ` +
+    `${s.flows.net >= 0 ? "DEPOSITED" : "WITHDRAWN"} ${usd(Math.abs(s.flows.net))}, NOT P&amp;L` : `P&amp;L ${usd(s.ticker.pnl)} (${pct(s.ticker.pnl_pct)})`;
 
   function renderStage(s) {
     const t = s.ticker, k = s.kills, coin = s.header.coin || "BTC";
     const liveTag = live.at ? `<span class="live-dot" aria-hidden="true"></span>LIVE · ` : "";
     $("ticker").innerHTML = `‹ ${liveTag}TRADES · ${esc(coin)} ${px(t.price)} · BANK ${usd(t.bank)} · ` +
       `<span class="hl">${esc(t.position)}${t.position_detail ? " " + esc(t.position_detail) : ""}</span>` +
-      ` · ${esc(t.record)} · HOLD ${pct(t.hold_pct)} · P&amp;L ${usd(t.pnl)} (${pct(t.pnl_pct)})${flowTag(s)} · FEES ${usd(t.fees)} · FUNDING ${usd(t.funding)}`;
+      ` · ${esc(t.record)} · HOLD ${pct(t.hold_pct)} · ${pnlTag(s)} · FEES ${usd(t.fees)} · FUNDING ${usd(t.funding)}`;
     $("chart-title").textContent = `${coin}-PERP · ${s.header.interval} · ${px(t.price)}`;
     $("chart-sub").textContent = `24h ${pct(t.change_24h)} · ema.fast pink · ema.slow blue · channel dashed`;
     const chips = $("chips");
@@ -342,8 +348,11 @@
         ? `at backtest pace ${at(goal.backtest_cagr, goal.years_at_backtest_rate)}`
         : `at ${span}backtest pace${goal.plan_included ? " + planned deposits" : ""} ${at(goal.test_cagr, goal.years_at_test_rate)}`;
       // with deposits: the paces are the NAV's (deposits aren't growth), the years count the plan still to come
-      const money = goal.deposited == null ? "" : `<br>${goal.deposited >= 0 ? "deposited" : "withdrawn"} so far ${usd(Math.abs(goal.deposited), 0)} (money in, not profit)` +
-        (goal.planned_left ? ` · ${goal.planned_left} more planned, ${usd(goal.planned_left_usd, 0)}` : "");
+      const din = goal.deposits_in || 0, dout = goal.withdrawn || 0, nx = goal.next_extra;
+      const money = goal.deposited == null ? "" : `<br>${[din && `deposited ${usd(din, 0)}`, dout && `withdrawn ${usd(dout, 0)}`].filter(Boolean).join(" · ")}` +
+        ` so far (money ${din && dout ? "in and out, not profit or loss" : din ? "in, not profit" : "out, not a loss"})` +
+        (goal.planned_left ? ` · ${goal.planned_left} more planned, ${usd(goal.planned_left_usd, 0)}` : "") +
+        (nx ? ` · next extra ${nx.amount > 0 ? "+" : "-"}${usd(Math.abs(nx.amount), 0)} on ${esc(nx.date)}` : "");
       $("goal-note").innerHTML = `${(goal.progress * 100).toFixed(1)}% of the way (log scale) · ${num(goal.multiple_left, 0)}x to go<br>` + pace +
         (goal.realised_cagr != null ? `<br>at this account's own pace ${at(goal.realised_cagr, goal.years_at_realised_rate)}` : "") + money;
     }
@@ -406,7 +415,7 @@
     const liveTag = live.at ? `<span class="live-dot" aria-hidden="true"></span>LIVE · ` : "";
     $("vt-ticker").innerHTML = `‹ ${liveTag}BASKET · ${esc(s.header.coins.join(" · "))} · BANK ${usd(t.bank)} · ` +
       `<span class="hl">${esc(t.position)}${t.position_detail ? " " + esc(t.position_detail) : ""}</span>` +
-      ` · ${esc(t.record)} · HOLD ${pct(t.hold_pct)} · P&amp;L ${usd(t.pnl)} (${pct(t.pnl_pct)})${flowTag(s)} · FEES ${usd(t.fees)} · FUNDING ${usd(t.funding)}`;
+      ` · ${esc(t.record)} · HOLD ${pct(t.hold_pct)} · ${pnlTag(s)} · FEES ${usd(t.fees)} · FUNDING ${usd(t.funding)}`;
     const next = Math.floor(now / DAY_MS + 1) * DAY_MS, left = next - now;   // every 00:00 UTC
     $("vt-next").textContent = `NEXT DECISION 00:00 UTC · IN ${Math.floor(left / 3600000)}H ${Math.floor(left % 3600000 / 60000)}M`;
     $("vt-exp").textContent = s.header.experiment ? `EXPERIMENT · ${s.header.experiment}` : "";
@@ -568,7 +577,7 @@
     nav.hidden = false;
     let start = 0, bank = 0, net = 0;
     const cards = index.coins.map((c) => {
-      if (c.error) return `<button class="coin" data-coin="${esc(c.coin)}"><span class="c-name">${esc(c.coin)}</span><span class="c-sub">error: ${esc(c.error)}</span></button>`;
+      if (c.error) return `<button class="coin err" data-coin="${esc(c.coin)}"><span class="c-name">${esc(c.coin)}</span><span class="c-sub">error: ${esc(c.error)}</span></button>`;
       const basket = c.kind === "basket", lp = parseFloat(live.mids[c.coin]);
       const open = c.coin === (state && state.header.coin) && state.ticker.bank != null;
       let b = open ? state.ticker.bank : c.bank;
@@ -581,7 +590,7 @@
       const sub = basket ? " · basket" : ` · risk ${(c.risk_per_trade * 100).toFixed(0)}%${c.shorts ? " · +shorts" : ""}`;
       return `<button class="coin ${c.coin === coin ? "on" : ""}" data-coin="${esc(c.coin)}" aria-pressed="${c.coin === coin}">` +
         `<span class="c-name">${esc(c.coin)}<i>${esc(label)}</i></span><span class="c-bank">${usd(b)}</span>` +
-        `<span class="c-sub">${pct(c.units ? b / c.units - 1 : b / c.start - 1)} · ${esc(c.position)} · ${esc(c.record)}${sub}</span></button>`;
+        `<span class="c-sub">${c.units ? `${pct(b / c.units - 1)} perf · P&amp;L ${usd(b - c.start - c.net_flows, 0)}` : pct(b / c.start - 1)} · ${esc(c.position)} · ${esc(c.record)}${sub}</span></button>`;
     });
     const left = index.coins.filter((c) => c.error).map((c) => c.coin);   // no bank this run: not in the total
     const put = start + net;   // with deposits: the P&L on everything put in, never counting the deposits as profit
@@ -592,6 +601,18 @@
     nav.style.setProperty("--tabs", cards.length);
     nav.innerHTML = cards.join("");
     nav.querySelectorAll("[data-coin]").forEach((b) => b.addEventListener("click", () => show(b.dataset.coin)));
+  }
+
+  // An account with no board this run: why, in full and wrapped (its tab's line is cut short), above the board shown
+  function notice() {
+    let el = $("acct-err");
+    if (!el) {
+      el = document.createElement("div"); el.id = "acct-err"; el.className = "panel acct-err"; el.setAttribute("role", "status");
+      $("coins").after(el);
+    }
+    const row = missing && index && index.coins ? index.coins.find((c) => c.coin === missing) : null;
+    el.hidden = !(row && row.error);
+    if (row && row.error) el.textContent = `${missing}: no board this run, its step failed. ${row.error}`;
   }
 
   function show(c) {
@@ -615,7 +636,7 @@
     $("time").textContent = hdr.time;
     const basket = hdr.kind === "basket";
     document.body.classList.toggle("kind-basket", basket);
-    renderCoins();
+    renderCoins(); notice();
     if (basket) renderBasket(s);
     else { renderAgents(s.agents); renderStage(s); renderBubbles(s.agents); drawChart(s.chart); drawWeb(); }
     renderBalance(s); drawEquity(s.equity, s.flows ? s.flows.marks : []); drawPnlBars(s.pnl_bars);
@@ -648,10 +669,22 @@
         res = await fetch(`${src}?t=${Date.now()}`, { cache: "no-store" });
       }
       if (mine !== asked) return;
-      if (res.status === 404 && staticMode && coin !== "BTC" && src === `boards/${coin}.json`) {
-        // show BTC's board (and the tab row) instead of a blank page; the remembered tab stays, for when it's back
-        missing = coin; coin = "BTC"; src = "boards/BTC.json";
-        res = await fetch(`${src}?t=${Date.now()}`, { cache: "no-store" });
+      if (res.status === 404 && staticMode && src === `boards/${coin}.json`) {
+        // no board for this account this run (its step failed: a rate limit, a deposits.json mistake): show another
+        // account's (BTC's if it has one) and the tab row, with why, never a blank page; the remembered tab stays
+        const ir = await fetch(`boards/index.json?t=${Date.now()}`, { cache: "no-store" }).catch(() => null);
+        const idx0 = ir && ir.ok ? await ir.json().catch(() => null) : null;
+        if (mine !== asked) return;
+        const ok = ((idx0 && idx0.coins) || []).filter((c) => !c.error && c.coin !== coin).map((c) => c.coin);
+        const alt = ok.includes("BTC") ? "BTC" : ok[0] || (!idx0 && coin !== "BTC" ? "BTC" : null);
+        if (alt) {
+          missing = coin; coin = alt; src = `boards/${coin}.json`;
+          res = await fetch(`${src}?t=${Date.now()}`, { cache: "no-store" });
+        } else if (idx0) {      // no account has a board this run (deposits.json isn't valid JSON, say): the tabs, and why
+          missing = coin; index = idx0; renderCoins(); notice();
+          $("foot").textContent = "no account has a board this run: every step failed (why: above). the next good run brings them back";
+          return;
+        }
       }
       if (!res.ok && src === "boards/BTC.json") {            // an older deploy with a single BTC board
         src = "board.json"; res = await fetch(`${src}?t=${Date.now()}`, { cache: "no-store" });

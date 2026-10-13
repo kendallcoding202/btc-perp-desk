@@ -267,3 +267,9 @@ body.kind-basket .analysis-body { grid-template-columns: minmax(0, 1fr); }
   .thr-row { grid-template-columns: minmax(0, 1fr) 70px 70px 14px; padding-left: 0; }
   .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
+
+/* an account with no board this run (its step failed: a deposits.json mistake, say): app.js notice() says why */
+.acct-err { padding: 8px 12px; font-size: 11px; line-height: 1.5; color: var(--orange); border-color: var(--orange); overflow-wrap: anywhere; }
+.acct-err[hidden] { display: none; }
+.coin.err .c-sub { white-space: normal; color: var(--orange); display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
+@media (max-width: 560px) { .acct-err { order: 1; } }
