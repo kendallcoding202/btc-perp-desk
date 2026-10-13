@@ -1,6 +1,6 @@
 # BTC Perp Desk (now BTC · ETH · SOL)
 
-A multi-agent trading desk for **BTC, ETH and SOL perpetual futures** (three separate $150 paper accounts), modelled on the "GROKBOT + JEV" dashboard, with one difference: every number it trades on has been backtested, with fees and funding charged.
+A multi-agent trading desk for **BTC, ETH and SOL perpetual futures** (three separate $150 paper accounts), modelled on the "GROKBOT + JEV" dashboard, with one difference: every number it trades on has been backtested, with fees and funding charged. A fourth paper account, **VT**, runs a different, slower strategy on the same three coins ([below](#vt-the-vol-trend-basket-a-4th-paper-account)).
 
 ```
 CHIEF    never takes a position     runs the gates in order, every 2h close
@@ -68,23 +68,25 @@ cp .env.example .env                         # optional: JEV_API_KEY, NTFY_TOPIC
 
 python3 -m desk backtest --research          # download history, write reports/backtest.md
 python3 -m desk backtest --coin ETH          # same for ETH (or SOL): reports/backtest-ETH.md
+python3 -m desk vt-backtest                  # the VT basket: reports/backtest-VT.md
 python3 -m desk replay                       # watch it trade 2024→now at http://127.0.0.1:8787
 python3 -m desk paper                        # a $150 paper account (add --coin ETH), live board at :8787
-python3 -m desk step                         # one step for every coin, the way the Action runs it
-python3 -m pytest                            # 27 tests, incl. "paper ledger == backtest"
+python3 -m desk step                         # one step for every account (BTC, ETH, SOL, VT), the way the Action runs it
+python3 -m pytest                            # 38 tests, incl. "paper ledger == backtest" for the desk and for VT
 ```
 
 ## The paper experiments
 
-**Three $150 paper accounts** (BTC, ETH, SOL; $450 in all) trade live Hyperliquid prices. Each account is separate: its own cash, position, record and kill switches. A GitHub Actions job ([`.github/workflows/paper.yml`](.github/workflows/paper.yml)) runs `python -m desk step` every 15 minutes, so the experiments keep running with no computer on. If one coin's step fails (say, a rate-limited API call), the other two still run and save, and the failed one catches up next run.
+**Three $150 paper accounts** (BTC, ETH, SOL; $450 in all) trade live Hyperliquid prices, plus the **$500 VT basket** ([below](#vt-the-vol-trend-basket-a-4th-paper-account)). Each account is separate, with its own cash, positions and record; the three desk accounts also have their own kill switches. A GitHub Actions job ([`.github/workflows/paper.yml`](.github/workflows/paper.yml)) runs `python -m desk step` every 15 minutes, so the experiments keep running with no computer on. If one account's step fails (say, a rate-limited API call), the others still run and save, and the failed one catches up next run.
 
 **Why $150, not $50.** Hyperliquid won't take an order under $10. The desk's ETH and SOL orders come to about 0.3–0.5× the account (BTC's about 1.7×), so at $50 some of their trades get skipped, and more after a losing streak. From every historical entry: BTC clears $10 on every trade from about $17 of equity; ETH and SOL need about $85–90, so $150 keeps them trading through a 40% drawdown. The accounts were restarted at $150 on 2026-10-12; the $50 runs (opened 10-09 and 10-10) had made no trades, and their ledgers are kept in `ledger/archive/` on the paper-ledger branch. One thing this changed: at $50 the minimum had blocked 18 SOL trades in 2021 that happened to lose, which flattered SOL's old report (+40%, now +16% at $150; 2024 onwards is the same either way).
 
 - **The record** lives on the [`paper-ledger`](../../tree/paper-ledger/ledger) branch, saved whenever something happens, so the history is permanent and public:
   - `ledger/<COIN>/paper.json` (`BTC`, `ETH`, `SOL`): the account, open position, every trade, and the desk's memory
   - `ledger/<COIN>/kills.json`: that account's kill switches. Create or edit it on that branch, e.g. `ledger/SOL/kills.json` with `{"entry_kill": true}`.
-- **The board** for your phone is published to GitHub Pages every run: **https://kendallcoding202.github.io/btc-perp-desk/** (open a coin directly with `#ETH` or `#SOL`). It is read-only; kill switches go through `kills.json`.
-  - Tabs at the top switch coins and show all three balances, plus the total.
+  - `ledger/VT/paper.json`: the VT basket's cash, its three positions, every fill and closed position. VT has no kill switches.
+- **The board** for your phone is published to GitHub Pages every run: **https://kendallcoding202.github.io/btc-perp-desk/** (open an account directly with `#ETH`, `#SOL` or `#VT`). It is read-only; kill switches go through `kills.json`.
+  - Tabs at the top switch accounts and show all four balances, plus the total.
   - **Between runs, your browser pulls prices straight from Hyperliquid every 5 seconds.** The price, open-position P&L, balance and the candle that's still forming move live. Decisions, fills and the record change only when the desk runs: every 2h candle close, picked up within 15 minutes.
 - **Locally:** `python -m desk paper` runs the same step every minute, with a live board and working kill buttons at http://127.0.0.1:8787. Don't run it against the same ledger as the Action, or the two will diverge.
 
@@ -96,7 +98,52 @@ Fills follow the backtest's rules exactly (a test enforces it):
 
 Each `step` processes whatever has closed since the last run, so a missed run never loses or double-counts a candle.
 
-**Phone notifications:** set `NTFY_TOPIC`, install the [ntfy](https://ntfy.sh) app, and subscribe to the same topic. You'll get a push for every buy, sell, stop, or halt.
+**Phone notifications:** set `NTFY_TOPIC`, install the [ntfy](https://ntfy.sh) app, and subscribe to the same topic. You'll get a push for every buy, sell, stop, or halt, and for every VT fill (bought, added, trimmed, sold).
+
+## VT: the vol-trend basket (a 4th paper account)
+
+**A paper experiment. It has no live mode, and `python -m desk live` won't take it.** It's a separate $500 account on the same Hyperliquid prices, saved and published with the others.
+
+**What it does.** One account holds three sleeves, BTC, ETH and SOL, a third of the book each. Once a day, at the 00:00 UTC daily close, each coin gets a size:
+- **Trend:** a coin is held only while its close is above its 50-day average. Below it, the sleeve goes to cash.
+- **Size:** 0.40 ÷ the coin's 10-day volatility (annualised), at most 2 "units". One unit is 0.65 ÷ 3 of the account, so a calm coin gets more and a wild one less.
+- **Band:** the size only changes when the new one is more than 25% away from what's held. Entries and exits always go through.
+- **Fills:** at the next daily open, with the same fees, slippage and funding as the desk. Long only, no stops.
+
+The numbers live in `thresholds.VolTrend` and are frozen. `desk/voltrend.py` is the only code that trades them, for both the backtest and the paper ledger, and a test holds the two equal.
+
+**Why it was added.** The October 2026 edge hunt ([`research/edge-hunt-2026-10/`](research/edge-hunt-2026-10/), write-up in [`reports/edge-hunt-2026-10.md`](reports/edge-hunt-2026-10.md)) tested well over a thousand variants against a pass bar written down before any result was seen: settings chosen on 2020–23 only, then judged once on 2024-01 → 2026-09. This one passed, and then two independent skeptics re-checked it (a code review for look-ahead, cost and data errors, and a re-implementation from the rules alone). Most of the other ideas failed or are still waiting for evidence.
+
+**What the backtest says** ([`reports/backtest-VT.md`](reports/backtest-VT.md), Binance perp daily bars, $500 start, the $10 minimum on):
+
+| | VT | Buy & hold, a third each |
+|---|---|---|
+| 2020-01 → 2026-09 | **+519%** (+31%/yr), Sharpe 1.41, worst drop 26% | +2,210%, Sharpe 0.99, worst drop 88% |
+| 2020–23 (where the rules were chosen) | +275%, Sharpe 1.84 | +1,746%, Sharpe 1.30 |
+| 2024-01 → 2026-09 (out-of-sample) | **+65%, Sharpe 0.90**, worst drop 22% | +44%, Sharpe 0.52, worst drop 62% |
+
+By year: 2020 +41% · 2021 +77% · **2022 −17%** · 2023 +81% · 2024 +19% · 2025 +18% · 2026 so far +18%.
+
+**What to expect.** Something modest:
+- **Expect less than the backtest.** The skeptics expect a Sharpe nearer 0.5–0.7 than 0.90. The board labels it as an experiment for that reason.
+- **It loses in long bear markets.** In 2022 it lost 17% (holding the three coins lost 75%). 26 of the 28 positions it closed that year lost money: rallies inside the falling market pulled it back in, then failed.
+- **Its edge over simply holding the coins isn't proven.** It beat buy & hold since 2024 on return, Sharpe and drawdown, but that is one stretch of under three years, and it mostly works as a slow trend filter: in the market for the rallies, out for most of the falls. A few big rally days carry much of the result: since 2024, without its 5 best days the +65% becomes +9%.
+- **It moves with the desk more than against it.** Daily-return correlation with the three desk accounts is 0.51 since 2020 and 0.60 since 2024. It spreads the risk a little; it doesn't hedge it.
+
+**Why $500.** Hyperliquid won't take an order under $10, and VT's orders are small: from every historical order, a new position is about 0.14× the account and a resize about 0.06×. The table shows fresh accounts opened on 2024-01-01 with the minimum on (orders blocked = entries and resizes it skipped):
+
+| start | orders blocked since 2024 | return | Sharpe |
+|---|---|---|---|
+| $50 | 351 (most ETH and SOL orders: 115 of 141 and 171 of 200) | +91% | 1.14 |
+| $150 | 52 | +69% | 0.95 |
+| $250 | 28 | +63% | 0.89 |
+| **$500** | **3** | **+62%** | **0.87** |
+| $1,000 | 0 | +62% | 0.87 |
+| no minimum | 0 | +62% | 0.87 |
+
+$500 trades almost exactly the tested strategy, and $250 is close. The $50 account looks better only because the minimum keeps it out of most of its trades: that result is luck, not the strategy. The research simulation counted more blocked orders (4, 30 and 417) because it applied the 25% band to one continuous series instead of the sizes actually held; the report explains the difference. The start size is `thresholds.VolTrend.starting_equity`; it's yours to change before the account opens.
+
+**On the board** (`#VT`), the VT tab shows the bank, P&L, goal and equity curve like the others, and instead of the price chart a holdings table: for each coin, how far its last close is above or below its 50-day average, its 10-day vol, the target and held sizes, what's held and its unrealised P&L. It also shows when the next decision is (every 00:00 UTC). Between runs, the bank and P&L move live with Hyperliquid's prices.
 
 ## Kill switches
 
@@ -110,6 +157,8 @@ Each `step` processes whatever has closed since the last run, so a missed run ne
 | cooldown (auto) | 5 losers in a row → sit out 6 candles |
 
 ## Going live (only after paper earns it)
+
+This is for the BTC, ETH and SOL desk accounts only. VT has no live mode.
 
 `python -m desk live --max-notional 50` refuses to start unless **all** of these hold:
 1. That coin's backtest report (`reports/backtest.json` for BTC, `reports/backtest-ETH.json`, `reports/backtest-SOL.json`) passes the go-live gate: 3+ years, profitable out-of-sample with profit factor ≥ 1.15, max drawdown ≤ 35%, never halted.
@@ -130,10 +179,11 @@ desk/filter.py       the gate order: kills → data → hard → scan → soft �
 desk/engine.py       the desk (CHIEF + RISK); identical in backtest, paper and live
 desk/backtest.py     replay with costs; in/out-of-sample, per-year, go-live gate
 desk/research.py     sensitivity, ablation, take-profit, sizing, cost and Jev tables
-desk/paper.py        the paper ledger step (one ledger per coin under ledger/<COIN>/)
+desk/voltrend.py     the VT basket: its rule, its book, and its backtest (one code path for backtest and paper)
+desk/paper.py        the paper ledger step (one ledger per account under ledger/<COIN>/, VT's in ledger/VT/)
 desk/jev.py          TypeSafe Jev client (POST api.typesafe.ai/v1/systemone)
 desk/brokers/        sim.py (backtest + paper), live.py (ccxt)
 desk/feeds/          hyperliquid.py (live), binance_vision.py (history)
-desk/board.py        state → dashboard JSON (agent cards, bubbles, gates, thresholds)
+desk/board.py        state → dashboard JSON (agent cards, bubbles, gates, thresholds; the VT holdings)
 dashboard/           the board: no build step, phone-friendly
 ```
