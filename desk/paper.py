@@ -27,7 +27,7 @@ from . import voltrend
 from .brokers.sim import SimBroker
 from .engine import Desk, Kills
 from .filter import evaluate_entry
-from .thresholds import VOLTREND, Params, VolTrend, report_name
+from .thresholds import VOLTREND, Params, VolTrend
 
 LOOKBACK_BARS = 1500
 FUNDING_WINDOW_MS = 4 * 86400_000
@@ -143,12 +143,9 @@ def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=
     meta["last_run_ts"] = now
     _write(lpath, {"meta": meta, "broker": broker.to_dict(), "desk": desk.to_dict()})
 
-    goal_cagr = None
-    rep = Path(f"reports/{report_name(p.market.symbol)}.json")
-    if rep.exists():
-        goal_cagr = json.loads(rep.read_text()).get("full", {}).get("cagr")
     state = board_mod.build(desk, f, len(f.bars) - 1, mode="paper", ctx=ctx, jev_client=jev, now_ms=now,
-                            goal_cagr=goal_cagr, elapsed_days=(now - meta["started_ts"]) / 86400_000, crawler={
+                            goal_pace=board_mod.report_pace(p.market.symbol),
+                            elapsed_days=(now - meta["started_ts"]) / 86400_000, crawler={
                                 "source": f"hyperliquid · {p.market.interval}", "funding_prints": len(funding),
                                 "requests": feed.requests, "latency_ms": feed.last_latency_ms,
                                 "age_s": (now - (f.bars[-1].ts + f.bar_ms)) / 1000})
@@ -253,11 +250,8 @@ def step_basket(vt: VolTrend = VOLTREND, ledger_dir: str | Path = "ledger/VT", f
     # Stored under "broker" like the desk's ledgers: the workflow's commit message reads broker.cash from each one.
     _write(lpath, {"meta": meta, "broker": book.to_dict()})
 
-    goal_cagr = None
-    rep = Path(f"reports/{report_name('VT')}.json")
-    if rep.exists():
-        goal_cagr = json.loads(rep.read_text()).get("full", {}).get("cagr")
-    state = board_mod.basket(book, marks=marks, now_ms=now, meta=meta, goal_cagr=goal_cagr, preview=preview, crawler={
+    state = board_mod.basket(book, marks=marks, now_ms=now, meta=meta, goal_pace=board_mod.report_pace("VT"),
+                             preview=preview, crawler={
         "source": f"hyperliquid · {vt.interval}", "bars": sum(len(v) for v in closed.values()),
         "requests": sum(getattr(f, "requests", 0) for f in feeds.values()),
         "latency_ms": max((getattr(f, "last_latency_ms", 0.0) for f in feeds.values()), default=0.0),

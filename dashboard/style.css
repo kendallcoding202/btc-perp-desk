@@ -159,6 +159,7 @@ body.kind-basket .analysis-body { grid-template-columns: minmax(0, 1fr); }
 .goal-line { display: flex; justify-content: space-between; font-family: var(--pixel); font-size: 11px; color: var(--muted); }
 .goal .bar { height: 6px; } .goal .bar i { background: linear-gradient(90deg, var(--pink), var(--green)); }
 .goal-note { font-size: 10.5px; color: var(--muted); text-align: right; }
+.goal-note span { white-space: nowrap; }
 
 /* bottom */
 .bottom { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; }

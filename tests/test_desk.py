@@ -772,6 +772,59 @@ def test_vt_board_has_what_the_dashboard_draws(tmp_path):
     assert remarked == pytest.approx(book.equity(mids)) and remarked != pytest.approx(s["ticker"]["bank"])
 
 
+def test_every_board_projects_the_goal_at_its_out_of_sample_pace(tmp_path, monkeypatch):
+    """The balance panel's years to the goal are at the backtest's out-of-sample pace (2024 on), with that period's
+    dates, not the full period's: it includes the years the settings were picked on, so it flatters (BTC +50.5%/yr
+    over the full period, +28.2%/yr out of sample). Every account's board: the desk's, the VT basket's, replay's."""
+    from desk import board, runner
+    from desk.thresholds import report_name
+
+    root = Path(__file__).resolve().parents[1]
+    monkeypatch.chdir(root)                      # the steps read reports/ from the repo root, as the workflow does
+    for acc in ("BTC", "ETH", "SOL", "VT"):
+        rep = json.loads((root / "reports" / f"{report_name(acc)}.json").read_text())
+        oos = rep["out_of_sample"]
+        assert board.report_pace(acc) == {"cagr": oos["cagr"], "from": oos["from"], "to": oos["to"]} != rep["full"]["cagr"]
+    assert board.report_pace("BTC")["cagr"] == pytest.approx(0.2817, abs=1e-4)
+    assert board.report_pace("BTC", tmp_path) is None and board.oos_pace({"out_of_sample": {}}) is None
+    g = board.goal(150.0, 150.0, 100_000.0, {"cagr": 0.25, "from": "2024-01-19", "to": "2026-10-01"}, 40)
+    assert g["test_cagr"] == 0.25 and g["years_at_test_rate"] == pytest.approx(math.log(100_000 / 150) / math.log(1.25))
+    assert (g["test_from"], g["test_to"]) == ("2024-01-19", "2026-10-01") and "backtest_cagr" not in g
+    assert board.goal(150.0, 150.0, 100_000.0, None, 40)["years_at_test_rate"] is None
+
+    monkeypatch.setattr(paper, "LOOKBACK_BARS", 10 ** 6)
+    bars, funding = series(seed=5, n=400, start=150.0)
+    p = P.with_(market={"symbol": "ETH"}, hard={"max_data_age_bars": 1e9})
+    paper.step(p, tmp_path / "ETH", feed=FakeFeed(bars, funding, 350), log=lambda *a: None, now_ms=bars[350].ts + H4 // 2)
+    vt_series, vt_funding = _vt_market()
+    clock = {"now": vt_series["BTC"][0].ts + 120 * DAY + DAY // 2}
+    feeds = {c: FakeDailyFeed(vt_series[c], vt_funding[c], clock) for c in vt_series}
+    paper.step_basket(VOLTREND, tmp_path / "VT", feeds=feeds, log=lambda *a: None, now_ms=clock["now"])
+    for acc in ("ETH", "VT"):
+        g, pace = json.loads((tmp_path / acc / "board.json").read_text())["goal"], board.report_pace(acc)
+        assert (g["test_cagr"], g["test_from"], g["test_to"]) == (pace["cagr"], pace["from"], pace["to"])
+        assert g["years_at_test_rate"] > 0
+
+    states = []                                  # replay: the pace of the history it replays, out of sample
+
+    class Recorder:
+        def __init__(self, path):
+            pass
+
+        def set(self, state):
+            states.append(state)
+
+    monkeypatch.setattr(runner, "Board", Recorder)
+    monkeypatch.setattr(runner, "serve", lambda *a, **k: None)
+    monkeypatch.setattr(runner.time, "sleep", lambda s: None)
+    rp = P.with_(hard={"max_data_age_bars": 1e9})
+    bars, funding = series(seed=3, drift=0.002, n=2500)      # 14 months: the last 40% is long enough for a CAGR
+    runner.replay(bars, funding, rp, start_index=len(bars) - 1, loop=False, log=lambda *a: None)
+    oos = bt.summarize(bt.run(bars, funding, rp))["out_of_sample"]
+    assert oos["cagr"] is not None and len(states) == 1
+    assert (states[0]["goal"]["test_cagr"], states[0]["goal"]["test_to"]) == (oos["cagr"], oos["to"])
+
+
 def test_step_runs_vt_and_one_failure_never_stops_the_others(tmp_path, monkeypatch):
     import argparse
     import time as time_mod
