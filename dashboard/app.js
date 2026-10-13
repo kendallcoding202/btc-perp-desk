@@ -304,8 +304,8 @@
     const liveTag = live.at ? `<span class="live-dot" aria-hidden="true"></span>LIVE · ` : "";
     $("ticker").innerHTML = `‹ ${liveTag}TRADES · ${esc(coin)} ${px(t.price)} · BANK ${usd(t.bank)} · ` +
       `<span class="hl">${esc(t.position)}${t.position_detail ? " " + esc(t.position_detail) : ""}</span>` +
-      ` · ${esc(t.record)} · HOLD ${pct(t.hold_pct)} · ${pnlTag(s)} · FEES ${usd(t.fees)} · FUNDING ${usd(t.funding)}`;
-    $("chart-title").textContent = `${coin}-PERP · ${s.header.interval} · ${px(t.price)}`;
+      ` · ${esc(t.record)} · HOLD ${pct(t.hold_pct)} · ${pnlTag(s)} · FEES ${usd(t.fees)}${s.venue ? " (EST.)" : ""} · FUNDING ${s.venue ? "(EST.) " : ""}${usd(t.funding)}`;
+    $("chart-title").textContent = `${s.venue ? s.venue.product : coin + "-PERP"} · ${s.header.interval} · ${px(t.price)}`;
     $("chart-sub").textContent = `24h ${pct(t.change_24h)} · ema.fast pink · ema.slow blue · channel dashed`;
     const chips = $("chips");
     chips.innerHTML = s.agents.map((a) => `<span class="chip ${a.state === "idle" ? "off" : ""}" title="${esc(a.name)}: ${esc(a.state)}"
@@ -369,9 +369,16 @@
     const st = s.analysis.stats, basket = s.header.kind === "basket", t = s.ticker;
     $("analysis-title").textContent = basket ? "BASKET · ANALYSIS" : "DESK · ANALYSIS";
     $("scanned").textContent = `${s.analysis.scanned.toLocaleString("en-US")} ${basket ? "DAILY CLOSES DECIDED" : "BARS SCANNED"}`;
+    const v = s.venue;   // BTC on Coinbase: whole contracts, its margin, funding estimated from logged rates
     const cells = basket ? [
       ["$" + s.header.coin, "basket", "sym"], ["Cash", usd(t.cash)], ["Held", usd(t.notional)],
       ["Exposure", `${num(t.exposure)}x`], ["Unrealised", usd(t.unrealised)], ["Fees", usd(t.fees)], ["Funding", usd(t.funding)],
+    ] : v ? [
+      ["$" + (s.header.coin || "BTC"), "perp · " + s.header.venue, "sym"], ["Price", px(st.price)],
+      [`Contracts · ${v.contract_size} ${s.header.coin || "BTC"}`, String(v.contracts)],
+      [`Margin · ${(v.margin_rate * 100).toFixed(1)}% o/n`, v.contracts ? usd(v.margin_in_use, 0) : "none"],
+      ["Funding APR (est.)", `${num(st.funding_apr, 1)}%`], ["ATR", `${num(st.atr_pct)}%`],
+      ["Spread", st.spread_bps == null ? "—" : `${num(st.spread_bps, 2)} bps`],
     ] : [
       ["$" + (s.header.coin || "BTC"), "perp · " + s.header.venue, "sym"], ["Price", px(st.price)], ["24h", pct(st.change_24h)],
       ["ATR", `${num(st.atr_pct)}%`], ["Funding APR", `${num(st.funding_apr, 1)}%`],
@@ -383,7 +390,12 @@
     const olHead = s.analysis.outlook_side === "short"
       ? `SHORT LINE · a 2h close below it shorts; steps up as old lows age out (if ${esc(s.header.coin || "BTC")} makes no new low)`
       : `BUY LINE · steps down as old highs age out (if ${esc(s.header.coin || "BTC")} makes no new high)`;
-    $("outlook").innerHTML = (s.header.experiment ? `<div class="ol-exp">EXPERIMENT · ${esc(s.header.experiment)}</div>` : "") +
+    const nc = v && v.session.next_closure, sk = v && v.skipping;
+    const venueLine = v ? `<div class="ol-exp">${esc(v.display)} RULES · whole ${v.contract_size} BTC contracts (one is ${usd(v.one_contract_usd, 0)}), ` +
+      `≤${v.max_leverage}x, overnight margin ${(v.margin_rate * 100).toFixed(1)}% · fees est. ${esc(v.fee_estimate)} · funding est. from ${v.funding.logged} logged hourly rates` +
+      (nc ? ` · ${v.session.open === false ? "CLOSED NOW" : "next closure"} ${esc(nc.why)} ${day(nc.start)}–${hhmm(nc.end)} UTC` : "") +
+      (sk ? ` · <b>SKIPPING: ${esc(sk.note)}</b>` : "") + `</div>` : "";
+    $("outlook").innerHTML = venueLine + (s.header.experiment ? `<div class="ol-exp">EXPERIMENT · ${esc(s.header.experiment)}</div>` : "") +
       (ol.length ? `<div class="ol-head">${olHead}</div>` +
       `<div class="ol-rows">` + ol.map((r, k) => `<div class="${k === 0 ? "now" : ""}"><span>${k === 0 ? "next close" : day(r.ts) + " UTC"}</span>` +
       `<b>${px(r.level)}</b><i>${pct(r.level / st.price - 1, 1)}</i></div>`).join("") + `</div>` : "");
@@ -587,7 +599,7 @@
       }
       start += c.start; bank += b; net += c.net_flows || 0;
       const label = basket ? (c.holdings || []).map((h) => h.coin).join("·") : lp ? px(lp) : px(c.price);
-      const sub = basket ? " · basket" : ` · risk ${(c.risk_per_trade * 100).toFixed(0)}%${c.shorts ? " · +shorts" : ""}`;
+      const sub = basket ? " · basket" : ` · risk ${(c.risk_per_trade * 100).toFixed(0)}%${c.shorts ? " · +shorts" : ""}${c.venue ? ` · ${esc(c.venue)}` : ""}`;
       return `<button class="coin ${c.coin === coin ? "on" : ""}" data-coin="${esc(c.coin)}" aria-pressed="${c.coin === coin}">` +
         `<span class="c-name">${esc(c.coin)}<i>${esc(label)}</i></span><span class="c-bank">${usd(b)}</span>` +
         `<span class="c-sub">${c.units ? `${pct(b / c.units - 1)} perf · P&amp;L ${usd(b - c.start - c.net_flows, 0)}` : pct(b / c.start - 1)} · ${esc(c.position)} · ${esc(c.record)}${sub}</span></button>`;
@@ -644,7 +656,8 @@
     renderKills(s.kills);
     const age = Math.round((Date.now() - s.updated) / 60000);
     $("foot").textContent = `desk updated ${new Date(s.updated).toISOString().replace("T", " ").slice(0, 16)} UTC (${age} min ago)` +
-      (live.at ? ` · live price ${Math.round((Date.now() - live.at) / 1000)}s ago from Hyperliquid` : "") +
+      (live.at ? ` · live price ${Math.round((Date.now() - live.at) / 1000)}s ago from Hyperliquid` +
+        (s.venue ? ` (a proxy: a browser can't read Coinbase's; the desk marks at Coinbase's price every run)` : "") : "") +
       (missing ? ` · no ${missing} board this run (its step failed), showing ${hdr.coin || "BTC"}` : "") +
       ` · not financial advice; the desk can and will lose money`;
     if (staticMode) {
