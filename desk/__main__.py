@@ -313,13 +313,30 @@ def cmd_reset_halt(args) -> int:
             print("  state/ still holds live files from before they were kept per coin: move them into "
                   "state/<COIN>/ for the coin they belong to (see README, Going live)")
         return 1
-    d = json.loads(path.read_text())
-    holder = d["desk"] if args.mode == "paper" else d
-    risk = holder.get("risk", {})
-    print(f"  {coin} halted: {risk.get('halted')} — {risk.get('halt_reason') or 'n/a'}")
-    risk.update({"halted": False, "halt_reason": "", "peak_equity": 0.0})
-    holder["risk"] = risk
-    path.write_text(json.dumps(d))
+    held = None
+    if args.mode == "live":
+        # A running live process rewrites its desk file from memory every check, so a reset made under it is lost
+        # at the next one. Its lock says whether it is running; hold it while resetting.
+        from .brokers.live import LiveSetupError
+        from .runner import _lock
+
+        try:
+            held = _lock(live_paths("state", coin)["lock"])
+        except LiveSetupError:
+            print(f"  {coin}'s live process is running: it rewrites {path} at every check, so a reset now would be "
+                  f"undone. Stop it first, then reset the halt.")
+            return 2
+    try:
+        d = json.loads(path.read_text())
+        holder = d["desk"] if args.mode == "paper" else d
+        risk = holder.get("risk", {})
+        print(f"  {coin} halted: {risk.get('halted')} — {risk.get('halt_reason') or 'n/a'}")
+        risk.update({"halted": False, "halt_reason": "", "peak_equity": 0.0})
+        holder["risk"] = risk
+        path.write_text(json.dumps(d))
+    finally:
+        if held is not None:
+            held.close()
     print("  halt cleared; peak equity resets to current equity on the next bar.")
     return 0
 

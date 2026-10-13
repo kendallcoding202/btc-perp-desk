@@ -1207,3 +1207,25 @@ def test_stops_placed_while_their_read_back_failed_dont_pile_up(tmp_path):
         b.check_stop_price(82_000.0, T0 + 60_000 * (k + 1))
     stops = ex.fetch_open_orders("BTC/USDC:USDC")
     assert [(o["triggerPrice"], o["amount"]) for o in stops] == [(81_000.0, 0.005)] and b.stop_order_id == stops[0]["id"]
+
+
+def test_reset_halt_for_live_refuses_while_that_coins_live_process_runs(tmp_path, monkeypatch, capsys):
+    """reset-halt used to print 'halt cleared' under a running live process, which wrote the halt straight back at
+    its next check: the operator was told the desk could trade when it couldn't."""
+    import argparse
+
+    from desk import __main__ as cli
+
+    monkeypatch.chdir(tmp_path)
+    halted = {"risk": {"halted": True, "halt_reason": "test", "peak_equity": 1.0}, "meta": {}}
+    paths = runner.live_paths("state", "BTC")
+    paths["dir"].mkdir(parents=True)
+    paths["desk"].write_text(json.dumps(halted))
+    running = runner._lock(paths["lock"])                 # what `live --coin BTC` holds while it runs
+    assert cli.cmd_reset_halt(argparse.Namespace(mode="live", coin="BTC")) == 2
+    assert "Stop it first" in capsys.readouterr().out
+    assert json.loads(paths["desk"].read_text())["risk"]["halted"] is True
+    running.close()                                        # stopped: now the reset goes through
+    assert cli.cmd_reset_halt(argparse.Namespace(mode="live", coin="BTC")) == 0
+    assert json.loads(paths["desk"].read_text())["risk"]["halted"] is False
+    runner._lock(paths["lock"]).close()                    # and reset-halt let go of the lock
