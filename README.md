@@ -1,40 +1,41 @@
 # BTC Perp Desk (now BTC · ETH · SOL)
 
-A multi-agent trading desk for **BTC, ETH and SOL perpetual futures** (three separate paper accounts: BTC $500, ETH and SOL $150 each), modelled on the "GROKBOT + JEV" dashboard, with one difference: every number it trades on has been backtested, with fees and funding charged. A fourth paper account, **VT**, runs a different, slower strategy on the same three coins ([below](#vt-the-vol-trend-basket-a-4th-paper-account)).
+A multi-agent trading desk for **BTC, ETH and SOL perpetual futures** (three separate paper accounts: BTC $500, ETH and SOL $150 each), modelled on the "GROKBOT + JEV" dashboard, with one difference: every number it trades on has been backtested, with fees and funding charged. The BTC account simulates **Coinbase's US-regulated BTC perp**, the venue it's planned to trade with real money: whole 0.01 BTC contracts, its margin, sessions and fees ([below](#btc-on-coinbase)). A fourth paper account, **VT**, runs a different, slower strategy on the same three coins ([below](#vt-the-vol-trend-basket-a-4th-paper-account)).
 
 ```
 CHIEF    never takes a position     runs the gates in order, every 2h close
 SCAN     finding what moves         60-bar (5-day) Donchian breakout, 100/400 EMA trend filter
 VET      is the move real           efficiency ratio, volatility band       (asks Jev)
 CROWD    who's on the other side    funding pressure: don't join a crowd paying 50%+ APR (asks Jev)
-SIZE     how much                   5% of equity at risk per trade (aggressive), ≤5x leverage
+SIZE     how much                   5% of equity at risk per trade (aggressive), ≤5x (BTC: whole Coinbase contracts, ≤4x)
 FILLS    execution                  taker in, taker out; fees + slippage always charged
 RISK     the stop                   3 ATR stop, trails every new high, never loosens; kill switches
-CRAWLER  reads first, then trades   Hyperliquid live data; Binance archive for 6+ years of history
+CRAWLER  reads first, then trades   Coinbase (BTC) and Hyperliquid live data; Binance archive for 6+ years of history
 JEV      second opinion             TypeSafe AI's decision model, advisory (see why below)
 ```
 
 > **Not financial advice. This can lose money.** Nothing here is a promise of profit. The results below are what history says. The future doesn't have to agree.
 
-## What the backtest says (2020-01 → 2026-09, BTCUSDT perp, 2h candles, 5% risk per trade)
+## What the backtest says (2020-01 → 2026-09, BTC on Coinbase rules, 2h candles, 5% risk per trade)
 
-Full report with every table: [`reports/backtest.md`](reports/backtest.md). Re-run it any time with `python -m desk backtest --research`.
+Full report with every table: [`reports/backtest.md`](reports/backtest.md). Re-run it any time with `python -m desk backtest --research`. The history is Binance's BTCUSDT perp (Coinbase's BTC perp only listed in July 2025), traded under Coinbase's rules: whole contracts of 0.01 BTC at each candle's price, at most 4x, the overnight margin check, its sessions and an estimate of its fees ([BTC on Coinbase](#btc-on-coinbase)).
 
-| | Desk | Buy & hold BTC |
-|---|---|---|
-| Total return | **+1,475%** ($500 → $7,876) | +1,059% |
-| Per year | +50% | |
-| Worst drop from a peak | **28%** | 77% |
-| Out-of-sample (2024-01 → 2026-09; settings were picked on 2020–23) | +95%, profit factor 1.44 | +103% |
-| Trades | 118 (≈17 a year), 42% winners, avg win 2.4× avg loss | |
+| | Desk, Coinbase rules | Fractional, as before (Hyperliquid) | Buy & hold BTC |
+|---|---|---|---|
+| Total return | **+1,126%** ($500 → $6,128) | +1,475% ($500 → $7,876) | +1,059% |
+| Per year | +45% | +50% | |
+| Worst drop from a peak | **28%** | 28% | 77% |
+| Out-of-sample (2024-01 → 2026-09; settings were picked on 2020–23) | +86% (+26%/yr), profit factor 1.42 | +95%, 1.44 | +103% |
+| Trades | 118 (≈17 a year), 39% winners, avg win 2.6× avg loss | the same 118 | |
 
-By year: 2020 +128% · 2021 +10% · 2022 −5% · 2023 +231% · 2024 +69% · 2025 +33% · **2026 so far −11%**.
+By year: 2020 +103% · 2021 +8% · 2022 −5% · 2023 +210% · 2024 +64% · 2025 +31% · **2026 so far −12%**.
 
 The honest read:
-- **This is the aggressive profile you asked for.** Each trade risks 5% of the account. Leverage is set by the stop distance: a tight setup gets more (median 1.7×, max 4×). The worst losing streak so far was 8 trades in a row. At 2% risk the same strategy made +21%/yr with a 12% worst drop.
+- **This is the aggressive profile you asked for.** Each trade risks up to 5% of the account. Leverage is set by the stop distance: a tight setup gets more (median 1.7×, max 3.8×). The worst losing streak so far was 8 trades in a row. At 2% risk the same strategy made +18%/yr with a 12% worst drop.
+- **Coinbase's rules cost about a quarter of the profit** over the whole history: +1,126% against +1,475% fractional. The report adds them one at a time: Coinbase's fee rate (5 bps against 4.5) cost 32 points (the 4x cap never bound), whole contracts 84, the $0.20-a-contract fee minimum 158 (it binds while BTC is under $40,000: 45 of the 118 trades, 2020–23), and the sessions 76, nearly all from one Friday entry that fell in the weekly break and went a bar later at a worse price (with whole contracts, one trade's difference also changes the sizes of the ones after it). Since 2024 it's +86% against +95%.
 - **The backtest flatters it.** Many variants were tried to get here, and the 2h/5% choice was made after seeing them. 2026 has been a losing year. The paper experiment is the real test.
-- **Whole-period profit isn't the result of one lucky setting.** Every nearby setting tested was profitable, and tripling fees and slippage still leaves it profitable.
-- **$500 → $100,000 is a 200× goal.** At the whole backtest's +50%/yr that's about 13 years, but that pace includes 2020–23, where the settings were picked. At the 2024–26 out-of-sample pace, +28%/yr, it's about 21 years. With the planned $100 a month for 5 years it's about 13 years at that pace (about $13,500 after 5 years, $6,500 of it deposited); at +10%/yr it would be about 31 years. These are backtest paces, not forecasts. The board projects every account at its own backtest's 2024–26 pace ("at 2024–26 backtest pace"), and once an account is 30 days old, at the pace it has actually made too. For ETH and SOL that period is only partly unseen: their 2% risk was picked after seeing ETH's 2024, and ETH's shorts were switched on after missing their own bar ([`reports/edge-hunt-2026-10.md`](reports/edge-hunt-2026-10.md)).
+- **Whole-period profit isn't the result of one lucky setting.** Every nearby setting with the 3 or 4 ATR stop was profitable, and tripling fees and slippage still leaves it profitable. Under Coinbase's rules the 2 ATR stops now lose money: they trade more, and the fee minimum and the rounding take their edge.
+- **$500 → $100,000 is a 200× goal.** At the whole backtest's +45%/yr that's about 14 years, but that pace includes 2020–23, where the settings were picked. At the 2024–26 out-of-sample pace, +26%/yr, it's about 23 years. With the planned $100 a month for 5 years it's about 14 years at that pace; a fresh $500 account opened in 2024 and fed $100 a month only made +22%/yr, time-weighted, because at $500 whole contracts are coarse, and at that pace it's about 16 years (about $11,700 after the 5 years, $6,500 of it deposited). These are backtest paces, not forecasts. The board projects every account at its own backtest's 2024–26 pace ("at 2024–26 backtest pace"), and once an account is 30 days old, at the pace it has actually made too. For ETH and SOL that period is only partly unseen: their 2% risk was picked after seeing ETH's 2024, and ETH's shorts were switched on after missing their own bar ([`reports/edge-hunt-2026-10.md`](reports/edge-hunt-2026-10.md)).
 
 ### ETH and SOL: same desk, smaller bets
 
@@ -72,36 +73,62 @@ python3 -m desk vt-backtest                  # the VT basket: reports/backtest-V
 python3 -m desk replay                       # watch it trade 2024→now at http://127.0.0.1:8787
 python3 -m desk paper                        # a $500 BTC paper account ($150 with --coin ETH or SOL), board at :8787
 python3 -m desk step                         # one step for every account (BTC, ETH, SOL, VT), the way the Action runs it
-python3 -m pytest                            # 184 tests, incl. "paper ledger == backtest" for the desk and for VT,
+python3 -m pytest                            # 217 tests, incl. "paper ledger == backtest" for the desk, for BTC on
+                                             # Coinbase rules and for VT,
                                              # and live mode against a fake exchange (tests/test_live.py)
 ```
 
 ## The paper experiments
 
-**Three desk paper accounts** (BTC $500, ETH and SOL $150 each; $800 in all) trade live Hyperliquid prices, plus the **$500 VT basket** ([below](#vt-the-vol-trend-basket-a-4th-paper-account)). Each account is separate, with its own cash, positions and record; the three desk accounts also have their own kill switches. A GitHub Actions job ([`.github/workflows/paper.yml`](.github/workflows/paper.yml)) runs `python -m desk step` every 15 minutes, so the experiments keep running with no computer on. If one account's step fails (say, a rate-limited API call), the others still run and save, and the failed one catches up next run.
+**Three desk paper accounts** (BTC $500, ETH and SOL $150 each; $800 in all) trade live prices, BTC Coinbase's ([below](#btc-on-coinbase)) and ETH and SOL Hyperliquid's, plus the **$500 VT basket** ([below](#vt-the-vol-trend-basket-a-4th-paper-account)). Each account is separate, with its own cash, positions and record; the three desk accounts also have their own kill switches. A GitHub Actions job ([`.github/workflows/paper.yml`](.github/workflows/paper.yml)) runs `python -m desk step` every 15 minutes, so the experiments keep running with no computer on. If one account's step fails (say, a rate-limited API call), the others still run and save, and the failed one catches up next run.
 
-**Why BTC is $500.** BTC is the account planned for real money first, on Coinbase's US-regulated nano BTC perp (Hyperliquid isn't available in the US). Coinbase trades whole contracts of 0.01 BTC, about $830 at $83,000, with about 21% overnight margin, so a $150 account can't hold even one contract. The paper account mirrors the planned $500 start. It was restarted at $500 on 2026-10-13; the $150 run (opened 2026-10-12, no trades) is kept in `ledger/archive/` on the paper-ledger branch. Its backtest is the same in percentage terms at $500 as at $150: BTC's tickets clear the $10 minimum from about $17 of equity, so no trade changes. The paper account still trades Hyperliquid prices in fractional sizes; whole-contract Coinbase sizing comes with the Coinbase work.
+**Why BTC is $500.** BTC is the account planned for real money first, on Coinbase's US-regulated nano BTC perp (Hyperliquid isn't available in the US). Coinbase trades whole contracts of 0.01 BTC, about $830 at $83,000, with about 21% overnight margin, so a $150 account can't hold even one contract. The paper account mirrors the planned $500 start. It was restarted at $500 on 2026-10-13; the $150 run (opened 2026-10-12, no trades) is kept in `ledger/archive/` on the paper-ledger branch. The BTC paper account now simulates Coinbase's rules, whole contracts included ([BTC on Coinbase](#btc-on-coinbase)); the $500 Hyperliquid run opened that day is refused rather than converted, for you to archive.
 
 **Why $150 for ETH and SOL, not $50.** Hyperliquid won't take an order under $10. The desk's ETH and SOL orders come to about 0.3–0.5× the account (BTC's about 1.7×), so at $50 some of their trades get skipped, and more after a losing streak. From every historical entry: BTC clears $10 on every trade from about $17 of equity; ETH and SOL need about $85–90, so $150 keeps them trading through a 40% drawdown. The accounts were restarted at $150 on 2026-10-12; the $50 runs (opened 10-09 and 10-10) had made no trades, and their ledgers are kept in `ledger/archive/` on the paper-ledger branch. One thing this changed: at $150 SOL takes 13 trades the $50 account had to skip (12 of them in 2021), and 12 of those 13 lost. Skipping them had flattered SOL's old report (+40%, now +16% at $150; 2024 onwards is the same either way).
 
 - **The record** lives on the [`paper-ledger`](../../tree/paper-ledger/ledger) branch, saved whenever something happens, so the history is permanent and public:
-  - `ledger/<COIN>/paper.json` (`BTC`, `ETH`, `SOL`): the account, open position, every trade, and the desk's memory
+  - `ledger/<COIN>/paper.json` (`BTC`, `ETH`, `SOL`): the account, open position, every trade, and the desk's memory. BTC's also says `"venue": "coinbase"` and keeps Coinbase's funding log, margin rates and maintenance windows
   - `ledger/<COIN>/kills.json`: that account's kill switches. Create or edit it on that branch, e.g. `ledger/SOL/kills.json` with `{"entry_kill": true}`.
   - `ledger/VT/paper.json`: the VT basket's cash, its three positions, every fill and closed position, and each coin's last 70 daily candles. A candle missing from one Hyperliquid answer is filled in from those, so the 50-day average never shifts. A candle no answer has had yet is waited for: it's a day with no candle, which that coin sits out as in the backtest, only once two answers have lacked it and it closed 3 days ago. VT has no kill switches.
 - **The board** for your phone is published to GitHub Pages every run: **https://kendallcoding202.github.io/btc-perp-desk/** (open an account directly with `#ETH`, `#SOL` or `#VT`). It is read-only; kill switches go through `kills.json`.
   - Tabs at the top switch accounts and show all four balances, plus the total.
-  - **Between runs, your browser pulls prices straight from Hyperliquid every 5 seconds.** The price, open-position P&L, balance and the candle that's still forming move live. Decisions, fills and the record change only when the desk runs: every 2h candle close, picked up within 15 minutes.
+  - **Between runs, your browser pulls prices straight from Hyperliquid every 5 seconds.** The price, open-position P&L, balance and the candle that's still forming move live. Decisions, fills and the record change only when the desk runs: every 2h candle close, picked up within 15 minutes. The BTC tab uses Hyperliquid's BTC price as a proxy between runs (a browser can't read Coinbase's API); the desk marks it at Coinbase's price at every run.
 - **Locally:** `python -m desk paper` runs the same step every minute, with a live board and working kill buttons at http://127.0.0.1:8787. Don't run it against the same ledger as the Action, or the two will diverge.
 
 Fills follow the backtest's rules exactly (a test enforces it):
 - Decisions are made at each 2h close (every even UTC hour).
 - Entries fill at the next candle's open.
 - Stops are checked against each candle's range as it forms.
-- Funding is charged every hour, as on Hyperliquid.
+- Funding is charged every hour, as on Hyperliquid and Coinbase (BTC: at the nearest rate Coinbase's funding log has, an estimate).
+- BTC trades whole Coinbase contracts, and no entry goes into Coinbase's weekly break or a maintenance window.
 
 Each `step` processes whatever has closed since the last run, so a missed run never loses or double-counts a candle.
 
 **Phone notifications:** set `NTFY_TOPIC`, install the [ntfy](https://ntfy.sh) app, and subscribe to the same topic. You'll get a push for every buy, sell, stop, or halt, and for every VT fill (bought, added, trimmed, sold).
+
+## BTC on Coinbase
+
+The BTC account is planned to trade real money on **Coinbase's US-regulated BTC perp** (Coinbase Financial Markets: "BTC PERP", product `BIP-20DEC30-CDE`, nano BTC perp-style futures; Hyperliquid isn't available in the US). So its paper account and its backtest simulate Coinbase as far as Coinbase's public data allows. The strategy is BTC's as before: the same signals, stop, trailing and exits. These are the venue's rules on top of it, in `desk/venue.py`, with the numbers in `thresholds.COINBASE` (read from Coinbase's public API on 2026-10-13). The backtest and the paper account use the same code, and a test holds them equal on the same candles.
+
+**What's simulated**
+- **Whole contracts of 0.01 BTC.** The desk's risk-based size (5% of the account lost at the stop) is cut down to whole contracts at the candle's price, never rounded up, and at most 4x the account (Coinbase's overnight margin, about 21%, would allow about 4.76x). If that comes to 0 contracts the entry is skipped, and the board and your phone say why, once: `SIZE: skipped — one contract ($832) would risk 7.1% at this stop (budget 5%)`. At $83,000 a contract is about $830, so a $500 account's $25 budget buys one while the stop is within about $2,500 (3%) of the price, and two within 1.5%: at $500 most trades risk less than the 5%, and a wide stop skips the trade. Deposits make the sizes finer.
+- **The overnight margin check.** Equity minus the loss at the stop must cover the contracts' notional × Coinbase's overnight long margin rate (21.025% on 2026-10-13; paper reads it every run and falls back to the last one it saved). If it doesn't, contracts are cut until it does, and with none left the entry is skipped. At 4x and 5% risk it always fits at today's rate.
+- **Sessions.** Coinbase's BTC perp trades around the clock except for a weekly break, Friday 17:00–18:00 New York time (21:00–22:00 UTC in summer, 22:00–23:00 UTC in winter; Coinbase's own 5-minute candles show it), and maintenance windows Coinbase lists ahead (about quarterly, a Saturday; paper records each one it reads, and the ones seen since July 2025 are in `thresholds.COINBASE`). No entry is decided while its fill would fall in a closure, nor while Coinbase says its session is closed. Coinbase has no candles while it's closed, so a stop isn't checked then, and a stop the price gapped through fills at the reopen. The backtest leaves out the Binance candles that fall wholly inside a known window, to match. The weekly hour sits inside one 2h candle, so the backtest can't tell which part of that candle's range traded: it checks the stop against all of it.
+- **Coinbase's own market data** for the paper account: 2h candles (paged 300 at a time to the 1,500 the desk needs), the hourly funding rate, the book (spread, and depth as contracts × 0.01 BTC × price within 10 bps), open interest, margin rates and the session, from Coinbase's public API with no key (`desk/feeds/coinbase.py`). A short, failed or odd answer (a contract size that isn't 0.01 BTC, say) stops BTC's step for that run; the next run catches up.
+
+**What's estimated** (the board labels each one)
+- **Fees.** Coinbase's all-in fee per contract isn't confirmed. The desk charges max($0.20 a contract, 0.05% of the notional) per side, plus the usual 3 bps of slippage: the higher of the two schedules Coinbase has published (2025 marketing says "as low as 0.02%, $0.15 minimum"; an older footnote, 0.05% and $0.20). At $83,000 the 0.05% binds ($0.42 a contract). The minimum bound while BTC was under $40,000 (2020–23 in the backtest). Replace both (`fee_min_per_contract` in `thresholds.COINBASE`, and BTC's `costs.taker_fee_bps`) with the real tier before any real money.
+- **Funding.** Coinbase funds hourly but publishes no funding history. Each paper run writes the current hourly rate to a funding log in the ledger (8 days kept; a run that logs a new hour saves the ledger, so that's about hourly), and each hour is charged the nearest rate the log has. The 3-day funding gate reads the same log. The backtest uses Binance's funding prints as the stand-in.
+- **Stop fills.** Coinbase has no stop-market order: the stop will be a stop-limit. The simulation fills it at the stop (or at the open, gapped through), which is what a stop-limit does when its limit is met. In a fast market a stop-limit can be left unfilled; 2h candles can't show that.
+- **History.** Coinbase's BTC perp listed on 2025-07-18, so the backtest's prices are Binance's BTCUSDT perp's. Fills aren't rounded to Coinbase's $5 tick (under 1 bp).
+
+**What it does to the numbers** ([`reports/backtest.md`](reports/backtest.md)): +1,126% over 2020-01 → 2026-09 against +1,475% fractional, +86% against +95% since 2024 (the table at the top, and the report's waterfall of each rule). The go-live gate still passes.
+
+**The pace to $100,000 with $500 + $100 a month, under Coinbase rules.** The board projects BTC at its backtest's 2024–26 out-of-sample pace, +26%/yr: with the planned $100 a month for 5 years, about 14 years. A fresh $500 account opened 2024-01-01 with $100 put in each month (as the paper account will get them) did worse, because at $500 whole contracts are coarse: +22%/yr time-weighted (fractional sizing from the same start: +28%/yr), $4,442 by 2026-10 with $3,700 put in. At that pace the plan reaches $100,000 in about 16 years, about $11,700 after the 5 years ($6,500 of it deposited). Backtest paces, not forecasts.
+
+**The old Hyperliquid BTC ledger is refused, never converted.** A BTC ledger whose meta doesn't say `coinbase` (the $500 Hyperliquid run opened 2026-10-13) stops BTC's step with `LedgerRefused`, before any request: the Actions run fails, the board shows why above the tabs (no BTC board is published while it lasts), your phone gets it every 6 hours, and ETH, SOL and VT keep running. To archive it, on the `paper-ledger` branch move `ledger/BTC/paper.json` to `ledger/archive/BTC-hyperliquid-500usd-from-2026-10-13.json`, as the earlier runs were archived. The next run opens a fresh $500 Coinbase account (`"venue": "coinbase"` in its meta), and the save step's guard lets it in because there's no BTC ledger left to replace.
+
+**On the board** the BTC tab is titled `COINBASE · BTC PERP (0.01 BTC contracts)`. It shows the contracts held and the margin they use, the funding (est.) and fees (est.), the next closure, and any entry the venue is skipping, with why. Its events say fills in contracts (`BOUGHT 2 contracts (0.02 BTC) @ ...`).
 
 ## VT: the vol-trend basket (a 4th paper account)
 
@@ -214,7 +241,7 @@ The next run (within about 15 minutes) records it once its date has come, at 00:
 The step checks the file strictly and never guesses:
 - A mistake in one account's section stops that account's step until you fix it; the other accounts keep running. If the file isn't valid JSON at all, or names an account that doesn't exist, every account waits. Each paused account's error is shown above the board on GitHub Pages (its own board isn't published while it's paused, so the page shows another account's), the Actions run fails, and with `NTFY_TOPIC` set your phone gets `BTC paused: deposits.json` with the message: at the first run after the edit, then every 6 hours until it's fixed. Each step then catches up every missed candle, so no trading is lost.
 - **Never edit or delete an entry that's already been recorded** (its date has passed). Fix a mistake with another `extra`; a negative one takes money back out. A recorded entry that's changed or missing stops that account until it's put back as it was. Add new extras at the end of the list: two on the same date are told apart by their order.
-- **A withdrawal the open position still needs waits**, as an exchange holds back the margin a position uses: the realised balance must stay above $0 and the position within the account's maximum leverage (5x; VT: the most its rules ever hold) of what's left. The board and your phone say so once (`WITHDRAWAL $1,000.00 waiting ...`); it goes out at the first bar open where it fits, usually once the position has closed. Entries dated after it wait with it. A withdrawal bigger than the whole account stops the step.
+- **A withdrawal the open position still needs waits**, as an exchange holds back the margin a position uses: the realised balance must stay above $0 and the position within the account's maximum leverage (5x; BTC on Coinbase 4x; VT: the most its rules ever hold) of what's left. The board and your phone say so once (`WITHDRAWAL $1,000.00 waiting ...`); it goes out at the first bar open where it fits, usually once the position has closed. Entries dated after it wait with it. A withdrawal bigger than the whole account stops the step.
 
 **How it's counted.** Like a fund: the account starts with one unit per dollar, and a deposit buys units at what a unit is worth at that moment (a withdrawal sells them). So:
 - **The performance %** is the units' value, time-weighted: a deposit or a withdrawal never moves it. Once an account has had one, the board's ticker shows it as `PERF +x% TIME-WEIGHTED` next to the dollar P&L (the two can differ a lot: $100 a month into a small account), each tab shows `+x% perf · P&L $y`, and your phone says `(+x% time-weighted)`.
@@ -250,6 +277,8 @@ This is for the BTC, ETH and SOL desk accounts only. VT has no live mode.
 4. You set a hard per-position dollar cap with `--max-notional`.
 
 `--force-unproven` overrides 1 and 2: it prints a warning and carries on. 3 and 4 always hold. Don't use it.
+
+**BTC can't go live yet.** Its account is set up for Coinbase, and the live broker only trades Hyperliquid (and the ccxt venues below), so `python -m desk live --coin BTC` refuses and says why. Live on Coinbase needs its own work: ccxt 4.5.85's Coinbase futures support has gaps the October 2026 research found (stop-market orders are unsupported, and its futures positions, balances and reduce-only closes don't work as the live broker needs), and the fee estimate needs the real fee tier.
 
 It also refuses to start if:
 - a credential is missing, or the account reads $0. On Hyperliquid, `HL_WALLET_ADDRESS` is the account the API wallet was approved for, never the API wallet's own address.
@@ -299,8 +328,9 @@ desk/research.py     sensitivity, ablation, take-profit, sizing, cost and Jev ta
 desk/voltrend.py     the VT basket: its rule, its book, and its backtest (one code path for backtest and paper)
 desk/paper.py        the paper ledger step (one ledger per account under ledger/<COIN>/, VT's in ledger/VT/)
 desk/jev.py          TypeSafe Jev client (POST api.typesafe.ai/v1/systemone)
-desk/brokers/        sim.py (backtest + paper), live.py (ccxt)
-desk/feeds/          hyperliquid.py (live), binance_vision.py (history)
+desk/venue.py        a venue's own rules (BTC on Coinbase): whole contracts, margin, sessions, fees, the funding log
+desk/brokers/        sim.py (backtest + paper; VenueSimBroker for a venue's fees), live.py (ccxt)
+desk/feeds/          hyperliquid.py (live), coinbase.py (live, BTC), binance_vision.py (history)
 desk/board.py        state → dashboard JSON (agent cards, bubbles, gates, thresholds; the VT holdings)
 dashboard/           the board: no build step, phone-friendly
 dashboard/spider.js  the walking CRAWLER: visits whatever the desk just did (gate cards in the order the desk

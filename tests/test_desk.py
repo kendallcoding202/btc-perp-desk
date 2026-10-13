@@ -946,8 +946,9 @@ def test_vt_board_has_what_the_dashboard_draws(tmp_path):
 
 def test_every_board_projects_the_goal_at_its_out_of_sample_pace(tmp_path, monkeypatch):
     """The balance panel's years to the goal are at the backtest's out-of-sample pace (2024 on), with that period's
-    dates, not the full period's: it includes the years the settings were picked on, so it flatters (BTC +50.5%/yr
-    over the full period, +28.2%/yr out of sample). Every account's board: the desk's, the VT basket's, replay's."""
+    dates, not the full period's: it includes the years the settings were picked on, so it flatters (BTC on Coinbase
+    rules +45.0%/yr over the full period, +25.8%/yr out of sample). Every account's board: the desk's, the VT basket's,
+    replay's."""
     from desk import board, runner
     from desk.thresholds import report_name
 
@@ -957,7 +958,7 @@ def test_every_board_projects_the_goal_at_its_out_of_sample_pace(tmp_path, monke
         rep = json.loads((root / "reports" / f"{report_name(acc)}.json").read_text())
         oos = rep["out_of_sample"]
         assert board.report_pace(acc) == {"cagr": oos["cagr"], "from": oos["from"], "to": oos["to"]} != rep["full"]["cagr"]
-    assert board.report_pace("BTC")["cagr"] == pytest.approx(0.2817, abs=1e-4)
+    assert board.report_pace("BTC")["cagr"] == pytest.approx(0.2580, abs=1e-4)      # under Coinbase's rules
     assert board.report_pace("BTC", tmp_path) is None and board.oos_pace({"out_of_sample": {}}) is None
     g = board.goal(150.0, 150.0, 100_000.0, {"cagr": 0.25, "from": "2024-01-19", "to": "2026-10-01"}, 40)
     assert g["test_cagr"] == 0.25 and g["years_at_test_rate"] == pytest.approx(math.log(100_000 / 150) / math.log(1.25))

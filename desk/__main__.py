@@ -20,7 +20,8 @@ import sys
 from pathlib import Path
 
 from . import backtest as bt
-from .thresholds import ACCOUNTS, COINS, DEFAULT, EXPERIMENTS, VOLTREND, Params, params_for, report_name
+from .thresholds import (ACCOUNTS, COINS, DEFAULT, EXPERIMENTS, VOLTREND, Params, params_for, report_name,
+                         venue_for)
 
 
 def _load_env(path: str = ".env") -> None:
@@ -78,6 +79,16 @@ def cmd_backtest(args) -> int:
     r = bt.run(bars, funding, p, jev=jev)
     s = bt.summarize(r)
     extra = ""
+    if venue_for(p) is not None:    # BTC on Coinbase: what the rules cost against fractional sizing, and the pace
+        cmp_md, s["comparison"] = bt.venue_comparison(bars, funding, p, s)
+        pace_md, s["pace"] = bt.pace(bars, funding, p, oos_cagr=s["out_of_sample"].get("cagr"))
+        extra = cmp_md + "\n\n" + pace_md
+        print(f"  coinbase rules vs fractional: " + " · ".join(
+            f"{k} {v['return']:+.1%}" for k, v in s["comparison"].items()))
+        yt = s["pace"]["years_to_target"]
+        print(f"  fresh ${p.sizing.starting_equity:,.0f} + $100/mo from {s['pace']['start']}: "
+              f"{bt._pct(s['pace']['cagr'])}/yr time-weighted, $100k in "
+              + (f"{yt:.1f} years" if yt else "never"))
     if args.research:
         from . import research
 
@@ -90,7 +101,7 @@ def cmd_backtest(args) -> int:
         client = _jev(p.with_(jev={"mode": "advisory"}))
         if client:
             parts.append(research.jev_experiment(bars, funding, p, client))
-        extra = "\n\n".join(parts)
+        extra = "\n\n".join(([extra] if extra else []) + parts)
     path = bt.write_report(s, p, extra_md=extra, name=args.name or report_name(p.market.symbol))
     f, o = s["full"], s["out_of_sample"]
     print(f"\n  {f['from']} → {f['to']}: {f['return']:+.1%} total ({bt._pct(f['cagr'])}/yr), max drawdown "

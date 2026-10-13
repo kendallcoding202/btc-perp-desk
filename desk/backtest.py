@@ -203,11 +203,14 @@ def venue_comparison(bars, funding, p: Params, summary: dict) -> tuple[str, dict
          dict(q=p, spec=replace(spec, weekly_break=None, known_closures=()))),
         ("coinbase", "+ the sessions: **Coinbase rules** (this report)", None),
     ]
+    below = spec.fee_min_per_contract / (p.costs.taker_fee_bps / 1e4)          # a contract worth less: the minimum
+    bound = [t for t in summary["trades"] if t["qty"] * t["entry_price"] < below * round(t["qty"] / spec.contract_size)]
+    years = sorted({_ymd(t["entry_ts"])[:4] for t in bound})
     lines = ["## Coinbase rules vs fractional sizing", "",
              "The same strategy on the same Binance history, Coinbase's rules added one at a time. The first row is this "
              "report as it stood before the BTC account moved to Coinbase rules. The fee minimum binds while a contract "
-             f"is worth under ${spec.fee_min_per_contract / (p.costs.taker_fee_bps / 1e4):,.0f}, BTC under "
-             f"${spec.fee_min_per_contract / (p.costs.taker_fee_bps / 1e4) / spec.contract_size:,.0f} (2020-22); the "
+             f"is worth under ${below:,.0f}, BTC under ${below / spec.contract_size:,.0f}: at the entry of {len(bound)} "
+             f"of the {len(summary['trades'])} trades" + (f" ({years[0]}-{years[-1][2:]})" if years else "") + ". The "
              "sessions skip entries into the weekly break and leave out the bars inside known maintenance windows.", "",
              "| sizing | total return | CAGR | max drawdown | out-of-sample (CAGR) | PF | trades | fees | funding | "
              "final |", "|---|---|---|---|---|---|---|---|---|---|"]
