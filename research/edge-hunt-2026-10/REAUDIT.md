@@ -1,4 +1,4 @@
-# Quarterly re-audit — the rules, fixed on 2026-10-12
+# Quarterly re-audit — the rules, fixed on 2026-10-12 (bar tightened 2026-10-13, before any new data)
 
 The re-audit runs on the 3rd of January, April, July and October. It **never changes anything**: no settings, no ledgers, no code on `main`. It writes a report with proposals, and the user decides.
 
@@ -26,8 +26,8 @@ The accounts: BTC, ETH and SOL desk accounts at $150 each, and the VT vol-trend 
    - Once there are 12 months of new data: REVIEW if the trailing 12-month daily Sharpe is below 0.
    - Nothing is paused automatically; the report says what it would pause and why.
 3. **Backtest refresh.** Re-run every account's backtest through the last complete month (`python -m desk backtest --coin BTC|ETH|SOL`, `python -m desk vt-backtest`). Compare the new-data slice with what we expected.
-   - Expected out-of-sample daily Sharpe, 2024-01 to 2026-09: BTC 0.87, ETH 0.52, SOL 0.24, VT 0.87.
-   - The skeptics expect VT nearer 0.5–0.7.
+   - Expected out-of-sample daily Sharpe, 2024-01 to 2026-09, on Binance data: BTC 0.87, ETH 0.52, SOL 0.24, VT 0.87.
+   - Hyperliquid funding runs about twice Binance's, so on the venue we trade expect less (VT about 0.77 at most). The skeptics expect VT nearer 0.5–0.7.
 
 ## B. Ideas waiting for more evidence
 
@@ -39,16 +39,34 @@ The scripts are in `candidates/`, with their rules frozen. Evaluate them on new 
 | `C1_ls_4h`: fade extreme Binance retail long/short ratios, 4h, long/short | `candidates/c1_lsratio/final_C1_ls_4h.py` | contested: works on BTC, mixed on other coins; needs Binance's live ratio, which may be blocked from US servers (check first) |
 | ETH stop at 3.5 ATR (ETH leg of `stopwidth`) | `candidates/stopwidth/final_stopwidth.py` | unconfirmed: +0.19 Sharpe out of sample on ETH, within noise |
 | ETH short-side crowding gate: skip a breakdown short when 3-day funding is below its 10th percentile over the prior year | `candidates/funding/final_rel_crowding.py` (short side only) | a lead from the rel_crowding verifiers: helped ETH in both periods, untested on its own |
-| `xs_carry`: cross-sectional funding carry, Binance funding signal | `candidates/funding/final_xs_carry.py` | unconfirmed: tie-break luck and survivorship; watch only |
+| ~~`xs_carry`~~: cross-sectional funding carry | `candidates/funding/final_xs_carry.py` | **dropped 2026-10-13**: fails on a wider, less survivor-biased universe (2024–26 Sharpe ≈0.45, 2022 ≈−30%, 2020–23 worst drop 43–50%; see `checks/`). Report its numbers for the record, but it can't be proposed. |
 
-**Bar for proposing a candidate as a new paper account, or a change to an account.** All of these must hold:
+**Bar for proposing a candidate as a new paper account.** Revised 2026-10-13, before any new data existed (see "Why the bar is this strict" below). All of these must hold:
 
-- **N1** At least 6 months of new data (the first eligible re-audit is 2027-04).
+- **N1** At least **12 months** of new data. The first eligible re-audit is 2027-10. Earlier re-audits report the numbers as provisional only.
 - **N2** New-data daily Sharpe ≥ 0.5 and return > 0 after full costs, and return > 0 at 2× costs.
-- **N3** The same sign as its 2024–26 out-of-sample result (no flip).
+- **N2b** It beats doing the simple thing on the same new data: new-data return above a passive benchmark.
+  - Long-biased candidates (tsmom20, the VT-style books): beat both BTC held only above its 50-day average, and a vol-targeted always-long book on the same coins, at the same average exposure.
+  - Market-neutral candidates (C1 long/short, xs_carry): beat zero.
+- **N3** The same sign as its 2024–26 out-of-sample result. And, pooling 2024-01 to now, a 10-day block bootstrap gives P(Sharpe ≤ 0) ≤ 0.05.
 - **N4** Two independent checks fail to refute it: a code review for look-ahead, cost and data errors, and a re-implementation from the rules text alone.
 - **N5** It fits a stated account size, given Hyperliquid's $10 minimum order. Say the capital it needs.
-- **For a change to an existing account:** the new-data improvement over the current settings is positive, and a paired block bootstrap gives P(improvement ≤ 0) < 0.2.
+
+**Bar for changing an existing account's settings** (for example ETH at 3.5 ATR): 12+ months of new data, a positive new-data improvement over the current settings, and, pooling 2024-01 to now, a paired block bootstrap P(improvement ≤ 0) < 0.05.
+
+**Real money is a separate decision.** A re-audit never proposes going live. Before anything trades real money, the live-only bugs listed in [`reports/edge-hunt-2026-10.md`](../../reports/edge-hunt-2026-10.md) must be fixed and tested. The account must also clear N3 at P ≤ 0.01, not just 14 days of paper.
+
+**Keep rule for the accounts we run.** Each quarter, report each account's pooled (2024-01 to now) block-bootstrap P(Sharpe ≤ 0). If it is above 0.30, flag it NO DEMONSTRATED EDGE (REVIEW), and say what the options are: keep it as an experiment, shrink it, or stop it. At this rule's writing, SOL was 0.39, ETH 0.22, BTC 0.08 and VT about 0.05. The user decides; nothing stops automatically.
+
+**Why the bar is this strict.** The first version needed only 6 months and Sharpe ≥ 0.5. That lets luck through too often. A rough guide, with the standard error of a yearly Sharpe ≈ 1/√years:
+
+| true Sharpe | chance a 6-month window shows ≥ 0.5 | 1 year | 2 years |
+|---|---|---|---|
+| 0 (no edge) | 36% | 31% | 24% |
+| 0.3 | 44% | 42% | 39% |
+| 0.7 (decent) | 56% | 58% | 61% |
+
+With five ideas waiting and a look every quarter, a no-edge idea would clear the old bar within a year or two. The pooled test in N3 holds the false-pass rate at about 5% per candidate. The price is power: a true 0.7 Sharpe passes it about 35–45% of the time by 2027–28. That is the right trade for adding things. A missed real edge costs less than a fake one that looks like progress.
 
 Report every candidate's numbers, pass or fail. Count every variant evaluated. A re-audit runs no new parameter searches. A new idea gets its own audit with its own written-down rules, like the October 2026 one.
 
