@@ -122,6 +122,7 @@ class LiveBroker:
         self.stop_px: float | None = None     # trigger of that resting stop, as the venue rounded it
         self.last_price: float | None = None
         self.stops_to_clean = False           # a close left reduce-only stops behind that couldn't be cancelled yet
+        self.defer_stops = False              # catching up missed bars: trail moves are kept, sent once at the end
         self.cash = self._balance()
         self._load_local()
         self.sync()
@@ -551,14 +552,33 @@ class LiveBroker:
 
     def update_stop(self, stop: float) -> None:
         """Move the resting stop: the new one is placed and confirmed first, then the old one is cancelled (never
-        unprotected). If the new one won't go on, the old one stays and the next sync tries again."""
+        unprotected). If the new one won't go on, the old one stays and the next sync tries again. While catching
+        up missed bars (defer_stops) the move is only recorded; flush_stop() sends the final level once."""
         if self.position is None:
             return
         self.position.stop = stop
         self._save_local()
+        if self.defer_stops:
+            return
         self._ensure_stop(stop, self.last_price, self.clock(), keep_old=True)
         if self.position is not None:
             self._save_local()
+
+    def flush_stop(self) -> None:
+        """After a catch-up: put the desk's stop on the exchange if the resting one isn't at it."""
+        pos = self.position
+        if pos is None or not pos.stop or (self.stop_px is not None and math.isclose(self.stop_px, self._px(pos.stop),
+                                                                                     rel_tol=1e-9)):
+            return
+        self._ensure_stop(pos.stop, self.last_price, self.clock(), keep_old=True)
+
+    def missed_stop(self, bar) -> bool:
+        """Catching up: did `bar` go through a trail the desk moved during the gap but never sent? The stop that was
+        resting on the exchange did its own job (sync books it); this is the tighter level paper would have held."""
+        pos = self.position
+        if pos is None or not pos.stop or self.stop_px is None or (pos.stop - self.stop_px) * pos.side.sign <= 0:
+            return False
+        return bar.low <= pos.stop if pos.side is Side.LONG else bar.high >= pos.stop
 
     def check_stop_price(self, price: float, ts: int):
         """The exchange holds the stop; just reconcile."""

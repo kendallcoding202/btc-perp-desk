@@ -488,3 +488,183 @@ def test_a_desk_close_carries_the_exchanges_fees_and_funding(tmp_path):
     assert t.fees == pytest.approx(entry["fee"]["cost"] + exit_["fee"]["cost"])
     assert t.funding == pytest.approx(-sum(e["amount"] for e in ex.incomes)) and t.funding < 0
     assert b.cash == pytest.approx(ex.fetch_balance()["total"]["USDC"])
+
+
+# ---------------------------------------------------------------- bug 4: catching up missed bars like paper
+
+from desk import paper, runner                      # noqa: E402
+from desk.engine import Desk                         # noqa: E402
+from desk.models import MarketContext                # noqa: E402
+from test_desk import H4, FakeFeed, P, series        # noqa: E402
+
+
+class LiveFeed:
+    """Hyperliquid's public feed, in process: a growing prefix of `bars`; bar `upto` is still forming."""
+
+    def __init__(self, bars, funding, upto):
+        self.bars, self.all_funding, self.upto = bars, funding, upto
+        self.bar_ms, self.requests, self.last_latency_ms = H4, 0, 1.0
+
+    def candles(self, start_ms=0, end_ms=None, closed_only=True):
+        return [b for b in self.bars[:self.upto] if b.ts >= start_ms]
+
+    def funding(self, start_ms, end_ms=None):
+        end = self.bars[self.upto - 1].ts + H4
+        return [e for e in self.all_funding if start_ms <= e.ts <= end]
+
+    def context(self):
+        return MarketContext(mid=self.mid(), spread_bps=1.0, depth_usd=1e7)
+
+    def mid(self):
+        return self.bars[self.upto].open if self.upto < len(self.bars) else self.bars[-1].close
+
+
+class StopLoop(Exception):
+    pass
+
+
+def _spy_decisions(monkeypatch):
+    """Record every on_bar_close, live and paper: bar ts -> (position before, decision, blocked by, orders)."""
+    rows = {"live": {}, "paper": {}, "live_qty": {}, "paper_qty": {}}
+    real = Desk.on_bar_close
+
+    def spy(self, f, i, ctx=None, now_ms=None):
+        before = self.broker.position.side.value if self.broker.position else None
+        orders = real(self, f, i, ctx=ctx, now_ms=now_ms)
+        d = self.last_decision
+        who = "live" if self.broker.is_live else "paper"
+        rows[who][f.bars[i].ts] = (before, d.side.value if d.side else None,
+                                   d.blocked_by.name if d.blocked_by else None, [o.action for o in orders])
+        rows[who + "_qty"][f.bars[i].ts] = d.qty
+        return orders
+
+    monkeypatch.setattr(Desk, "on_bar_close", spy)
+    return rows
+
+
+def _run_paper(tmp_path, p, bars, funding, start, end, monkeypatch):
+    """paper.step once per bar, the way the Actions cron runs it, from `start` until bar `end` has been processed."""
+    monkeypatch.setattr(paper, "LOOKBACK_BARS", 10 ** 6)
+    feed = FakeFeed(bars, funding, start)
+    led = tmp_path / "paper"
+    for upto in range(start, end + 2):
+        feed.upto = upto
+        paper.step(p, led, feed=feed, log=lambda *a: None, now_ms=bars[upto].ts + H4 // 2)
+
+
+def _run_live(tmp_path, p, bars, funding, start, script, ex=None, desk_meta=None):
+    """runner.run against the fake exchange. The first poll is a minute after bar start-1 closes; then each entry of
+    `script` sleeps through that many bar closes (1 = a normal poll each bar, 5 = the laptop slept through 5),
+    with the exchange's price walking through each bar's low, high and close meanwhile (resting stops trigger)."""
+    feed = LiveFeed(bars, funding, start)
+    ex = ex or FakeHyperliquid({"BTC": bars[start - 1].close}, usdc=10_000.0)
+    clock = {"now": bars[start].ts + 60_000}
+    ex.now = clock["now"]
+    logs, steps = [], list(script)
+    broker = LiveBroker(p, exchange=ex, state_path=tmp_path / "live" / "pos.json", log=logs.append, sleep=Sleeps(),
+                        clock=lambda: clock["now"])
+
+    def sleep(_):
+        if not steps:
+            raise StopLoop
+        for _ in range(steps.pop(0)):
+            bar = bars[feed.upto]
+            for k, px in enumerate((bar.low, bar.high, bar.close)):
+                ex.now = bar.ts + (k + 1) * 1000
+                ex.move("BTC", px, dt_ms=0)
+            feed.upto += 1
+        clock["now"] = ex.now = bars[feed.upto].ts + 60_000
+
+    if desk_meta is not None:
+        (tmp_path / "live").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "live" / "live_desk.json").write_text(json.dumps({"meta": desk_meta}))
+    try:
+        runner.run(p, "live", state_dir=str(tmp_path / "live"), dashboard=False, log=logs.append, feed=feed,
+                   broker=broker, clock=lambda: clock["now"], sleep=sleep)
+    except StopLoop:
+        pass
+    return broker, ex, logs
+
+
+def _ts(bars, *idx):
+    return [bars[k].ts for k in idx]
+
+
+def test_after_a_gap_live_decides_on_every_missed_bar_in_order_as_paper_does(tmp_path, monkeypatch):
+    """The audit's repro: the live loop slept through several closes and then decided on the newest one only."""
+    bars, funding = series(seed=3, drift=0.002, n=700)
+    p = P.with_(hard={"max_data_age_bars": 1e9})
+    rows = _spy_decisions(monkeypatch)
+    _run_paper(tmp_path, p, bars, funding, 240, 253, monkeypatch)
+    broker, ex, logs = _run_live(tmp_path, p, bars, funding, 240, [1] * 9 + [5])    # through 248, then 249-253
+    assert list(rows["live"]) == _ts(bars, *range(240, 254))                        # every bar, in order, once
+    # Flat going into the gap, both make the same decision on each missed bar, the entry at 251 included...
+    for k in (249, 250, 251):
+        assert rows["live"][bars[k].ts] == rows["paper"][bars[k].ts]
+        assert rows["live_qty"][bars[k].ts] == pytest.approx(rows["paper_qty"][bars[k].ts])
+    assert rows["paper"][bars[251].ts][3] == ["open"]
+    # ...but that entry's open has passed: live doesn't take it at today's price
+    assert [o for o in ex.orders if o["kind"] == "entry"] == [] and broker.position is None
+    assert any("not taken" in e.text for e in _desk_events(tmp_path))
+
+
+def test_an_entry_from_the_newest_close_after_a_gap_is_taken_as_paper_takes_it(tmp_path, monkeypatch):
+    bars, funding = series(seed=3, drift=0.002, n=700)
+    p = P.with_(hard={"max_data_age_bars": 1e9})
+    rows = _spy_decisions(monkeypatch)
+    _run_paper(tmp_path, p, bars, funding, 240, 252, monkeypatch)
+    broker, ex, logs = _run_live(tmp_path, p, bars, funding, 240, [1] * 9 + [3])    # through 248, then 249-251
+    for k in (249, 250, 251):
+        assert rows["live"][bars[k].ts] == rows["paper"][bars[k].ts]
+    entries = [o for o in ex.orders if o["kind"] == "entry"]
+    paper_qty = rows["paper_qty"][bars[251].ts]
+    assert len(entries) == 1 and paper_qty - 1e-5 <= entries[0]["amount"] <= paper_qty     # the same ticket
+    assert broker.position is not None and len(ex.fetch_open_orders("BTC/USDC:USDC")) == 1
+
+
+def test_an_exit_decided_at_a_missed_bar_is_sent_and_live_is_flat_from_there_like_paper(tmp_path, monkeypatch):
+    bars, funding = series(seed=1, drift=0.0003, n=700)
+    p = P.with_(hard={"max_data_age_bars": 1e9}, strategy={"stop_atr": 12.0, "trail_atr": 12.0})
+    rows = _spy_decisions(monkeypatch)
+    _run_paper(tmp_path, p, bars, funding, 380, 428, monkeypatch)
+    broker, ex, logs = _run_live(tmp_path, p, bars, funding, 380, [1] * 42 + [6])   # through 421, then 422-427
+    assert rows["paper"][bars[424].ts][3] == ["close"]                              # trend flip at 424
+    for k in range(422, 428):
+        assert rows["live"][bars[k].ts] == rows["paper"][bars[k].ts]
+    closes = [o for o in ex.orders if o["kind"] == "close"]
+    assert len(closes) == 1 and broker.position is None and broker.trades[-1].reason == "trend_flip"
+    assert ex.positions == {} and ex.fetch_open_orders() == []
+
+
+def test_a_trail_moved_during_a_gap_that_a_later_missed_bar_went_through_gets_live_out(tmp_path, monkeypatch):
+    """Long from the 382 close. Asleep after 430 with the exchange stop at 77,166; while away the desk's trail rose to
+    78,827 and bar 448 went through it (low 77,727), above the exchange's stop. Paper is out at 448; so is live."""
+    bars, funding = series(seed=3, drift=0.002, n=700)
+    p = P.with_(hard={"max_data_age_bars": 1e9})
+    rows = _spy_decisions(monkeypatch)
+    _run_paper(tmp_path, p, bars, funding, 370, 450, monkeypatch)
+    broker, ex, logs = _run_live(tmp_path, p, bars, funding, 370, [1] * 61 + [20])  # through 430, then 431-450
+    assert rows["live"][bars[430].ts][0] == "long" and rows["paper"][bars[448].ts][0] is None
+    assert broker.position is None and broker.trades[-1].reason == "stop"
+    assert ex.positions == {} and ex.fetch_open_orders() == []
+    for k in (448, 449, 450):                                                       # flat from 448 on, like paper
+        assert rows["live"][bars[k].ts] == rows["paper"][bars[k].ts]
+
+
+def test_a_gap_longer_than_the_history_window_refuses_loudly_and_sends_nothing(tmp_path, monkeypatch):
+    """With a 300-bar history window (bars 351-649) and the last bar processed at 100, bars 101-350 can't be
+    rebuilt: paper would skip them silently; live refuses."""
+    monkeypatch.setattr(runner, "LOOKBACK_BARS", 300)
+    bars, funding = series(seed=3, drift=0.002, n=700)
+    p = P.with_(hard={"max_data_age_bars": 1e9})
+    ex = FakeHyperliquid({"BTC": bars[649].close}, usdc=10_000.0)
+    with pytest.raises(SystemExit, match="too long ago"):
+        _run_live(tmp_path, p, bars, funding, 650, [1], ex=ex, desk_meta={"last_bar_ts": bars[100].ts,
+                                                                           "started_ts": 1, "start_equity": 1e4})
+    assert ex.orders == []
+
+
+def _desk_events(tmp_path):
+    from desk.engine import Event
+    d = json.loads((tmp_path / "live" / "live_desk.json").read_text())
+    return [Event(**e) for e in d["events"]]
