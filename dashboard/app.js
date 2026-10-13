@@ -192,7 +192,7 @@
   }
 
   // ---- equity + pnl bars ----------------------------------------------------
-  function drawEquity(eq) {
+  function drawEquity(eq, marks = []) {
     const { g, w, h } = fit($("equity"));
     if (eq.length < 2) {
       const y = h / 2;
@@ -214,6 +214,20 @@
     g.beginPath(); g.moveTo(X(0), h); eq.forEach((p, k) => g.lineTo(X(k), Y(p[1]))); g.lineTo(X(eq.length - 1), h); g.closePath();
     g.fillStyle = grad; g.fill();
     line(g, eq.map((p, k) => [X(k), Y(p[1])]), css("--green"), 2);
+    // a deposit or withdrawal is a step in the bank, not profit or loss: a dashed line where it went in or out, and
+    // its amount wherever it fits (two rows; a label that would overlap another is left off, the line stays)
+    const ends = [0, 0];
+    g.fillStyle = css("--blue");
+    marks.forEach(([ts, amt]) => {
+      const k = eq.findIndex((p) => p[0] > ts);
+      if (k < 0) return;
+      const x = X(k), up = amt > 0, text = `${up ? "+" : "−"}$${Math.round(Math.abs(amt)).toLocaleString("en-US")} ${up ? "in" : "out"}`;
+      line(g, [[x, 6], [x, h - 4]], css("--blue"), 1, [2, 3]);
+      const tw = g.measureText(text).width, tx = Math.min(x + 3, w - tw - 2), row = ends.findIndex((e) => tx >= e + 6);
+      if (row < 0) return;
+      g.fillText(text, tx, 14 + row * 12);
+      ends[row] = tx + tw;
+    });
     const lx = X(eq.length - 1), ly = Y(ys[ys.length - 1]);
     g.fillStyle = css("--green"); g.beginPath(); g.arc(lx, ly, 4, 0, Math.PI * 2); g.fill();
     g.strokeStyle = "rgba(62,224,143,.35)"; g.lineWidth = 4; g.beginPath(); g.arc(lx, ly, 8, 0, Math.PI * 2); g.stroke();
@@ -276,12 +290,15 @@
     $("chief-bubble").textContent = chief ? chief.quote : "";
   }
 
+  // Deposits and withdrawals, next to a P&L that leaves them out (the board only has "flows" once there's one)
+  const flowTag = (s) => s.flows ? ` · ${s.flows.net >= 0 ? "DEPOSITED" : "WITHDRAWN"} ${usd(Math.abs(s.flows.net))}, NOT P&amp;L` : "";
+
   function renderStage(s) {
     const t = s.ticker, k = s.kills, coin = s.header.coin || "BTC";
     const liveTag = live.at ? `<span class="live-dot" aria-hidden="true"></span>LIVE · ` : "";
     $("ticker").innerHTML = `‹ ${liveTag}TRADES · ${esc(coin)} ${px(t.price)} · BANK ${usd(t.bank)} · ` +
       `<span class="hl">${esc(t.position)}${t.position_detail ? " " + esc(t.position_detail) : ""}</span>` +
-      ` · ${esc(t.record)} · HOLD ${pct(t.hold_pct)} · P&amp;L ${usd(t.pnl)} (${pct(t.pnl_pct)}) · FEES ${usd(t.fees)} · FUNDING ${usd(t.funding)}`;
+      ` · ${esc(t.record)} · HOLD ${pct(t.hold_pct)} · P&amp;L ${usd(t.pnl)} (${pct(t.pnl_pct)})${flowTag(s)} · FEES ${usd(t.fees)} · FUNDING ${usd(t.funding)}`;
     $("chart-title").textContent = `${coin}-PERP · ${s.header.interval} · ${px(t.price)}`;
     $("chart-sub").textContent = `24h ${pct(t.change_24h)} · ema.fast pink · ema.slow blue · channel dashed`;
     const chips = $("chips");
@@ -323,9 +340,12 @@
       const at = (rate, y) => `<span>(${pct(rate, 1)}/yr): ${yrs(y)}</span>`;   // wraps before the numbers, not inside them
       const pace = goal.test_cagr === undefined && goal.backtest_cagr !== undefined
         ? `at backtest pace ${at(goal.backtest_cagr, goal.years_at_backtest_rate)}`
-        : `at ${span}backtest pace ${at(goal.test_cagr, goal.years_at_test_rate)}`;
+        : `at ${span}backtest pace${goal.plan_included ? " + planned deposits" : ""} ${at(goal.test_cagr, goal.years_at_test_rate)}`;
+      // with deposits: the paces are the NAV's (deposits aren't growth), the years count the plan still to come
+      const money = goal.deposited == null ? "" : `<br>${goal.deposited >= 0 ? "deposited" : "withdrawn"} so far ${usd(Math.abs(goal.deposited), 0)} (money in, not profit)` +
+        (goal.planned_left ? ` · ${goal.planned_left} more planned, ${usd(goal.planned_left_usd, 0)}` : "");
       $("goal-note").innerHTML = `${(goal.progress * 100).toFixed(1)}% of the way (log scale) · ${num(goal.multiple_left, 0)}x to go<br>` + pace +
-        (goal.realised_cagr != null ? `<br>at this account's own pace ${at(goal.realised_cagr, goal.years_at_realised_rate)}` : "");
+        (goal.realised_cagr != null ? `<br>at this account's own pace ${at(goal.realised_cagr, goal.years_at_realised_rate)}` : "") + money;
     }
   }
 
@@ -386,7 +406,7 @@
     const liveTag = live.at ? `<span class="live-dot" aria-hidden="true"></span>LIVE · ` : "";
     $("vt-ticker").innerHTML = `‹ ${liveTag}BASKET · ${esc(s.header.coins.join(" · "))} · BANK ${usd(t.bank)} · ` +
       `<span class="hl">${esc(t.position)}${t.position_detail ? " " + esc(t.position_detail) : ""}</span>` +
-      ` · ${esc(t.record)} · HOLD ${pct(t.hold_pct)} · P&amp;L ${usd(t.pnl)} (${pct(t.pnl_pct)}) · FEES ${usd(t.fees)} · FUNDING ${usd(t.funding)}`;
+      ` · ${esc(t.record)} · HOLD ${pct(t.hold_pct)} · P&amp;L ${usd(t.pnl)} (${pct(t.pnl_pct)})${flowTag(s)} · FEES ${usd(t.fees)} · FUNDING ${usd(t.funding)}`;
     const next = Math.floor(now / DAY_MS + 1) * DAY_MS, left = next - now;   // every 00:00 UTC
     $("vt-next").textContent = `NEXT DECISION 00:00 UTC · IN ${Math.floor(left / 3600000)}H ${Math.floor(left % 3600000 / 60000)}M`;
     $("vt-exp").textContent = s.header.experiment ? `EXPERIMENT · ${s.header.experiment}` : "";
@@ -484,8 +504,9 @@
 
   // A bank re-marked at live mids: its P&L, the goal, and a point on the equity curve.
   function rebank(s, bank) {
-    const t = s.ticker, g = s.goal;
+    const t = s.ticker, g = s.goal, fl = s.flows;
     t.bank = bank; t.pnl = bank - g.start; t.pnl_pct = bank / g.start - 1;
+    if (fl) { t.pnl = bank - fl.start - fl.net; t.pnl_pct = bank / fl.units - 1; }   // deposits aren't profit: the NAV's
     g.equity = bank;
     g.progress = Math.max(0, Math.min(1, Math.log(bank / g.start) / Math.log(g.target / g.start)));
     g.multiple_left = g.target / bank;
@@ -545,7 +566,7 @@
     const nav = $("coins");
     if (!index || !index.coins) { nav.hidden = true; return; }
     nav.hidden = false;
-    let start = 0, bank = 0;
+    let start = 0, bank = 0, net = 0;
     const cards = index.coins.map((c) => {
       if (c.error) return `<button class="coin" data-coin="${esc(c.coin)}"><span class="c-name">${esc(c.coin)}</span><span class="c-sub">error: ${esc(c.error)}</span></button>`;
       const basket = c.kind === "basket", lp = parseFloat(live.mids[c.coin]);
@@ -555,16 +576,18 @@
         const m = basketLive(c.cash, JSON.parse(JSON.stringify(c.holdings)));
         if (m.bank > 0) b = m.bank;
       }
-      start += c.start; bank += b;
+      start += c.start; bank += b; net += c.net_flows || 0;
       const label = basket ? (c.holdings || []).map((h) => h.coin).join("·") : lp ? px(lp) : px(c.price);
       const sub = basket ? " · basket" : ` · risk ${(c.risk_per_trade * 100).toFixed(0)}%${c.shorts ? " · +shorts" : ""}`;
       return `<button class="coin ${c.coin === coin ? "on" : ""}" data-coin="${esc(c.coin)}" aria-pressed="${c.coin === coin}">` +
         `<span class="c-name">${esc(c.coin)}<i>${esc(label)}</i></span><span class="c-bank">${usd(b)}</span>` +
-        `<span class="c-sub">${pct(b / c.start - 1)} · ${esc(c.position)} · ${esc(c.record)}${sub}</span></button>`;
+        `<span class="c-sub">${pct(c.units ? b / c.units - 1 : b / c.start - 1)} · ${esc(c.position)} · ${esc(c.record)}${sub}</span></button>`;
     });
     const left = index.coins.filter((c) => c.error).map((c) => c.coin);   // no bank this run: not in the total
+    const put = start + net;   // with deposits: the P&L on everything put in, never counting the deposits as profit
     cards.push(`<div class="coin total"><span class="c-name">ALL</span><span class="c-bank">${usd(bank)}</span>` +
-      `<span class="c-sub">${pct(start ? bank / start - 1 : 0)} on ${usd(start, 0)} paper` +
+      (net ? `<span class="c-sub">${pct(put > 0 ? (bank - put) / put : 0)} · P&amp;L ${usd(bank - put)} on ${usd(put, 0)} put in` :
+       `<span class="c-sub">${pct(start ? bank / start - 1 : 0)} on ${usd(start, 0)} paper`) +
       `${left.length ? ` · without ${esc(left.join(", "))}` : ""}</span></div>`);
     nav.style.setProperty("--tabs", cards.length);
     nav.innerHTML = cards.join("");
@@ -595,7 +618,7 @@
     renderCoins();
     if (basket) renderBasket(s);
     else { renderAgents(s.agents); renderStage(s); renderBubbles(s.agents); drawChart(s.chart); drawWeb(); }
-    renderBalance(s); drawEquity(s.equity); drawPnlBars(s.pnl_bars);
+    renderBalance(s); drawEquity(s.equity, s.flows ? s.flows.marks : []); drawPnlBars(s.pnl_bars);
     renderAnalysis(s); if (basket) renderRules(s.basket.rules); else renderThresholds(s.thresholds);
     renderKills(s.kills);
     const age = Math.round((Date.now() - s.updated) / 60000);

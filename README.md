@@ -72,7 +72,7 @@ python3 -m desk vt-backtest                  # the VT basket: reports/backtest-V
 python3 -m desk replay                       # watch it trade 2024→now at http://127.0.0.1:8787
 python3 -m desk paper                        # a $500 BTC paper account ($150 with --coin ETH or SOL), board at :8787
 python3 -m desk step                         # one step for every account (BTC, ETH, SOL, VT), the way the Action runs it
-python3 -m pytest                            # 112 tests, incl. "paper ledger == backtest" for the desk and for VT,
+python3 -m pytest                            # 158 tests, incl. "paper ledger == backtest" for the desk and for VT,
                                              # and live mode against a fake exchange (tests/test_live.py)
 ```
 
@@ -148,6 +148,49 @@ $500 trades almost exactly the tested strategy, and $250 is close. The $50 accou
 
 **On the board** (`#VT`), the VT tab shows the bank, P&L, goal and equity curve like the others, and instead of the price chart a holdings table: for each coin, how far its last close is above or below its 50-day average, its 10-day vol, the target and held sizes, what's held and its unrealised P&L. It also shows when the next decision is (every 00:00 UTC). Between runs, the bank and P&L move live with Hyperliquid's prices.
 
+## Deposits and withdrawals
+
+Money you put into an account, or take out, is never counted as profit or loss. Every paper account reads [`deposits.json`](deposits.json) at the repo root (on `main`) at each run. BTC's plan is set: $100 on the 1st of every month, 60 deposits from 2026-11-01 to 2031-10-01.
+
+```json
+{
+  "BTC": {
+    "monthly": {"amount": 100, "day": 1, "first": "2026-11-01", "count": 60},
+    "extra": [
+      {"date": "2026-12-15", "amount": 250, "note": "bonus"},
+      {"date": "2027-03-01", "amount": -50, "note": "took some out"}
+    ]
+  }
+}
+```
+
+- `monthly`: `amount` dollars on `day` (1 to 28) of each month, starting on `first` (which must fall on that day), `count` times. To change the amount later, make `monthly` a list: set the first plan's `count` to the months already done, and start a second plan the month after.
+- `extra`: one-off amounts on a date. **A negative amount is a withdrawal.** `note` is optional.
+- Any account works the same way: `"ETH"`, `"SOL"` and `"VT"` can each have their own `monthly` and `extra`.
+- Keys starting with `_` are comments (text only).
+
+**Adding a deposit from your phone.** In the GitHub app or in your phone's browser at github.com, open the repo, then `deposits.json` on the `main` branch, and tap the pencil (Edit). Add one line at the end of BTC's `extra` list (put a comma after the entry before it, if there is one):
+
+```json
+      {"date": "2026-12-15", "amount": 250, "note": "bonus"}
+```
+
+Then tap **Commit changes** and commit to `main`. For a withdrawal, use a negative amount: `"amount": -50`. The next run (within about 15 minutes) records it once its date has come, at 00:00 UTC on that date. A date already past is recorded at the next run. With `NTFY_TOPIC` set, your phone gets `DEPOSIT $250.00 recorded (extra: bonus) — money in, not profit`.
+
+The step checks the file strictly and never guesses:
+- Amounts are dollars and cents (`250`, `99.5`, `-50`), and dates are `YYYY-MM-DD`. A typo stops that account's step: its tab shows the error, and the Actions run fails, until you fix it. The other accounts keep running. If the file isn't valid JSON at all, or names an account that doesn't exist, every account waits. Each step catches up every missed candle afterwards, so no trading is lost.
+- **Never edit or delete an entry that's already been recorded** (its date has passed). Fix a mistake with another `extra`; a negative one takes money back out. A recorded entry that's changed or missing stops that account until it's put back as it was. Add new `extra`s at the end of the list: two on the same date are told apart by their order.
+
+**How it's counted.** Like a fund: the account starts with one unit per dollar, and a deposit buys units at what a unit is worth at that moment (a withdrawal sells them). So:
+- **The performance %** is the units' value: on the board's P&L, the tabs, your phone, and the go-live gate. A deposit or a withdrawal never moves it.
+- **P&L in dollars** is the balance, minus the start, minus what was deposited net of withdrawals.
+- **The brakes read the same percentage just before and just after a flow.** At each one, the 40% drawdown halt and the 10% daily loss limit are rescaled with the balance. A deposit during a 35% drawdown still shows a 35% drawdown. A withdrawal never trips the halt.
+- **Trading sees a deposit only as a bigger account to size the next trade from.** 5% of a bigger account is a bigger bet, as it would be with real money. A position already open isn't topped up.
+- **On the board:** each flow is marked on the equity chart, it's in the events, and the deposited total is next to the P&L. The goal panel shows what's been deposited so far, and counts the deposits still planned in its years to $100,000. The ALL card's P&L leaves deposits out. The ledger's commit message reads, for example, `BTC $600.00 (+$100.00 deposited, not profit)`.
+- **Until the first flow is recorded** (BTC's is 2026-11-01), every ledger and board is byte for byte what it was before deposits existed. That includes the goal panel: it starts counting the plan at the first deposit.
+
+**Live.** `deposits.json` is for the paper accounts only; live never applies it. Live reads real deposits, withdrawals and transfers from Hyperliquid's own ledger at every check: bridge deposits and withdrawals, sub-account transfers, transfers between accounts, spot ↔ perp, and vaults. It books them the same way, brakes included. (It uses ccxt's `fetch_ledger`; `fetch_deposits` and `fetch_withdrawals` only see the bridge.) An entry of a kind it doesn't know is alerted, never guessed at. If the account's value moves by more than the larger of $1 and 2% of the account beyond what the position's P&L, the trades booked and the recorded flows explain, it alerts your phone and sets `entry_kill`.
+
 ## Kill switches
 
 | switch | what it does |
@@ -165,7 +208,7 @@ This is for the BTC, ETH and SOL desk accounts only. VT has no live mode.
 
 `python -m desk live --coin BTC --max-notional 50` refuses to start unless **all** of these hold:
 1. That coin's backtest report (`reports/backtest.json` for BTC, `reports/backtest-ETH.json`, `reports/backtest-SOL.json`) passes the go-live gate: 3+ years, profitable out-of-sample with profit factor ≥ 1.15, max drawdown ≤ 35%, never halted.
-2. That coin's paper ledger has **14+ days** of trading and is up overall.
+2. That coin's paper ledger has **14+ days** of trading and is up overall, time-weighted: deposits and withdrawals don't count either way ([above](#deposits-and-withdrawals)).
 3. `DESK_LIVE_CONFIRM` is set to the exact phrase in `.env.example`.
 4. You set a hard per-position dollar cap with `--max-notional`.
 
@@ -201,6 +244,7 @@ What is still open:
 - Only Hyperliquid was checked, against ccxt's code and Hyperliquid's public market list. The other venues' symbols follow ccxt's naming but weren't checked. Those venues may also need extra parameters before their stop orders show up in `fetch_open_orders`. Without them, the stop check would fail and close every new position.
 - Any exchange error while placing an order still sets `entry_kill`, even when a retry then gets the order through. Clear it from the board once you've checked.
 - The go-live gate still rests on 14 days of paper, which the audit calls noise.
+- Deposits on live are read from Hyperliquid's ledger as ccxt 4.5.85 returns it, with the fields Hyperliquid documents. That has only been checked against ccxt's code and the fakes, not a funded account. Two details are assumed: a withdrawal's fee is part of the amount taken out, and a transfer's fee is paid by the sender. If either is wrong, the reconciliation alert catches it. Hyperliquid's newer "send" entries aren't parsed yet; they're alerted.
 
 Paper trading is not affected by any of this. The backtests (BTC, ETH, SOL, VT) and paper steps on copies of the real ledgers give byte-for-byte the same output before and after these fixes, apart from each report's generated time.
 
