@@ -584,7 +584,7 @@
     btn.textContent = !on ? "spider: off"
       : reduced.matches ? "spider: still (reduce motion is on)"
       : alive() ? "spider: on"
-      : board.updated ? `spider: asleep, no desk run for ${h ? `${h}h ` : ""}${m}m` : "spider: asleep, no board yet";
+      : board.updated ? `spider: asleep, no new board for ${h ? `${h}h ` : ""}${m}m` : "spider: asleep, no board yet";
   }
   const seenLines = new Map();    // coin → the event lines already on its board
   function newFills(coin) {
