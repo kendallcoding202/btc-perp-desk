@@ -929,7 +929,8 @@ def test_every_board_projects_the_goal_at_its_out_of_sample_pace(tmp_path, monke
     assert board.report_pace("BTC", tmp_path) is None and board.oos_pace({"out_of_sample": {}}) is None
     g = board.goal(150.0, 150.0, 100_000.0, {"cagr": 0.25, "from": "2024-01-19", "to": "2026-10-01"}, 40)
     assert g["test_cagr"] == 0.25 and g["years_at_test_rate"] == pytest.approx(math.log(100_000 / 150) / math.log(1.25))
-    assert (g["test_from"], g["test_to"]) == ("2024-01-19", "2026-10-01") and "backtest_cagr" not in g
+    assert (g["test_from"], g["test_to"]) == ("2024-01-19", "2026-10-01")
+    assert (g["backtest_cagr"], g["years_at_backtest_rate"]) == (g["test_cagr"], g["years_at_test_rate"])  # old app.js
     assert board.goal(150.0, 150.0, 100_000.0, None, 40)["years_at_test_rate"] is None
 
     monkeypatch.setattr(paper, "LOOKBACK_BARS", 10 ** 6)

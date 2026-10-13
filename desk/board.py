@@ -89,6 +89,9 @@ def goal(equity: float, start: float, target: float, pace: dict | None, elapsed_
             "multiple_left": target / equity if equity > 0 else None,
             "test_cagr": test, "test_from": (pace or {}).get("from"), "test_to": (pace or {}).get("to"),
             "years_at_test_rate": years(test),
+            # the same numbers under the old names, for an app.js from before test_cagr (a tab left open across a
+            # deploy): it shows them as "at backtest pace", which they are
+            "backtest_cagr": test, "years_at_backtest_rate": years(test),
             "realised_cagr": realised, "years_at_realised_rate": years(realised)}
 
 

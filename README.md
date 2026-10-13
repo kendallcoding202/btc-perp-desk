@@ -34,7 +34,7 @@ The honest read:
 - **This is the aggressive profile you asked for.** Each trade risks 5% of the account. Leverage is set by the stop distance: a tight setup gets more (median 1.7×, max 4×). The worst losing streak so far was 8 trades in a row. At 2% risk the same strategy made +21%/yr with a 12% worst drop.
 - **The backtest flatters it.** Many variants were tried to get here, and the 2h/5% choice was made after seeing them. 2026 has been a losing year. The paper experiment is the real test.
 - **Whole-period profit isn't the result of one lucky setting.** Every nearby setting tested was profitable, and tripling fees and slippage still leaves it profitable.
-- **$150 → $100,000 is a 667× goal.** At the whole backtest's +50%/yr that's about 16 years, but that pace includes 2020–23, where the settings were picked. At the 2024–26 out-of-sample pace, +28%/yr, it's about 26 years. The board projects every account at its own backtest's out-of-sample pace ("at its 2024–26 test pace"), and once an account is 30 days old, at the pace it has actually made too.
+- **$150 → $100,000 is a 667× goal.** At the whole backtest's +50%/yr that's about 16 years, but that pace includes 2020–23, where the settings were picked. At the 2024–26 out-of-sample pace, +28%/yr, it's about 26 years. The board projects every account at its own backtest's 2024–26 pace ("at 2024–26 backtest pace"), and once an account is 30 days old, at the pace it has actually made too. For ETH and SOL that period is only partly unseen: their 2% risk was picked after seeing ETH's 2024, and ETH's shorts were switched on after missing their own bar ([`reports/edge-hunt-2026-10.md`](reports/edge-hunt-2026-10.md)).
 
 ### ETH and SOL: same desk, smaller bets
 

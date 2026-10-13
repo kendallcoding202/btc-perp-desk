@@ -317,12 +317,13 @@
       const yrs = (y) => y == null ? "—" : y > 200 ? "200+ years" : `${y.toFixed(y < 10 ? 1 : 0)} years`;
       // At the backtest's out-of-sample pace: its whole period includes the years the settings were picked on, so it
       // flatters. A board from before that change has only backtest_cagr (the whole period): it keeps its old label.
+      // "backtest", not "test": the account itself is the paper test, and ETH/SOL's 2024–26 isn't fully unseen.
       const yr = (d) => typeof d === "string" && /^\d{4}/.test(d) ? d.slice(0, 4) : null, y0 = yr(goal.test_from), y1 = yr(goal.test_to);
       const span = y0 && y1 ? (y0 === y1 ? y0 : `${y0}–${y1.slice(2)}`) + " " : "";
       const at = (rate, y) => `<span>(${pct(rate, 1)}/yr): ${yrs(y)}</span>`;   // wraps before the numbers, not inside them
       const pace = goal.test_cagr === undefined && goal.backtest_cagr !== undefined
         ? `at backtest pace ${at(goal.backtest_cagr, goal.years_at_backtest_rate)}`
-        : `at its ${span}test pace ${at(goal.test_cagr, goal.years_at_test_rate)}`;
+        : `at ${span}backtest pace ${at(goal.test_cagr, goal.years_at_test_rate)}`;
       $("goal-note").innerHTML = `${(goal.progress * 100).toFixed(1)}% of the way (log scale) · ${num(goal.multiple_left, 0)}x to go<br>` + pace +
         (goal.realised_cagr != null ? `<br>at this account's own pace ${at(goal.realised_cagr, goal.years_at_realised_rate)}` : "");
     }
