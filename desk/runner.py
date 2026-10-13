@@ -89,10 +89,7 @@ def run(p: Params, mode: str, *, state_dir: str = "state", poll_s: float = 15.0,
         desk.last_decision = evaluate_entry(p, f, len(bars) - 1, equity=broker.equity(ctx.mid),
                                             kills=desk.kill_gates(_now_ms(), broker.equity(ctx.mid)), ctx=ctx,
                                             now_ms=_now_ms())
-    goal_cagr = None
-    rep = Path("reports/backtest.json")
-    if rep.exists():
-        goal_cagr = json.loads(rep.read_text()).get("full", {}).get("cagr")
+    goal_pace = board_mod.report_pace(p.market.symbol)
     log(f"{mode}: {len(bars)} {p.market.interval} bars, {len(funding)} funding prints, "
         f"equity ${broker.equity(ctx.mid):,.2f}, {p.market.symbol} {ctx.mid:,.1f}")
 
@@ -134,7 +131,7 @@ def run(p: Params, mode: str, *, state_dir: str = "state", poll_s: float = 15.0,
                            f"no trade ({blocked.name if blocked else 'holding'})"))
 
             state = board_mod.build(desk, f, len(f.bars) - 1, mode=mode, ctx=ctx, jev_client=jev, now_ms=now,
-                                    goal_cagr=goal_cagr, elapsed_days=(now - meta["started_ts"]) / 86400_000, crawler={
+                                    goal_pace=goal_pace, elapsed_days=(now - meta["started_ts"]) / 86400_000, crawler={
                 "source": f"hyperliquid · {p.market.interval}", "funding_prints": len(funding),
                 "requests": feed.requests, "latency_ms": feed.last_latency_ms,
                 "age_s": (now - (f.bars[-1].ts + f.bar_ms)) / 1000})
@@ -159,7 +156,7 @@ def replay(bars, funding, p: Params, *, speed: float = 25.0, start_index: int = 
     log(f"replay board: http://{host}:{port}  ({speed:g} bars/sec)")
     f = ind.compute(bars, funding, p)
     from .backtest import run as bt_run, summarize
-    goal_cagr = summarize(bt_run(bars, funding, p))["full"]["cagr"]
+    goal_pace = board_mod.oos_pace(summarize(bt_run(bars, funding, p)))
     while True:
         broker = SimBroker(p)
         desk = Desk(p, broker, jev=jev)
@@ -169,7 +166,7 @@ def replay(bars, funding, p: Params, *, speed: float = 25.0, start_index: int = 
             broker.apply_funding(f.funding_bar[i], bar.close)
             desk.on_bar_close(f, i, now_ms=bar.ts + f.bar_ms)
             if i >= start_index:
-                board.set(board_mod.build(desk, f, i, mode="replay", jev_client=jev, goal_cagr=goal_cagr,
+                board.set(board_mod.build(desk, f, i, mode="replay", jev_client=jev, goal_pace=goal_pace,
                                           elapsed_days=(bar.ts - bars[0].ts) / 86400_000, crawler={
                     "source": "history replay", "funding_prints": len(funding)}))
                 time.sleep(1.0 / speed)

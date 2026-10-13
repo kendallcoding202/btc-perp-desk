@@ -7,12 +7,14 @@ says is always what the desk actually thought.
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict
 from datetime import datetime, timezone
+from pathlib import Path
 
 from . import indicators as ind
 from .models import Verdict
-from .thresholds import EXPERIMENTS
+from .thresholds import EXPERIMENTS, report_name
 
 AGENTS = [
     ("chief", "CHIEF", "never takes a position"),
@@ -53,8 +55,24 @@ def _thin(seq: list, n: int) -> list:
     return out
 
 
-def goal(equity: float, start: float, target: float, cagr: float | None, elapsed_days: float | None) -> dict:
-    """Progress toward the target on a log scale ($150→$100k is 667x: $300 is 11% of the way, $1,500 is 35%)."""
+def oos_pace(summary: dict | None) -> dict | None:
+    """The pace the goal panel projects at: a backtest's out-of-sample CAGR, with that period's dates. Not the full
+    period's: it includes the years the settings were picked on, so it flatters (BTC +50%/yr, +28%/yr since 2024)."""
+    oos = (summary or {}).get("out_of_sample") or {}
+    if oos.get("cagr") is None:
+        return None
+    return {"cagr": oos["cagr"], "from": oos.get("from"), "to": oos.get("to")}
+
+
+def report_pace(account: str, reports_dir: str | Path = "reports") -> dict | None:
+    """oos_pace from the account's backtest report (reports/backtest[-COIN].json); None if it has none."""
+    path = Path(reports_dir) / f"{report_name(account)}.json"
+    return oos_pace(json.loads(path.read_text())) if path.exists() else None
+
+
+def goal(equity: float, start: float, target: float, pace: dict | None, elapsed_days: float | None) -> dict:
+    """Progress toward the target on a log scale ($150→$100k is 667x: $300 is 11% of the way, $1,500 is 35%), and
+    the years left at `pace` (oos_pace) and, once the account is 30 days old, at its own pace."""
     import math
 
     progress = math.log(equity / start) / math.log(target / start) if equity > 0 and target > start else 0.0
@@ -66,9 +84,14 @@ def goal(equity: float, start: float, target: float, cagr: float | None, elapsed
     realised = None
     if elapsed_days and elapsed_days >= 30 and equity > 0:
         realised = (equity / start) ** (365.25 / elapsed_days) - 1
+    test = (pace or {}).get("cagr")
     return {"start": start, "target": target, "equity": equity, "progress": max(0.0, min(1.0, progress)),
             "multiple_left": target / equity if equity > 0 else None,
-            "backtest_cagr": cagr, "years_at_backtest_rate": years(cagr),
+            "test_cagr": test, "test_from": (pace or {}).get("from"), "test_to": (pace or {}).get("to"),
+            "years_at_test_rate": years(test),
+            # the same numbers under the old names, for an app.js from before test_cagr (a tab left open across a
+            # deploy): it shows them as "at backtest pace", which they are
+            "backtest_cagr": test, "years_at_backtest_rate": years(test),
             "realised_cagr": realised, "years_at_realised_rate": years(realised)}
 
 
@@ -94,7 +117,7 @@ def trigger_outlook(f: ind.Features, i: int, n: int, limit: int = 10, short: boo
 
 
 def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict | None = None,
-          jev_client=None, now_ms: int | None = None, candles: int = 140, goal_cagr: float | None = None,
+          jev_client=None, now_ms: int | None = None, candles: int = 140, goal_pace: dict | None = None,
           elapsed_days: float | None = None) -> dict:
     p, broker, dec = desk.p, desk.broker, desk.last_decision
     coin = p.market.symbol
@@ -300,7 +323,7 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
             "direction": dec.direction.value if dec else None,
         },
         "thresholds": thr_rows,
-        "goal": goal(equity, start_eq, p.sizing.goal_equity, goal_cagr, elapsed_days),
+        "goal": goal(equity, start_eq, p.sizing.goal_equity, goal_pace, elapsed_days),
         "kills": {"flat_kill": k.flat_kill, "entry_kill": k.entry_kill, "jev_kill": k.jev_kill,
                   "halted": r.halted, "daily_locked": desk.day_locked, "cooldown": now_ms < r.cooldown_until_ts},
         "jev": {
@@ -312,7 +335,7 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
 
 
 def basket(book, *, now_ms: int, marks: dict[str, float], meta: dict, crawler: dict | None = None,
-           goal_cagr: float | None = None, preview: dict | None = None, equity_points: int = 400) -> dict:
+           goal_pace: dict | None = None, preview: dict | None = None, equity_points: int = 400) -> dict:
     """The VT basket's board (desk/voltrend.py). Its own panels are under "basket". The keys the desk boards carry
     are kept, empty where they don't apply (no agents, no candle chart, no gates), so a desk renderer still works.
 
@@ -375,7 +398,7 @@ def basket(book, *, now_ms: int, marks: dict[str, float], meta: dict, crawler: d
         },
         "equity": [[ts, round(eq, 2)] for ts, eq in _thin(book.equity_curve, equity_points)],
         "pnl_bars": [round(t["net_pnl"], 2) for t in book.trades[-80:]],
-        "goal": goal(equity, start_eq, vt.goal_equity, goal_cagr, (now_ms - started) / day_ms),
+        "goal": goal(equity, start_eq, vt.goal_equity, goal_pace, (now_ms - started) / day_ms),
         "events": [{"ts": e.ts, "agent": e.agent, "text": e.text} for e in list(book.events)[-30:]],
         # what the desk boards have and the basket doesn't
         "agents": [],

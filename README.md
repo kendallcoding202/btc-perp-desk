@@ -34,7 +34,7 @@ The honest read:
 - **This is the aggressive profile you asked for.** Each trade risks 5% of the account. Leverage is set by the stop distance: a tight setup gets more (median 1.7×, max 4×). The worst losing streak so far was 8 trades in a row. At 2% risk the same strategy made +21%/yr with a 12% worst drop.
 - **The backtest flatters it.** Many variants were tried to get here, and the 2h/5% choice was made after seeing them. 2026 has been a losing year. The paper experiment is the real test.
 - **Whole-period profit isn't the result of one lucky setting.** Every nearby setting tested was profitable, and tripling fees and slippage still leaves it profitable.
-- **$150 → $100,000 is a 667× goal.** At +50%/yr that's about 16 years at the historical pace. The board shows this projection live.
+- **$150 → $100,000 is a 667× goal.** At the whole backtest's +50%/yr that's about 16 years, but that pace includes 2020–23, where the settings were picked. At the 2024–26 out-of-sample pace, +28%/yr, it's about 26 years. The board projects every account at its own backtest's 2024–26 pace ("at 2024–26 backtest pace"), and once an account is 30 days old, at the pace it has actually made too. For ETH and SOL that period is only partly unseen: their 2% risk was picked after seeing ETH's 2024, and ETH's shorts were switched on after missing their own bar ([`reports/edge-hunt-2026-10.md`](reports/edge-hunt-2026-10.md)).
 
 ### ETH and SOL: same desk, smaller bets
 
@@ -72,7 +72,7 @@ python3 -m desk vt-backtest                  # the VT basket: reports/backtest-V
 python3 -m desk replay                       # watch it trade 2024→now at http://127.0.0.1:8787
 python3 -m desk paper                        # a $150 paper account (add --coin ETH), live board at :8787
 python3 -m desk step                         # one step for every account (BTC, ETH, SOL, VT), the way the Action runs it
-python3 -m pytest                            # 38 tests, incl. "paper ledger == backtest" for the desk and for VT
+python3 -m pytest                            # 52 tests, incl. "paper ledger == backtest" for the desk and for VT
 ```
 
 ## The paper experiments
@@ -84,7 +84,7 @@ python3 -m pytest                            # 38 tests, incl. "paper ledger == 
 - **The record** lives on the [`paper-ledger`](../../tree/paper-ledger/ledger) branch, saved whenever something happens, so the history is permanent and public:
   - `ledger/<COIN>/paper.json` (`BTC`, `ETH`, `SOL`): the account, open position, every trade, and the desk's memory
   - `ledger/<COIN>/kills.json`: that account's kill switches. Create or edit it on that branch, e.g. `ledger/SOL/kills.json` with `{"entry_kill": true}`.
-  - `ledger/VT/paper.json`: the VT basket's cash, its three positions, every fill and closed position. VT has no kill switches.
+  - `ledger/VT/paper.json`: the VT basket's cash, its three positions, every fill and closed position, and each coin's last 70 daily candles. A candle missing from one Hyperliquid answer is filled in from those, so the 50-day average never shifts. A candle no answer has had yet is waited for: it's a day with no candle, which that coin sits out as in the backtest, only once two answers have lacked it and it closed 3 days ago. VT has no kill switches.
 - **The board** for your phone is published to GitHub Pages every run: **https://kendallcoding202.github.io/btc-perp-desk/** (open an account directly with `#ETH`, `#SOL` or `#VT`). It is read-only; kill switches go through `kills.json`.
   - Tabs at the top switch accounts and show all four balances, plus the total.
   - **Between runs, your browser pulls prices straight from Hyperliquid every 5 seconds.** The price, open-position P&L, balance and the candle that's still forming move live. Decisions, fills and the record change only when the desk runs: every 2h candle close, picked up within 15 minutes.
