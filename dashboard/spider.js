@@ -10,10 +10,13 @@
 //                                                drop on silk
 //   no board yet, or one too old to trust        it curls up at home and keeps still until a fresh board lands
 // On the VT basket's tab (no agents, chart or trigger line) the same moves read the basket instead:
-//   a new board                                  each coin's row in #holdings (BTC, ETH, SOL), on its 50-day
-//                                                average: longer on a coin in a different state from the other
+//   a new board                                  each coin's row in #holdings (BTC, ETH, SOL), by its order or its
+//                                                50-day average, never on their words (a row with no room for it
+//                                                is skipped): longer on a coin in a different state from the other
 //                                                two, a twitch on one with an order waiting for the next open;
-//                                                then the bank in the basket's ticker
+//                                                then the bank in the basket's ticker. A row that is scrolled
+//                                                away (a phone, at the top of the page) has the coin's name in
+//                                                the VT tab's label stand in for it, and waits for later too
 //   a live tick that changes the bank's figure   a quick hop to it, at most one per 20 s (the basket has no price)
 //   a new fill (BOUGHT, SOLD, ADDED, TRIMMED)    its event line, or that coin's row when the line is scrolled away
 // It only goes where you can see it. A stop that is scrolled out of view waits (one peek from the screen's edge
@@ -146,7 +149,7 @@
     const b = box(el);              // on the box's top-right corner, clear of the heading's words and the level
     return b ? { x: b.x + b.w - S * 0.2, y: b.y - S * 0.22, perch: { el, top: true } } : null;
   }
-  function amountSpot(t, re) {    // just above the first match of `re` in element t (above its first line, if it wraps)
+  function textBox(t, re) {       // the first match of `re` in element t, as a page box (its first line, if it wraps)
     if (!t) return null;
     const walk = document.createTreeWalker(t, NodeFilter.SHOW_TEXT);
     for (let n = walk.nextNode(); n; n = walk.nextNode()) {
@@ -155,9 +158,29 @@
       const range = document.createRange();
       range.setStart(n, m.index); range.setEnd(n, m.index + m[0].length);
       const r = [...range.getClientRects()].find((q) => q.width > 2);
-      if (r) return { x: r.left + scrollX + r.width / 2, y: r.top + scrollY - S * 0.45 };
+      if (r) return { x: r.left + scrollX, y: r.top + scrollY, w: r.width, h: r.height };
     }
     return null;
+  }
+  function amountSpot(t, re) {    // just above the first match of `re` in element t
+    const r = textBox(t, re);
+    return r ? { x: r.x + r.w / 2, y: r.y - S * 0.45 } : null;
+  }
+  function words(el) {            // every line of text in el, as page boxes
+    const out = [];
+    if (!el) return out;
+    const walk = document.createTreeWalker(el, NodeFilter.SHOW_TEXT), range = document.createRange();
+    for (let n = walk.nextNode(); n; n = walk.nextNode()) {
+      range.selectNodeContents(n);
+      for (const r of range.getClientRects()) if (r.width) out.push({ l: r.left + scrollX, r: r.right + scrollX, t: r.top + scrollY, b: r.bottom + scrollY });
+    }
+    return out;
+  }
+  // would the sprite standing at p touch none of these words? (its drawn part: S/2 either side, S/2 above, 11/24 S
+  // below; with `shake`, also while it twitches there: 2 px either side, 4 px up)
+  function clear(p, ws, shake) {
+    const sx = S / 2 + (shake ? 2 : 0), up = S / 2 + (shake ? 4 : 0);
+    return !ws.some((q) => q.r > p.x - sx && q.l < p.x + sx && q.b > p.y - up && q.t < p.y + S * 11 / 24);
   }
   const priceSpot = () => amountSpot($("ticker"), /\$[\d,.]+/);    // the coin's price: the ticker's first $ amount
   // the basket's bank in its ticker. A phone wraps it after BANK: it then stands above that word, on the panel's
@@ -174,24 +197,48 @@
   const AVG = 1;
   const coinOf = (row) => { const b = row.querySelector(".h-coin b"); return b ? b.textContent : ""; };
   const sleeves = () => [...document.querySelectorAll("#holdings .h-row:not(.h-head)")];
-  function beside(el) {           // the right-hand end of a cell, if its words leave the sprite room there
-    const b = box(el);
-    if (!b) return null;
-    let right = b.x;
-    const walk = document.createTreeWalker(el, NodeFilter.SHOW_TEXT), range = document.createRange();
-    for (let n = walk.nextNode(); n; n = walk.nextNode()) {
-      range.selectNodeContents(n);
-      [...range.getClientRects()].forEach((r) => { if (r.width) right = Math.max(right, r.right + scrollX); });
-    }
-    return b.x + b.w - right >= S * 1.2 ? { x: b.x + b.w - S * 0.62, y: b.y + b.h / 2 } : null;
+  // where it stands in a row's cell, at the cell's right-hand end: beside the cell's words if they leave room there,
+  // or (under) just below them, reaching no further than the next row's top padding. Only where it touches no word
+  // in the basket (all)
+  function inCell(el, row, all, under, shake) {
+    const b = box(el), rb = box(row);
+    if (!b || !rb) return null;
+    const ws = words(el), x = b.x + b.w - S * 0.62;
+    const p = under ? { x, y: Math.max(b.y, ...ws.map((q) => q.b)) + S / 2 + (shake ? 5 : 1) }
+      : ws.every((q) => q.r <= b.x + b.w - S * 1.2) ? { x, y: b.y + b.h / 2 } : null;
+    return p && p.y + S * 11 / 24 <= rb.y + rb.h + 7 && clear(p, all, shake) ? p : null;
   }
-  // a coin's row: beside its order when one is waiting, else beside its 50-day average (short words at any width)
+  // a coin's row: at its order when one is waiting, else at its 50-day average, else at another of its cells (a
+  // narrow table): beside the cell's words, or under them. A row with no room anywhere is skipped, never stood on.
+  // An order waiting gets the twitch, or where that has no room, the same long look standing still
   function sleeveSpot(coin, twitch) {
     const row = sleeves().find((r) => coinOf(r) === coin);
     if (!row) return null;
-    const pend = row.querySelector(".pend"), avg = row.children[AVG], b = box(avg);
-    const spot = (pend && beside(pend)) || beside(avg) || (b && { x: b.x + b.w - S * 0.62, y: b.y + b.h / 2 });
-    return spot && { ...spot, found: !!(twitch && pend) };
+    const pend = row.querySelector(".pend"), all = words($("basket"));
+    const cells = [pend, ...[...row.children].slice(AVG).filter((c) => c !== pend)].filter(Boolean);
+    const place = (shake) => {
+      for (const c of cells) { const p = inCell(c, row, all, false, shake) || inCell(c, row, all, true, shake); if (p) return p; }
+      return null;
+    };
+    return shaken(place, !!(twitch && pend));
+  }
+  function shaken(place, found) { // a spot with room for the twitch, else (found) one to stand still on as long
+    const spot = place(found);
+    if (spot) return { ...spot, found };
+    const still = found && place(false);
+    return still ? { ...still, dwell: 2600 } : null;
+  }
+  // a row that is scrolled away (a phone, at the top of the page): the coin's name in the VT tab's own label
+  // ("BTC·ETH·SOL") stands in for it, with the row's own order waiting, if the sprite fits just under the name
+  function nameSpot(coin) {
+    const row = sleeves().find((r) => coinOf(r) === coin);
+    const r = row && /^[A-Z0-9]+$/.test(coin) && textBox(document.querySelector(".coin.on .c-name i"), new RegExp(`\\b${coin}\\b`));
+    if (!r) return null;
+    const ws = words($("coins"));
+    return shaken((shake) => {
+      const p = { x: r.x + r.w / 2, y: r.y + r.h + S / 2 + (shake ? 5 : 1) };
+      return clear(p, ws, shake) ? p : null;
+    }, !!row.querySelector(".pend"));
   }
   const FILL = /\b(?:BOUGHT|SOLD|ADDED|TRIMMED) [\d.]+ ([A-Z]+)\b/;   // voltrend.py's fill lines name the coin
   const eventLine = (text) => [...document.querySelectorAll("#events li")].find((li) => li.textContent === text);
@@ -381,7 +428,7 @@
     }
     plan = route(to, pace, visit.hop);
     const how = spot.found ? "found" : visit.kind === "idle" ? "idle" : "read";
-    plan.push(arrive(spot.perch || null), sit(spot.found ? 2600 : visit.dwell, how));
+    plan.push(arrive(spot.perch || null), sit(spot.found ? 2600 : spot.dwell || visit.dwell, how));
   }
   function sleep() {              // no board, or a stale one: home, curl up, and no frames until a fresh board
     queue = []; later = [];
@@ -426,8 +473,14 @@
         } else if (visit.kind === "tour") {
           if (visit.peek) continue;
           later.push(visit);
-          if (visit.batch && !visit.batch.peeked) { visit.batch.peeked = true; peekFor = visit; }   // one peek a tour
-          continue;
+          const alt = visit.alt && visit.alt();             // VT: the coin's name in its tab, while its row is away
+          if (alt && seen(alt.y, S / 2)) {
+            visit = { ...visit, at: visit.alt, alt: null, peek: true };   // like a peek, never kept for later
+            spot = alt;
+          } else {
+            if (visit.batch && !visit.batch.peeked) { visit.batch.peeked = true; peekFor = visit; }   // one peek a tour
+            continue;
+          }
         }
       }
       if (peekFor) { queue.unshift(peekAt(peekFor), visit); peekFor = null; continue; }
@@ -520,6 +573,7 @@
 
   // ---- what the desk is doing -----------------------------------------------------------------------
   let board = {}, lastTour = 0, tickCoin = null, lastPrice = null, lastHop = Date.now();   // no hop in the first 20 s
+  let switched = false;           // a tab was clicked: the next board tours, whichever it is
   function alive() {              // a board has landed and it is recent enough to say the desk is running
     if (!board.updated) return false;
     return Date.now() - board.updated < (board.static === false ? STALE_LIVE : STALE_STATIC);
@@ -556,7 +610,7 @@
     const batch = { peeked: false };
     const stops = rows.map((r, k) => {
       const coin = coinOf(r), odd = shared && many(states[k]) === 1;
-      return { kind: "tour", batch, at: () => sleeveSpot(coin, true), dwell: odd ? rand(2000, 2500) : rand(800, 1300) };
+      return { kind: "tour", batch, at: () => sleeveSpot(coin, true), alt: () => nameSpot(coin), dwell: odd ? rand(2000, 2500) : rand(800, 1300) };
     });
     stops.push({ kind: "tour", batch, at: bankSpot, dwell: 1400 });
     return stops;
@@ -596,8 +650,8 @@
     touch();
     candle = d.candle || null;
     const fills = newFills(d.coin), now = Date.now();
-    const fresh = d.coin !== board.coin || d.scanned !== board.scanned || (d.updated !== board.updated && now - lastTour > RETOUR);
-    board = d;
+    const fresh = switched || d.coin !== board.coin || d.scanned !== board.scanned || (d.updated !== board.updated && now - lastTour > RETOUR);
+    board = d; switched = false;
     label();
     reveal();
     if (!on) return;
@@ -645,10 +699,12 @@
     kick();
   });
 
-  // another tab: drop the old coin's plan; the new board's tour follows as soon as it loads
+  // another tab: drop the old coin's plan; the tour of whichever board loads next follows as soon as it does (the
+  // clicked tab's, or the shown one's again when another tab was clicked before that one loaded)
   document.addEventListener("click", (e) => {
     const tab = e.target instanceof Element && e.target.closest(".coin[data-coin]");
     if (!tab || tab.dataset.coin === board.coin) return;  // the tab already shown: nothing changes
+    switched = true;
     queue = queue.filter((v) => v.kind !== "tour" && v.kind !== "event");
     later = [];
     if (visit && (visit.kind === "tour" || visit.kind === "event")) cut();
