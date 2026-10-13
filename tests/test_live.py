@@ -473,6 +473,22 @@ def test_when_the_fills_cant_be_read_the_exit_falls_back_loudly(tmp_path, readab
         assert any("couldn't be read" in a for a in said)
 
 
+def test_an_exit_partly_made_by_hand_is_booked_from_every_closing_fill(tmp_path):
+    """0.001 of a 0.004 BTC long is closed by hand on the exchange, then the stop takes the rest: the exit is the
+    average of both fills, not the stop's price on the whole position."""
+    ex = FakeHyperliquid({"BTC": 80_000.0}, slip_bps=0.0)
+    b = _broker("BTC", ex, tmp_path, cap=500.0, sleep=Sleeps())
+    b.submit(Order("open", Side.LONG, 0.004, "breakout", stop=78_000.0))
+    b.execute_now(80_000.0, T0)
+    ex.move("BTC", 79_500.0)
+    ex.create_order("BTC/USDC:USDC", "market", "sell", 0.001, 79_500.0, {"reduceOnly": True})
+    ex.move("BTC", 77_900.0, fill_at=77_850.0)
+    b.check_stop_price(77_900.0, ex.now)
+    t = b.trades[-1]
+    assert t.exit_price == pytest.approx((0.001 * 79_500 + 0.003 * 77_850) / 0.004)
+    assert t.fees == pytest.approx(sum(f["fee"]["cost"] for f in ex.fills))
+
+
 def test_a_desk_close_carries_the_exchanges_fees_and_funding(tmp_path):
     ex = FakeHyperliquid({"ETH": 2_600.0}, fee_bps=2.0)
     b = _broker("ETH", ex, tmp_path, cap=500.0, sleep=Sleeps())

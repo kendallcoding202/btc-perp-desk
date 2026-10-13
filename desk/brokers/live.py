@@ -1,18 +1,27 @@
 """Live broker — real orders through ccxt's unified API.
 
-STATUS: written against ccxt's documented unified API (create_order with
-reduceOnly / stopLossPrice, fetch_positions, fetch_balance) but NOT yet run
-against a funded account. Before trusting it:
+STATUS: written against ccxt's unified API (create_order with reduceOnly /
+stopLossPrice, fetch_positions, fetch_balance, fetch_open_orders,
+fetch_my_trades, fetch_funding_history) and tested against an in-process fake
+that answers the way ccxt 4.5's hyperliquid class does (tests/test_live.py).
+It has NOT been run against a funded account. Before trusting it:
 
   1. run `python -m desk paper` for the promotion period,
-  2. run `python -m desk live --max-notional 50` (a $50 cap) and watch every fill,
+  2. run `python -m desk live --coin BTC --max-notional 50` (a $50 cap) and watch every fill,
   3. only then raise the cap.
 
 Design rules:
+  * each coin trades its own perp (SYMBOL_FORMATS), on that market's size step and
+    minimum order; no market for the coin = refuse to start;
   * the protective stop lives ON THE EXCHANGE as a reduce-only stop-market order,
-    so if this process dies the position is still protected;
+    so if this process dies the position is still protected. It counts as placed only
+    once it is read back from the open orders; it is retried with backoff, and if it
+    still won't rest the position is closed and an alert goes out. Every sync checks
+    it is still there and puts it back if not;
   * the exchange is the source of truth for the position; the desk's local copy
-    (entry, best close, stop) is reconciled on every sync;
+    (entry, best close, stop) is reconciled on every sync. An exit the exchange made
+    is booked at its own fills, fees and funding, never at a later mid;
+  * each coin's state is its own file (state/<COIN>/live_position.json);
   * any exception while placing an order leaves the desk in entry_kill.
 """
 
@@ -321,7 +330,8 @@ class LiveBroker:
         pos = self.position
         closing = [t for t in self._fills_since(pos.entry_ts) or [] if t.get("side") == self._closing_side(pos.side)]
         by_stop = [t for t in closing if self.stop_order_id and str(t.get("order")) == self.stop_order_id]
-        fills = by_stop or closing
+        whole = by_stop and math.isclose(self._sum_fills(by_stop)[0], pos.qty, rel_tol=1e-6)
+        fills = by_stop if whole else closing      # the stop's own fills, unless something else closed part of it
         est_fee = lambda px: pos.qty * px * self.p.costs.taker_fee_bps / 1e4   # noqa: E731
         reason, px, fee, ts = "stop (exchange)", None, None, None
         if fills:
