@@ -37,9 +37,11 @@
   const TRADE = /\b(BOUGHT|SOLD|SHORTED|COVERED|ADDED|TRIMMED|STOP|HALT)\b/;
   const HOP_EVERY = 20000;              // at most one hop to the ticker per 20 s
   const RETOUR = 5 * 60000;             // same coin, same bar: a fresh `updated` tours again after 5 min (live server)
-  // a board older than this means the desk is not running: static boards are published every 15 min (so two
-  // missed runs and then some), the live server steps every minute or so
-  const STALE_STATIC = 40 * 60000, STALE_LIVE = 5 * 60000;
+  // a board older than this means the desk is not running. The static board is published by every desk run:
+  // GitHub's 15-min schedule fires only now and then, and the hourly backup makes sure of at least one run per
+  // 2h bar, so a board up to ~2h old is normal and one past 2.5h has missed a bar. The live server steps every
+  // minute or so
+  const STALE_STATIC = 150 * 60000, STALE_LIVE = 5 * 60000;
 
   const reduced = matchMedia("(prefers-reduced-motion: reduce)");
   const phone = matchMedia("(max-width: 560px)");
@@ -464,7 +466,8 @@
   function apply() {
     layer.hidden = !on;
     if (on) root.dataset.spider = "on"; else delete root.dataset.spider;    // app.js leaves the web's hub empty for it
-    if (btn) { btn.textContent = `spider: ${on ? "on" : "off"}`; btn.setAttribute("aria-pressed", String(on)); }
+    if (btn) btn.setAttribute("aria-pressed", String(on));
+    label();
     if (!on || reduced.matches || document.hidden) stop(); else start();
     if (on && reduced.matches) rest();
   }
@@ -474,6 +477,14 @@
   function alive() {              // a board has landed and it is recent enough to say the desk is running
     if (!board.updated) return false;
     return Date.now() - board.updated < (board.static === false ? STALE_LIVE : STALE_STATIC);
+  }
+  function label() {              // the footer button says what the spider is doing, and why when it is still
+    if (!btn) return;
+    const age = Date.now() - board.updated, h = Math.floor(age / 3600000), m = Math.floor(age / 60000) % 60;
+    btn.textContent = !on ? "spider: off"
+      : reduced.matches ? "spider: still (reduce motion is on)"
+      : alive() ? "spider: on"
+      : board.updated ? `spider: asleep, no desk run for ${h ? `${h}h ` : ""}${m}m` : "spider: asleep, no board yet";
   }
   const seenLines = new Map();    // coin → the event lines already on its board
   function newFills(coin) {
@@ -524,6 +535,7 @@
     const fills = newFills(d.coin), now = Date.now();
     const fresh = d.coin !== board.coin || d.scanned !== board.scanned || (d.updated !== board.updated && now - lastTour > RETOUR);
     board = d;
+    label();
     reveal();
     if (!on) return;
     if (reduced.matches) { rest(); return; }
@@ -551,6 +563,7 @@
     if (d.candle) candle = d.candle;
     const moved = d.coin === tickCoin && lastPrice != null && d.price != null && d.price !== lastPrice;
     tickCoin = d.coin; lastPrice = d.price;
+    label();
     if (!on) return;
     if (reduced.matches) { rest(); return; }
     if (!running) return;
