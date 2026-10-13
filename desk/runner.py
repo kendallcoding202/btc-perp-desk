@@ -370,7 +370,8 @@ def run(p: Params, mode: str, *, state_dir: str = "state", poll_s: float = 15.0,
 
             state = board_mod.build(desk, f, len(f.bars) - 1, mode=mode, ctx=ctx, jev_client=jev, now_ms=now,
                                     goal_pace=goal_pace, elapsed_days=(now - meta["started_ts"]) / 86400_000,
-                                    flows=flows_mod.State(meta["start_equity"], recorded), crawler={
+                                    flows=flows_mod.State(meta["start_equity"], recorded),
+                                    start_equity=meta["start_equity"], crawler={
                 "source": f"hyperliquid · {p.market.interval}", "funding_prints": len(funding),
                 "requests": feed.requests, "latency_ms": feed.last_latency_ms,
                 "age_s": (now - (f.bars[-1].ts + f.bar_ms)) / 1000})

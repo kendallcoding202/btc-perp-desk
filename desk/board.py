@@ -171,10 +171,13 @@ def trigger_outlook(f: ind.Features, i: int, n: int, limit: int = 10, short: boo
 
 def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict | None = None,
           jev_client=None, now_ms: int | None = None, candles: int = 140, goal_pace: dict | None = None,
-          elapsed_days: float | None = None, flows=None, venue_state: dict | None = None) -> dict:
-    """`venue_state`: paper's record of the venue (venue.remember) for an account with venue rules, else None."""
+          elapsed_days: float | None = None, flows=None, start_equity: float | None = None,
+          venue_state: dict | None = None) -> dict:
+    """start_equity: the account's own starting balance (a live account's first exchange balance); paper boards
+    leave it out and start from the paper setting. `venue_state`: paper's record of the venue (venue.remember) for
+    an account with venue rules, else None."""
     p, broker, dec = desk.p, desk.broker, desk.last_decision
-    rules = desk.venue          # venue rules (Coinbase for BTC), or None
+    vrules = desk.venue         # venue rules (Coinbase for BTC), or None
     coin = p.market.symbol
     shorts = p.strategy.allow_shorts and p.strategy.short_mode == "breakdown"
     bars = f.bars
@@ -188,7 +191,7 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
     wins = sum(1 for t in trades if t.net_pnl > 0)
     losses = len(trades) - wins
     a = f.atr[i] or 0.0
-    start_eq = p.sizing.starting_equity
+    start_eq = p.sizing.starting_equity if start_equity is None else start_equity
     bars_per_day = max(1, int(86400_000 / f.bar_ms))
     prev = bars[max(0, i - bars_per_day)].close
     chg_24h = price / prev - 1 if prev else 0.0
@@ -251,21 +254,21 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
     else:
         quotes["crowd"] = f"funding {fapr:+.1f}% apr. nobody's crowded, nobody's squeezed."
     cards["crowd"] = dict(value=f"{crowd:.2f}" if crowd is not None else "—",
-                          detail=f"funding {fapr:+.1f}% apr" + (" (est.)" if rules else "")
+                          detail=f"funding {fapr:+.1f}% apr" + (" (est.)" if vrules else "")
                           + (f" · oi {_usd(ctx.open_interest_usd / 1e9, 2)}B" if ctx and ctx.open_interest_usd else ""),
                           score=crowd, state="blocked" if _gate(dec, "crowding") and
                           _gate(dec, "crowding").verdict == Verdict.DROP else "idle", asks_jev=p.jev.mode != "off")
 
-    held = (lambda q: rules.describe(q, coin)) if rules is not None else (lambda q: f"{q:.4f} {coin}")
-    skip = _venue_skip(dec) if rules is not None else None
+    held = (lambda q: vrules.describe(q, coin)) if vrules is not None else (lambda q: f"{q:.4f} {coin}")
+    skip = _venue_skip(dec) if vrules is not None else None
     if pos:
         notional = pos.qty * price
         quotes["size"] = f"{held(pos.qty)} on, {_usd(notional)} notional, {notional / equity:.2f}x." + (
-            f" margin {_usd(rules.margin_in_use(pos.qty, price, pos.side.sign))} overnight." if rules else "")
+            f" margin {_usd(vrules.margin_in_use(pos.qty, price, pos.side.sign))} overnight." if vrules else "")
         size_val = _usd(notional)
     elif skip is not None:
         quotes["size"], size_val = f"skipped: {skip.note}.", "SKIP"
-    elif dec and dec.qty and rules is not None:     # whole contracts: what they risk, not the budget they fit in
+    elif dec and dec.qty and vrules is not None:     # whole contracts: what they risk, not the budget they fit in
         d = abs(bar.close - dec.stop)
         eq_dec = dec.notional / dec.leverage if dec.leverage else equity
         quotes["size"] = (f"{held(dec.qty)} at a {_usd(d)} stop risks {dec.qty * d / eq_dec:.1%} (budget "
@@ -278,20 +281,20 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
     else:
         quotes["size"], size_val = "nothing to size.", "$0"
     cards["size"] = dict(value=size_val, detail=f"risk {p.sizing.risk_per_trade:.1%} · ≤{p.sizing.max_leverage:.0f}x"
-                         + (f" · {rules.spec.contract_size:g} {coin} contracts" if rules else ""),
+                         + (f" · {vrules.spec.contract_size:g} {coin} contracts" if vrules else ""),
                          state="active" if pos else "blocked" if skip is not None else "idle")
 
     lf = broker.last_fill
     if lf:
         quotes["fills"] = (f"{'bought' if (lf['action'] == 'open') == (lf['side'] == 'long') else 'sold'} "
-                           f"{held(lf['qty']) if rules else format(lf['qty'], '.4f')} @ {_usd(lf['price'])}, "
-                           f"fee {_usd(lf['fee'], 2)}{' (est.)' if rules else ''}"
+                           f"{held(lf['qty']) if vrules else format(lf['qty'], '.4f')} @ {_usd(lf['price'])}, "
+                           f"fee {_usd(lf['fee'], 2)}{' (est.)' if vrules else ''}"
                            + (f", net {lf['net_pnl']:+,.2f}" if 'net_pnl' in lf else "") + ".")
     else:
         quotes["fills"] = "no fills yet. taker in, taker out."
     cards["fills"] = dict(value=f"{broker.orders_filled}/{broker.orders_submitted}",
-                          detail=(f"fee est. max(${rules.spec.fee_min_per_contract:.2f}/contract, "
-                                  f"{p.costs.taker_fee_bps:g}bps) + slip {p.costs.slippage_bps:g}bps" if rules else
+                          detail=(f"fee est. max(${vrules.spec.fee_min_per_contract:.2f}/contract, "
+                                  f"{p.costs.taker_fee_bps:g}bps) + slip {p.costs.slippage_bps:g}bps" if vrules else
                                   f"taker {p.costs.taker_fee_bps}bps + slip {p.costs.slippage_bps}bps"),
                           state="active" if broker.pending else "idle")
 
@@ -351,15 +354,15 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
 
     curve = _thin(desk.equity_curve, 400)
     k = desk.kills
-    title = f"{coin} PERP DESK" if rules is None else \
-        f"{rules.spec.display} ({rules.spec.contract_size:g} {coin} contracts)"
+    title = f"{coin} PERP DESK" if vrules is None else \
+        f"{vrules.spec.display} ({vrules.spec.contract_size:g} {coin} contracts)"
     state = with_flows({
         "updated": now_ms,
         "header": {
             "title": title, "coin": coin, "risk_per_trade": p.sizing.risk_per_trade,
             "tagline": ("SCAN PICKS · RISK SIZES · FILLS TRADES" + (" · LONG + SHORT" if p.strategy.allow_shorts else "")
-                        if rules is None else    # its title is the real product's: say it's simulated, up front
-                        f"{mode.upper()} · SIMULATED ON {rules.spec.name.upper()} RULES · NO ORDERS SENT"),
+                        if vrules is None else    # its title is the real product's: say it's simulated, up front
+                        f"{mode.upper()} · SIMULATED ON {vrules.spec.name.upper()} RULES · NO ORDERS SENT"),
             "shorts": p.strategy.allow_shorts, "experiment": EXPERIMENTS.get(coin),
             "mode": mode.upper(), "venue": p.market.venue, "interval": p.market.interval,
             "day": day_n, "date": now.strftime("%b %d").upper(), "time": now.strftime("%H:%M"),
@@ -367,8 +370,8 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
         "ticker": {
             "price": price, "change_24h": chg_24h, "bank": equity, "pnl": equity - start_eq,
             "pnl_pct": equity / start_eq - 1, "position": side_txt,
-            "position_detail": ((f"{rules.contracts(pos.qty)} contract{'s' if rules.contracts(pos.qty) != 1 else ''} "
-                                 f"@ {pos.entry_price:,.0f}" if rules else
+            "position_detail": ((f"{vrules.contracts(pos.qty)} contract{'s' if vrules.contracts(pos.qty) != 1 else ''} "
+                                 f"@ {pos.entry_price:,.0f}" if vrules else
                                  f"{pos.qty:.4f} @ {pos.entry_price:,.0f}") if pos else ""),
             "hold_pct": hold, "record": f"{wins}W {losses}L", "fees": broker.fees_total, "cash": broker.cash,
             "pos": None if pos is None else {"side": pos.side.value, "qty": pos.qty, "entry": pos.entry_price,
@@ -407,8 +410,9 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
             "calls": getattr(jev_client, "calls", 0), "answers": dec.jev_answers if dec else None,
         },
         "events": [{"ts": e.ts, "agent": e.agent, "text": e.text} for e in list(desk.events)[-30:]],
+        "rules": rules(p),
     }, flows, equity, now_ms)
-    if rules is not None:       # only an account with venue rules: the other boards are as they were
+    if vrules is not None:      # only an account with venue rules: the other boards are as they were
         state["venue"] = venue_block(desk, f, i, price, equity, now_ms, venue_state)
     return state
 
@@ -556,3 +560,12 @@ def basket(book, *, now_ms: int, marks: dict[str, float], meta: dict, crawler: d
                   "cooldown": False},
         "jev": {"mode": "off", "enabled": False, "calls": 0, "answers": None},
     }, flows, equity, now_ms)
+
+
+def rules(p) -> dict:
+    """The strategy settings a desk board's page recomputes with: the EMA periods for its live trend row, the
+    breakout window and stop widths for its labels. Read from Params, so the page never hard-codes them."""
+    s = p.strategy
+    return {"interval": p.market.interval, "ema_fast": s.ema_fast, "ema_slow": s.ema_slow,
+            "breakout_bars": s.breakout_bars, "stop_atr": s.stop_atr, "trail_atr": s.trail_atr,
+            "risk_per_trade": p.sizing.risk_per_trade, "allow_shorts": s.allow_shorts}
