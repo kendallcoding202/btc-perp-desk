@@ -13,3 +13,6 @@ state/*
 ledger/*
 !ledger/.gitkeep
 *.tmp
+# research data caches (re-fetched by each project's download.py)
+research/*/data/
+research/*/data
