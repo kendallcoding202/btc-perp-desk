@@ -301,11 +301,14 @@
 
   function renderStage(s) {
     const t = s.ticker, k = s.kills, coin = s.header.coin || "BTC";
-    const liveTag = live.at ? `<span class="live-dot" aria-hidden="true"></span>LIVE · ` : "";
+    // BTC on Coinbase: between runs the live price is Hyperliquid's (a proxy), and nothing moves while Coinbase is closed
+    const v = s.venue, proxy = v && live.at && !v.closed_now;
+    const liveTag = v && v.closed_now ? "CLOSED (COINBASE) · " : live.at
+      ? `<span class="live-dot" aria-hidden="true"></span>LIVE${v ? " (HYPERLIQUID PROXY)" : ""} · ` : "";
     $("ticker").innerHTML = `‹ ${liveTag}TRADES · ${esc(coin)} ${px(t.price)} · BANK ${usd(t.bank)} · ` +
       `<span class="hl">${esc(t.position)}${t.position_detail ? " " + esc(t.position_detail) : ""}</span>` +
-      ` · ${esc(t.record)} · HOLD ${pct(t.hold_pct)} · ${pnlTag(s)} · FEES ${usd(t.fees)}${s.venue ? " (EST.)" : ""} · FUNDING ${s.venue ? "(EST.) " : ""}${usd(t.funding)}`;
-    $("chart-title").textContent = `${s.venue ? s.venue.product : coin + "-PERP"} · ${s.header.interval} · ${px(t.price)}`;
+      ` · ${esc(t.record)} · HOLD ${pct(t.hold_pct)} · ${pnlTag(s)} · FEES ${usd(t.fees)}${v ? " (EST.)" : ""} · FUNDING ${v ? "(EST.) " : ""}${usd(t.funding)}`;
+    $("chart-title").textContent = `${v ? v.product : coin + "-PERP"} · ${s.header.interval} · ${px(t.price)}${proxy ? " (HL proxy)" : ""}`;
     $("chart-sub").textContent = `24h ${pct(t.change_24h)} · ema.fast pink · ema.slow blue · channel dashed`;
     const chips = $("chips");
     chips.innerHTML = s.agents.map((a) => `<span class="chip ${a.state === "idle" ? "off" : ""}" title="${esc(a.name)}: ${esc(a.state)}"
@@ -346,7 +349,7 @@
       const at = (rate, y) => `<span>(${pct(rate, 1)}/yr): ${yrs(y)}</span>`;   // wraps before the numbers, not inside them
       const pace = goal.test_cagr === undefined && goal.backtest_cagr !== undefined
         ? `at backtest pace ${at(goal.backtest_cagr, goal.years_at_backtest_rate)}`
-        : `at ${span}backtest pace${goal.plan_included ? " + planned deposits" : ""} ${at(goal.test_cagr, goal.years_at_test_rate)}`;
+        : `at ${span}backtest pace${goal.test_label ? ` of ${esc(goal.test_label)}` : ""}${goal.plan_included ? " + planned deposits" : ""} ${at(goal.test_cagr, goal.years_at_test_rate)}`;
       // with deposits: the paces are the NAV's (deposits aren't growth), the years count the plan still to come
       const din = goal.deposits_in || 0, dout = goal.withdrawn || 0, nx = goal.next_extra;
       const money = goal.deposited == null ? "" : `<br>${[din && `deposited ${usd(din, 0)}`, dout && `withdrawn ${usd(dout, 0)}`].filter(Boolean).join(" · ")}` +
@@ -374,7 +377,8 @@
       ["$" + s.header.coin, "basket", "sym"], ["Cash", usd(t.cash)], ["Held", usd(t.notional)],
       ["Exposure", `${num(t.exposure)}x`], ["Unrealised", usd(t.unrealised)], ["Fees", usd(t.fees)], ["Funding", usd(t.funding)],
     ] : v ? [
-      ["$" + (s.header.coin || "BTC"), "perp · " + s.header.venue, "sym"], ["Price", px(st.price)],
+      ["$" + (s.header.coin || "BTC"), "perp · " + s.header.venue, "sym"],
+      [live.at && !v.closed_now ? "Price (HL proxy)" : "Price", px(st.price)],
       [`Contracts · ${v.contract_size} ${s.header.coin || "BTC"}`, String(v.contracts)],
       [`Margin · ${(v.margin_rate * 100).toFixed(1)}% o/n`, v.contracts ? usd(v.margin_in_use, 0) : "none"],
       ["Funding APR (est.)", `${num(st.funding_apr, 1)}%`], ["ATR", `${num(st.atr_pct)}%`],
@@ -390,10 +394,13 @@
     const olHead = s.analysis.outlook_side === "short"
       ? `SHORT LINE · a 2h close below it shorts; steps up as old lows age out (if ${esc(s.header.coin || "BTC")} makes no new low)`
       : `BUY LINE · steps down as old highs age out (if ${esc(s.header.coin || "BTC")} makes no new high)`;
-    const nc = v && v.session.next_closure, sk = v && v.skipping;
+    const nc = v && v.session.next_closure, sk = v && v.skipping, cn = v && v.closed_now, fs = v && v.funding.stale_since;
     const venueLine = v ? `<div class="ol-exp">${esc(v.display)} RULES · whole ${v.contract_size} BTC contracts (one is ${usd(v.one_contract_usd, 0)}), ` +
       `≤${v.max_leverage}x, overnight margin ${(v.margin_rate * 100).toFixed(1)}% · fees est. ${esc(v.fee_estimate)} · funding est. from ${v.funding.logged} logged hourly rates` +
-      (nc ? ` · ${v.session.open === false ? "CLOSED NOW" : "next closure"} ${esc(nc.why)} ${day(nc.start)}–${hhmm(nc.end)} UTC` : "") +
+      (fs ? ` <b>(none new since ${mmddhhmm(fs)} UTC)</b>` : "") + (v.stop_fill ? ` · ${esc(v.stop_fill)}` : "") +
+      (cn ? ` · <b>CLOSED NOW: ${esc(cn.why)}${cn.until ? ` until ${hhmm(cn.until)} UTC` : ""}</b>` : "") +
+      (nc && !(cn && cn.scheduled) ? ` · next ${cn ? "scheduled " : ""}closure ${esc(nc.why)} ${day(nc.start)}–${hhmm(nc.end)} UTC` : "") +
+      (v.waiting_for ? ` · <b>WAITING for Coinbase's ${mmddhhmm(v.waiting_for)} UTC candle</b>` : "") +
       (sk ? ` · <b>SKIPPING: ${esc(sk.note)}</b>` : "") + `</div>` : "";
     $("outlook").innerHTML = venueLine + (s.header.experiment ? `<div class="ol-exp">EXPERIMENT · ${esc(s.header.experiment)}</div>` : "") +
       (ol.length ? `<div class="ol-head">${olHead}</div>` +
@@ -561,6 +568,7 @@
     if (!snap) return snap;
     const s = JSON.parse(JSON.stringify(snap));
     if (s.header.kind === "basket") return withLiveBasket(s);
+    if (s.venue && s.venue.closed_now) return s;   // Coinbase closed: the board's own price, nothing re-marked
     const mid = parseFloat(live.mids[s.header.coin || "BTC"]);
     if (!mid) return s;
     const t = s.ticker;
@@ -571,8 +579,8 @@
       t.hold_pct = p ? u / (p.qty * p.entry) : 0;
       rebank(s, t.cash + u);
     }
-    const c = live.candle, ch = s.chart;
-    if (c && live.candleCoin === (s.header.coin || "BTC") && ch.candles.length && c[0] > ch.candles[ch.candles.length - 1][0]) {
+    const c = live.candle, ch = s.chart;   // never Hyperliquid's forming candle on a Coinbase chart
+    if (c && !s.venue && live.candleCoin === (s.header.coin || "BTC") && ch.candles.length && c[0] > ch.candles[ch.candles.length - 1][0]) {
       c[4] = mid; c[2] = Math.max(c[2], mid); c[3] = Math.min(c[3], mid);
       ch.candles.push(c);
       const line = (s.analysis.outlook && s.analysis.outlook[0]) ? s.analysis.outlook[0].level : null;

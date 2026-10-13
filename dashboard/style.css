@@ -182,8 +182,8 @@ body.kind-basket .analysis-body { grid-template-columns: minmax(0, 1fr); }
 .ol-rows i { font-style: normal; font-size: 10px; color: var(--muted); }
 .analysis-body { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; padding: 10px 14px; }
 .gates { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; font-size: 11px; }
-.gates li { display: flex; justify-content: space-between; gap: 8px; border-bottom: 1px dotted var(--line); padding: 2px 0; }
-.gates li span:first-child { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.gates li { display: flex; justify-content: space-between; gap: 8px; border-bottom: 1px dotted var(--line); padding: 2px 0; min-width: 0; }
+.gates li span:first-child { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .v { font-family: var(--pixel); font-size: 10px; font-weight: 700; }
 .v.PASS { color: var(--green); } .v.MARK { color: var(--yellow); } .v.DROP { color: var(--red); }
 .v.WAIT { color: var(--blue); } .v.SKIP { color: var(--dim); }
