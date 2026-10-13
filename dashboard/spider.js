@@ -1,11 +1,16 @@
 // The walking crawler. A pixel spider that goes to whatever the desk just did, so you can watch the desk
 // work through its checks. Every move comes from the board's real state:
-//   a new board (a run landed, or another tab)   the agent cards in gate order (SCAN, VET, CROWD, SIZE, FILLS,
-//                                                RISK), staying longest on the one holding the entry back, then
-//                                                the newest candle, then the BUY / SHORT LINE
+//   a new board (a run landed, or another tab)   the agent cards in the order the desk checks their gates (the
+//                                                board's own gate list: kills, data, hard, scan, soft, size),
+//                                                staying longest on the one holding the entry back, then the
+//                                                newest candle, then the BUY / SHORT LINE
 //   a live price tick (at most one per 20 s)     a quick hop to the price in the ticker, then back
 //   a new fill (BOUGHT, SOLD, SHORTED, ...)      it runs to that event line and stays a few seconds
-//   nothing new                                  a slow walk along the panel edges, now and then a drop on silk
+//   nothing new                                  a slow walk along the panel edges, long rests, now and then a
+//                                                drop on silk
+//   no board yet, or one too old to trust        it curls up at home and keeps still until a fresh board lands
+// It only goes where you can see it. A stop that is scrolled out of view waits (one peek from the screen's edge
+// towards it) and is visited when you scroll to it; it never scrolls the page for you.
 // It is decoration. It changes nothing about how the desk trades: the rules are fixed in desk/thresholds.py.
 // app.js tells it about boards and ticks with two window events ("desk:board", "desk:tick"); everything else
 // it reads from the page. It never takes a click (pointer-events: none), stops while the tab is hidden, sits
@@ -18,17 +23,23 @@
   const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
   const ease = (k) => (k < 0.5 ? 2 * k * k : 1 - (2 - 2 * k) ** 2 / 2);
 
-  // The CRAWLER card's sprite (X = body, k = eye) and a second leg pose for walking.
+  // The CRAWLER card's sprite (X = body, k = eye), a second leg pose for walking, and curled up asleep.
   const POSES = [
     ["X..........X", ".X........X.", "..X.XXXX.X..", "...XXXXXX...", "XXXXkXXkXXXX", "...XXXXXX...",
      "..XXXXXXXX..", ".X.XXXXXX.X.", "X...XXXX...X", "...X....X...", "..X......X..", "............"],
     [".X........X.", ".X........X.", "..X.XXXX.X..", "X..XXXXXX..X", ".XXXkXXkXXX.", "...XXXXXX...",
      "X.XXXXXXXX.X", ".X.XXXXXX.X.", "....XXXX....", "..XX....XX..", ".X........X.", "............"],
+    ["............", "............", "............", "....XXXX....", "..XXXXXXXX..", ".XXkkXXkkXX.",
+     ".XXXXXXXXXX.", "X.XXXXXXXX.X", ".X.XXXXXX.X.", "X.X.XXXX.X.X", ".X.X....X.X.", "............"],
   ];
-  const TOUR = ["scan", "vet", "crowd", "size", "fills", "risk"];      // the order an entry meets the agents
+  // filter.py's order, by the card that owns each gate. Used only when a board lists no gates.
+  const ORDER = ["risk", "chief", "crawler", "vet", "crowd", "fills", "scan", "size"];
   const TRADE = /\b(BOUGHT|SOLD|SHORTED|COVERED|ADDED|TRIMMED|STOP|HALT)\b/;
   const HOP_EVERY = 20000;              // at most one hop to the ticker per 20 s
   const RETOUR = 5 * 60000;             // same coin, same bar: a fresh `updated` tours again after 5 min (live server)
+  // a board older than this means the desk is not running: static boards are published every 15 min (so two
+  // missed runs and then some), the live server steps every minute or so
+  const STALE_STATIC = 40 * 60000, STALE_LIVE = 5 * 60000;
 
   const reduced = matchMedia("(prefers-reduced-motion: reduce)");
   const phone = matchMedia("(max-width: 560px)");
@@ -42,6 +53,7 @@
   const layer = document.createElement("div");
   layer.className = "spider-layer";
   layer.setAttribute("aria-hidden", "true");
+  layer.style.visibility = "hidden";   // until the first board lays the page out (or 2.5 s without one): see reveal()
   const silkEl = document.createElement("i");
   silkEl.className = "spider-silk";
   const body = document.createElement("canvas");
@@ -93,7 +105,8 @@
     return boxes.get(el);
   }
   const touch = () => { dirty = true; };
-  const inView = (y) => y > scrollY && y < scrollY + innerHeight;
+  // is page-y on screen, `m` px clear of the top and bottom? (m = S / 2: the whole sprite shows; -S / 2: any of it)
+  const seen = (y, m) => { if (dirty) refresh(); return y > scrollY + m && y < scrollY + innerHeight - m; };
   // where it stands on an element's top (or bottom) edge, a fraction f of the way along; `inset` > 0 is inside
   const edge = (b, top, f, inset = -0.22) => ({ x: b.x + b.w * f, y: top ? b.y + S * inset : b.y + b.h - S * inset });
 
@@ -107,19 +120,21 @@
   function cardSpot(key, blocker) {
     const el = $(`card-${key}`), b = box(el);
     if (!b) return null;
-    return { ...edge(b, true, 0.62, 0.12), found: key === blocker || el.classList.contains("blocked"), perch: { el, top: true } };
+    // CHIEF's card goes red on any drop (STAND DOWN): that is the summary, not the gate that dropped it
+    const found = key === blocker || (key !== "chief" && el.classList.contains("blocked"));
+    return { ...edge(b, true, 0.62, 0.12), found, perch: { el, top: true } };
   }
-  let candle = null;              // the newest candle's high, in #chart's own pixels (from app.js)
+  let candle = null;              // app.js's getter: the newest candle's high in #chart px, as last drawn
   function candleSpot() {
-    const b = candle && box($("chart"));
-    return b ? { x: b.x + candle.x, y: b.y + candle.y - S * 0.4 } : null;
+    const c = typeof candle === "function" ? candle() : candle, b = c && box($("chart"));
+    return b ? { x: b.x + c.x, y: b.y + c.y - S * 0.4 } : null;
   }
   function lineSpot() {           // the next close on the BUY LINE / SHORT LINE, when the board shows one
     const el = document.querySelector("#outlook .ol-rows .now") || document.querySelector("#outlook .ol-head");
-    const b = box(el);
-    return b ? { ...edge(b, true, 0.5), perch: { el, top: true } } : null;
+    const b = box(el);              // on the box's top-right corner, clear of the heading's words and the level
+    return b ? { x: b.x + b.w - S * 0.2, y: b.y - S * 0.22, perch: { el, top: true } } : null;
   }
-  function priceSpot() {          // the coin's price in the ticker (the first $ amount in it)
+  function priceSpot() {          // just above the coin's price in the ticker (the first $ amount in it)
     const t = $("ticker");
     if (!t) return null;
     const walk = document.createTreeWalker(t, NodeFilter.SHOW_TEXT);
@@ -129,7 +144,7 @@
       const range = document.createRange();
       range.setStart(n, m.index); range.setEnd(n, m.index + m[0].length);
       const r = range.getBoundingClientRect();
-      if (r.width) return { x: r.left + scrollX + r.width / 2, y: r.top + scrollY - S * 0.22 };
+      if (r.width) return { x: r.left + scrollX + r.width / 2, y: r.top + scrollY - S * 0.45 };
     }
     return null;
   }
@@ -138,15 +153,25 @@
     const b = box(eventLine(text));
     return b ? { x: b.x + S * 0.35, y: b.y + S * 0.1 } : null;     // on the agent's name; the trade text stays clear
   }
+  function tradeSpot() {          // a trade whose line is scrolled away also shows in the ticker's position, or the tab
+    const chip = document.querySelector("#ticker .hl"), c = box(chip);
+    if (c && seen(c.y, S / 2)) return { x: c.x + c.w / 2, y: c.y - S * 0.45, perch: { el: chip, top: true } };
+    const tab = document.querySelector(".coin.on"), t = box(tab);
+    if (t && seen(t.y, S / 2)) return { ...edge(t, true, 0.5), perch: { el: tab, top: true } };
+    return null;
+  }
 
-  // ---- motion: a visit becomes a plan of small actions; each returns ms until it next needs a frame, -1 = done
-  const sp = { x: 0, y: 0, ox: 0, oy: 0, legs: 0, pose: 0 };     // legs: ms per step while walking, 0 when still
+  // ---- motion: a visit becomes a plan of small actions; each returns ms until it next needs a frame, -1 = done,
+  // Infinity = nothing until something wakes it. A run to a fill gets every frame, a tour walk ~30 a second, a stroll ~16.
+  const sp = { x: 0, y: 0, ox: 0, oy: 0, legs: 0, pose: 0, asleep: false };   // legs: ms per step while walking
   let silk = null;                // {x, y}: where the thread is tied while it hangs from one
   let perch = null;               // {el, top}: the edge it is sitting on
   let queue = [], visit = null, plan = [], act = null;
+  let later = [];                 // tour stops and a trade that were scrolled out of view, for when you scroll there
 
   const legMs = (pace) => (pace >= 400 ? 60 : pace >= 150 ? 100 : 170);
-  function walk(x, y, ms, legs, arc = 0) {
+  const gap = (pace) => (pace >= 400 ? 0 : pace >= 150 ? 36 : 60);   // a run: every frame; a tour walk: ~30 fps; a stroll: ~16
+  function walk(x, y, ms, legs, arc, every) {
     let x0, y0, t0;
     return {
       travel: true,
@@ -156,11 +181,11 @@
         sp.x = x0 + (x - x0) * e;
         sp.y = y0 + (y - y0) * e - Math.sin(Math.PI * k) * arc;
         sp.legs = arc ? 0 : legs;
-        return k < 1 ? (legs >= 170 ? 30 : 0) : -1;           // a slow walk is smooth enough at ~30 frames a second
+        return k < 1 ? every : -1;
       },
     };
   }
-  function lower(y, ms) {         // tie a thread here and drop straight down
+  function lower(y, ms, every = 0) {   // tie a thread here and drop straight down
     let y0, t0;
     return {
       travel: true,
@@ -168,7 +193,7 @@
       run(now) {
         const k = Math.min(1, (now - t0) / ms);
         sp.y = y0 + (y - y0) * ease(k); sp.legs = 0;
-        return k < 1 ? 0 : -1;
+        return k < 1 ? every : -1;
       },
     };
   }
@@ -180,7 +205,7 @@
         if (!silk) return -1;
         const k = Math.min(1, (now - t0) / ms);
         sp.x = silk.x; sp.y = y0 + (silk.y + S * 0.1 - y0) * ease(k); sp.legs = 170;
-        if (k < 1) return 0;
+        if (k < 1) return 45;
         silk = null;
         return -1;
       },
@@ -200,22 +225,26 @@
       },
     };
   }
-  function sit(ms, how) {         // "read": still, a slow shuffle; "found": a twitch first; "hang": sway on the thread
+  // "read": still, a slow shuffle; "idle": a slower one; "found": a twitch first; "hang": sway on the thread;
+  // "sleep": curled up, no frames at all until something wakes it
+  function sit(ms, how) {
     let t0;
     return {
       begin(now) { t0 = now; },
       run(now) {
         const t = now - t0;
         sp.legs = 0;
+        if (how === "sleep") { sp.ox = sp.oy = 0; sp.pose = 2; sp.asleep = true; return Infinity; }
         if (t >= ms) { sp.ox = sp.oy = 0; sp.pose = 0; return -1; }
         if (how === "found" && t < 680) {
           sp.ox = Math.floor(t / 45) % 2 ? 2 : -2; sp.oy = t % 340 < 120 ? -4 : 0; sp.pose = Math.floor(t / 85) % 2;
           return 0;
         }
         sp.oy = 0;
-        if (how === "hang") { sp.ox = Math.sin(t / 520) * 2.5; return 0; }
-        sp.ox = 0; sp.pose = Math.floor(t / 700) % 2;
-        return Math.min(ms - t, 700 - (t % 700));
+        if (how === "hang") { sp.ox = Math.sin(t / 520) * 2.5; return 66; }
+        const every = how === "idle" ? 1800 : 700;
+        sp.ox = 0; sp.pose = Math.floor(t / every) % 2;
+        return Math.min(ms - t, every - (t % every));
       },
     };
   }
@@ -230,11 +259,11 @@
     }
     const dx = to.x - from.x, dy = to.y - from.y, d = Math.hypot(dx, dy);
     if (d < 2) return out;
-    if (hop) out.push(walk(to.x, to.y, clamp(d * 0.9, 300, 650), 0, Math.min(56, 14 + d * 0.12)));
+    if (hop) out.push(walk(to.x, to.y, clamp(d * 0.9, 300, 650), 0, Math.min(56, 14 + d * 0.12), 36));
     else if (dy > 90 && dy < 600 && Math.abs(dx) < dy * 0.4 && pace < 400) {   // mostly straight down: drop on silk
-      if (Math.abs(dx) > 2) out.push(walk(to.x, from.y, clamp(Math.abs(dx) / pace * 1000, 150, 2000), legMs(pace)));
-      out.push(lower(to.y, clamp(dy / 0.35, 350, 1600)));
-    } else out.push(walk(to.x, to.y, clamp(d / pace * 1000, 250, pace < 100 ? 9000 : 2400), legMs(pace)));
+      if (Math.abs(dx) > 2) out.push(walk(to.x, from.y, clamp(Math.abs(dx) / pace * 1000, 150, 2000), legMs(pace), 0, gap(pace)));
+      out.push(lower(to.y, clamp(dy / 0.35, 350, 1600), 36));
+    } else out.push(walk(to.x, to.y, clamp(d / pace * 1000, 250, pace < 100 ? 9000 : 2400), legMs(pace), 0, gap(pace)));
     return out;
   }
   function keepIn(p) {
@@ -242,60 +271,126 @@
     return { ...p, x: clamp(p.x, fx + S / 2, fx + fw - S / 2), y: clamp(p.y, fy + S / 2, fy + fh - S / 2) };
   }
 
-  function wander() {             // nothing new: a calm walk along the panel edges in view
+  function wander() {             // nothing new: a calm walk along the panel edges in view, then a long rest
     const top = scrollY, bottom = scrollY + innerHeight, r = Math.random();
     const here = perch && box(perch.el);
     if (here && !silk && r < 0.2) return { kind: "idle", drop: rand(45, 110) };
     if (r < 0.32 && innerWidth >= 980) {
       const h = home();
-      if (inView(h.y)) return { kind: "idle", at: () => h, dwell: rand(2500, 5000), pace: 70 };
+      if (seen(h.y, S / 2)) return { kind: "idle", at: () => h, dwell: rand(5000, 10000), pace: 70 };
     }
     if (here && r < 0.72) {
       const lo = here.x + S, hi = here.x + here.w - S, y = perch.top ? here.y - S * 0.22 : here.y + here.h + S * 0.22;
-      if (hi - lo > 110 && inView(y)) {
+      if (hi - lo > 110 && seen(y, S / 2)) {
         const x = sp.x - lo > hi - sp.x ? rand(lo, Math.max(lo, sp.x - 50)) : rand(Math.min(hi, sp.x + 50), hi);
         const p = perch;
-        return { kind: "idle", at: () => ({ x, y, perch: p }), dwell: rand(900, 3200), pace: phone.matches ? 32 : 45 };
+        return { kind: "idle", at: () => ({ x, y, perch: p }), dwell: rand(4000, 9000), pace: phone.matches ? 32 : 45 };
       }
     }
     const edges = [];
+    const mine = Array.isArray(board.agents) ? board.agents : null;   // a card left over from another tab is not a perch
     document.querySelectorAll(".panel, .card").forEach((el) => {
+      if (mine && el.classList.contains("card") && !mine.includes(el.id.replace(/^card-/, ""))) return;
       const b = box(el);
       if (!b || b.w < S * 3) return;
       if (b.y > top + S && b.y < bottom - S) edges.push({ el, b, top: true });
       if (b.y + b.h > top + S && b.y + b.h < bottom - S) edges.push({ el, b, top: false });
     });
-    if (!edges.length) return { kind: "idle", at: () => ({ x: sp.x, y: sp.y }), dwell: 3000 };
+    if (!edges.length) return { kind: "idle", at: () => ({ x: sp.x, y: sp.y }), dwell: 6000 };
     const e = edges[Math.floor(Math.random() * edges.length)];
     const spot = { ...edge(e.b, e.top, rand(0, 1)), perch: { el: e.el, top: e.top } };
     spot.x = clamp(spot.x, e.b.x + S, e.b.x + e.b.w - S);
-    return { kind: "idle", at: () => spot, dwell: rand(1200, 3600), pace: phone.matches ? 60 : 80 };
+    return { kind: "idle", at: () => spot, dwell: rand(4000, 9000), pace: phone.matches ? 60 : 80 };
+  }
+
+  function peekAt(target) {       // the screen's edge nearest a stop that is scrolled away, in line with it
+    return {
+      kind: "tour", peek: true, batch: target.batch, dwell: 1100,
+      at() {
+        const t = target.at();
+        if (!t || seen(t.y, S / 2)) return null;
+        return { x: t.x, y: t.y > scrollY + innerHeight / 2 ? scrollY + innerHeight - S * 0.7 : scrollY + S * 0.7 };
+      },
+    };
+  }
+  function takeLater() {          // the waiting stops that are on screen now, in their order; the rest keep waiting
+    const now = [], still = [], t = Date.now();
+    later.forEach((v) => {
+      if (v.until && t > v.until) return;                  // a trade from long ago is not news any more
+      const s = v.at();
+      if (s) (seen(s.y, S / 2) ? now : still).push(v);
+    });
+    later = still;
+    return now;
+  }
+
+  function go(spot) {
+    const to = keepIn(spot);
+    const pace = visit.pace || (phone.matches ? 190 : 260);
+    if (!seen(sp.y, -S / 2)) {    // it is off screen: come in from the nearest edge (or just be there, if that is too)
+      sp.x = to.x; silk = null;
+      sp.y = !seen(to.y, -S / 2) ? to.y : sp.y < scrollY ? scrollY - S : scrollY + innerHeight + S;
+    }
+    plan = route(to, pace, visit.hop);
+    const how = spot.found ? "found" : visit.kind === "idle" ? "idle" : "read";
+    plan.push(arrive(spot.perch || null), sit(spot.found ? 2600 : visit.dwell, how));
+  }
+  function sleep() {              // no board, or a stale one: home, curl up, and no frames until a fresh board
+    queue = []; later = [];
+    visit = { kind: "sleep", at: home };
+    plan = [];
+    const h = keepIn(home()), d = Math.hypot(h.x - sp.x, h.y - sp.y);
+    if (d > 2) {
+      if (d < 500 && seen(sp.y, -S / 2) && seen(h.y, -S / 2)) plan = route(h, 70);
+      else { sp.x = h.x; sp.y = h.y; silk = null; }
+    }
+    plan.push(arrive(null), sit(0, "sleep"));
+    return true;
   }
 
   function startNext() {
-    for (let tries = 0; tries < 12; tries++) {
-      if (!queue.length) queue.push(wander());
+    if (!alive()) return sleep();
+    let peekFor = null;
+    for (let tries = 0; tries < 40; tries++) {
+      if (!queue.length) {
+        if (peekFor) { queue.push(peekAt(peekFor)); peekFor = null; continue; }
+        const back = takeLater();
+        queue.push(...(back.length ? back : [wander()]));
+      }
       visit = queue.shift();
       if (visit.drop) {
         if (dirty) refresh();
         const room = Math.min(visit.drop, scrollY + innerHeight - sp.y - S, fy + fh - sp.y - S);
         if (room < 30 || silk) continue;
-        plan = [lower(sp.y + room, room / 0.09), sit(rand(1400, 2400), "hang"), climb(room / 0.07), sit(rand(600, 1200), "read")];
+        const tk = box($("ticker")), y = sp.y + room;          // never hang over the ticker's numbers
+        if (tk && y + S / 2 > tk.y && y - S / 2 < tk.y + tk.h) continue;
+        plan = [lower(y, room / 0.09, 45), sit(rand(1400, 2400), "hang"), climb(room / 0.07), sit(rand(3000, 6000), "idle")];
         return true;
       }
-      const spot = visit.at();
+      let spot = visit.at();
       if (!spot) continue;
-      const to = keepIn(spot);
-      let pace = visit.pace || (phone.matches ? 190 : 260);
-      if (visit.kind === "idle" && !inView(sp.y)) pace = Math.max(pace, 240);     // out of sight: come back quicker
-      plan = route(to, pace, visit.hop);
-      plan.push(arrive(spot.perch || null), sit(spot.found ? 2600 : visit.dwell, spot.found ? "found" : "read"));
+      if (!seen(spot.y, S / 2)) {
+        if (visit.kind === "event") {       // its line is scrolled away: go to where the trade also shows
+          later = later.filter((v) => v.kind !== "event");
+          later.push(visit);
+          spot = tradeSpot();
+          if (!spot) continue;
+        } else if (visit.kind === "tour") {
+          if (visit.peek) continue;
+          later.push(visit);
+          if (visit.batch && !visit.batch.peeked) { visit.batch.peeked = true; peekFor = visit; }   // one peek a tour
+          continue;
+        }
+      }
+      if (peekFor) { queue.unshift(peekAt(peekFor), visit); peekFor = null; continue; }
+      go(spot);
       return true;
     }
     visit = null;
     return false;
   }
-  function cut() { visit = null; plan = []; act = null; sp.ox = sp.oy = 0; sp.legs = 0; }
+  function cut() { visit = null; plan = []; act = null; sp.ox = sp.oy = 0; sp.legs = 0; sp.pose = 0; sp.asleep = false; }
+  const keep = (v) => v && (v.kind === "tour" || v.kind === "event" || v.kind === "hop");
 
   function step(now) {
     for (let n = 0; n < 12; n++) {
@@ -312,12 +407,13 @@
     return 0;
   }
 
-  let lastX = NaN, lastY = NaN, silkOn = false;
+  let lastX = NaN, lastY = NaN, silkOn = false, dim = false;
   function paint(now) {           // writes two transforms; reads nothing from the layout
     const x = Math.round(clamp(sp.x + sp.ox - fx, S / 2, fw - S / 2) - S / 2);
     const y = Math.round(clamp(sp.y + sp.oy - fy, S / 2, fh - S / 2) - S / 2);
     if (x !== lastX || y !== lastY) { body.style.transform = `translate3d(${x}px,${y}px,0)`; lastX = x; lastY = y; }
     pose(sp.legs ? Math.floor(now / sp.legs) % 2 : sp.pose);
+    if (sp.asleep !== dim) { dim = sp.asleep; body.classList.toggle("asleep", dim); }
     if (silk) {
       const ax = silk.x - fx, ay = silk.y - fy, dx = x + S / 2 - ax, dy = y + S * 0.17 - ay, len = Math.hypot(dx, dy);
       if (dy > 2) {
@@ -329,13 +425,15 @@
     if (silkOn) { silkEl.style.display = "none"; silkOn = false; }
   }
 
-  // ---- the loop: requestAnimationFrame while something moves, a timer while it sits, nothing when hidden --
+  // ---- the loop: requestAnimationFrame while something moves, a timer while it sits, nothing when hidden or
+  // asleep ---------------------------------------------------------------------------------------------
   let on = store.get() !== "off", running = false, raf = 0, timer = 0;
   function frame(now) {
     raf = 0;
     if (!running) return;
     const wait = step(now);
     paint(now);
+    if (wait === Infinity) return;                         // asleep: kick() wakes it
     if (wait < 24) raf = requestAnimationFrame(frame);
     else timer = setTimeout(() => { timer = 0; if (running) raf = requestAnimationFrame(frame); }, wait - 16);
   }
@@ -347,7 +445,7 @@
   function start() {
     if (running) return;
     running = true;
-    if (visit && visit.kind !== "idle") queue.unshift(visit);    // pick up where it was, with fresh timing
+    if (keep(visit)) queue.unshift(visit);                 // pick up where it was, with fresh timing
     cut();
     kick();
   }
@@ -355,10 +453,10 @@
     running = false;
     cancelAnimationFrame(raf); clearTimeout(timer); raf = timer = 0;
   }
-  function rest() {               // reduced motion: sit still at home
+  function rest() {               // reduced motion: sit still at home (curled up while the desk is not running)
     touch();
-    const h = keepIn(home());
-    sp.x = h.x; sp.y = h.y; sp.ox = sp.oy = sp.legs = sp.pose = 0; silk = null;
+    const h = keepIn(home()), up = alive();
+    sp.x = h.x; sp.y = h.y; sp.ox = sp.oy = sp.legs = 0; sp.pose = up ? 0 : 2; sp.asleep = !up; silk = null;
     paint(0);
   }
 
@@ -373,11 +471,15 @@
 
   // ---- what the desk is doing -----------------------------------------------------------------------
   let board = {}, lastTour = 0, tickCoin = null, lastPrice = null, lastHop = Date.now();   // no hop in the first 20 s
-  const seen = new Map();         // coin → the event lines already on its board
+  function alive() {              // a board has landed and it is recent enough to say the desk is running
+    if (!board.updated) return false;
+    return Date.now() - board.updated < (board.static === false ? STALE_LIVE : STALE_STATIC);
+  }
+  const seenLines = new Map();    // coin → the event lines already on its board
   function newFills(coin) {
     const lines = [...document.querySelectorAll("#events li")].map((li) => li.textContent);
-    const known = seen.get(coin);
-    if (!known) { seen.set(coin, new Set(lines)); return []; }   // first look at this coin: nothing is new
+    const known = seenLines.get(coin);
+    if (!known) { seenLines.set(coin, new Set(lines)); return []; }   // first look at this coin: nothing is new
     const fresh = lines.filter((t) => !known.has(t) && TRADE.test(t));
     lines.forEach((t) => known.add(t));
     return fresh;                 // newest first, as the board lists them
@@ -386,11 +488,34 @@
     const gate = (gates || []).find((x) => x.verdict === "DROP" || x.verdict === "WAIT");
     return gate ? gate.owner : null;
   }
-  function tour(blocker) {
-    const stops = TOUR.map((key) => ({ kind: "tour", at: () => cardSpot(key, blocker), dwell: rand(800, 1400) }));
-    stops.push({ kind: "tour", at: candleSpot, dwell: 1300 }, { kind: "tour", at: lineSpot, dwell: 1400 });
+  function tour(d) {              // each card the first time it owns a gate, in the board's gate order
+    const blocker = blockerOf(d.gates), keys = [];
+    (d.gates || []).forEach((x) => { if (x.owner && !keys.includes(x.owner)) keys.push(x.owner); });
+    if (!keys.length) keys.push(...ORDER);
+    document.querySelectorAll(".card.blocked").forEach((el) => {
+      const k = el.id.replace(/^card-/, "");
+      if (k !== "chief" && !keys.includes(k)) keys.push(k);
+    });
+    const mine = Array.isArray(d.agents) ? keys.filter((k) => d.agents.includes(k)) : keys;   // this board's cards only
+    const batch = { peeked: false };
+    const stops = mine.map((key) => ({ kind: "tour", batch, at: () => cardSpot(key, blocker), dwell: rand(800, 1400) }));
+    stops.push({ kind: "tour", batch, at: candleSpot, dwell: 1300 }, { kind: "tour", batch, at: lineSpot, dwell: 1400 });
     return stops;
   }
+  function wake() { if (visit && visit.kind === "sleep") cut(); }
+  let revealed = false;
+  function reveal() {             // first show: at home, where the rendered page (not the empty skeleton) puts it
+    if (revealed) return;
+    revealed = true;
+    touch();
+    if (!visit || visit.kind === "sleep" || visit.kind === "idle") {
+      cut(); silk = null;
+      const h = keepIn(home()); sp.x = h.x; sp.y = h.y;
+      paint(performance.now());
+    }
+    layer.style.visibility = "";
+  }
+  setTimeout(() => { reveal(); kick(); }, 2500);   // no board yet (the desk may be down): show it asleep at home
 
   addEventListener("desk:board", (e) => {
     const d = e.detail || {};
@@ -399,17 +524,22 @@
     const fills = newFills(d.coin), now = Date.now();
     const fresh = d.coin !== board.coin || d.scanned !== board.scanned || (d.updated !== board.updated && now - lastTour > RETOUR);
     board = d;
+    reveal();
     if (!on) return;
     if (reduced.matches) { rest(); return; }
+    if (!alive()) { if (!visit || visit.kind !== "sleep") cut(); kick(); return; }
+    wake();
     if (fresh) {
       lastTour = now;
       queue = queue.filter((v) => v.kind !== "tour" && v.kind !== "idle");
+      later = later.filter((v) => v.kind !== "tour");
       if (!visit || visit.kind === "tour" || visit.kind === "idle") cut();
-      queue.push(...tour(blockerOf(d.gates)));
+      queue.push(...tour(d));
     }
     if (fills.length) {
       queue = queue.filter((v) => v.kind !== "idle");
-      queue.unshift({ kind: "event", at: () => eventSpot(fills[0]), dwell: 4000, pace: 520 });
+      later = later.filter((v) => v.kind !== "event");
+      queue.unshift({ kind: "event", at: () => eventSpot(fills[0]), dwell: 4000, pace: 520, until: now + 10 * 60000 });
       if (!visit || visit.kind !== "event") cut();
     }
     kick();
@@ -423,10 +553,13 @@
     tickCoin = d.coin; lastPrice = d.price;
     if (!on) return;
     if (reduced.matches) { rest(); return; }
-    if (!moved || !running || Date.now() - lastHop < HOP_EVERY) return;
+    if (!running) return;
+    if (!alive()) { if (!visit || visit.kind !== "sleep") { cut(); kick(); } return; }   // the board went stale
+    if (visit && visit.kind === "sleep") { cut(); kick(); return; }
+    if (!moved || Date.now() - lastHop < HOP_EVERY) return;
     if ((visit && (visit.kind === "event" || visit.kind === "hop")) || (queue[0] && queue[0].kind === "event")) return;
     const p = priceSpot();
-    if (!p || !inView(p.y)) return;
+    if (!p || !seen(p.y, S / 2)) return;
     lastHop = Date.now();
     const from = { x: sp.x, y: sp.y, perch };
     const back = visit && visit.kind === "tour" ? { ...visit, hop: true } : { kind: "idle", hop: true, at: () => from, dwell: rand(800, 1500) };
@@ -437,11 +570,34 @@
 
   // another tab: drop the old coin's plan; the new board's tour follows as soon as it loads
   document.addEventListener("click", (e) => {
-    if (!(e.target instanceof Element) || !e.target.closest(".coin[data-coin]")) return;
+    const tab = e.target instanceof Element && e.target.closest(".coin[data-coin]");
+    if (!tab || tab.dataset.coin === board.coin) return;  // the tab already shown: nothing changes
     queue = queue.filter((v) => v.kind !== "tour" && v.kind !== "event");
+    later = [];
     if (visit && (visit.kind === "tour" || visit.kind === "event")) cut();
     kick();
   });
+
+  // once the scrolling settles: visit the stops that were waiting for it, or come back into view from a rest
+  let settle = 0;
+  function resume() {
+    settle = 0;
+    if (!running || !alive()) return;
+    if (visit && visit.kind !== "idle") {                  // a tour, hop or trade is on: it takes them up after,
+      if (keep(visit) && !seen(sp.y, -S / 2)) { queue.unshift(visit); cut(); kick(); }   // re-planned if scrolled away
+      return;
+    }
+    const back = takeLater();
+    if (!back.length && seen(sp.y, -S / 2)) return;
+    queue = queue.filter((v) => v.kind !== "idle");
+    queue.unshift(...back);
+    cut(); kick();
+  }
+  document.addEventListener("scroll", () => {
+    touch();
+    if (!running) return;
+    clearTimeout(settle); settle = setTimeout(resume, 300);
+  }, { passive: true, capture: true });
 
   let width = innerWidth;
   addEventListener("resize", () => {
@@ -450,14 +606,14 @@
     if (reduced.matches) { rest(); return; }
     if (innerWidth === width) return;                     // a phone's address bar coming and going
     width = innerWidth;
-    if (visit && visit.kind !== "idle") queue.unshift(visit);
+    if (keep(visit)) queue.unshift(visit);
     cut(); kick();
   });
-  document.addEventListener("scroll", touch, { passive: true, capture: true });
-  if (window.ResizeObserver) {   // the page moved under it (fonts, a new board): re-aim a walk that is under way
+  if (window.ResizeObserver) {   // the page moved under it (fonts, a new board): re-aim a walk, or move its bed
     new ResizeObserver(() => {
       touch();
-      if (running && visit && visit.kind !== "idle" && act && act.travel) { queue.unshift(visit); cut(); kick(); }
+      if (!running || !visit) return;
+      if (visit.kind === "sleep" || (keep(visit) && act && act.travel)) { if (keep(visit)) queue.unshift(visit); cut(); kick(); }
     }).observe(frameEl);
   }
   if (document.fonts && document.fonts.ready) document.fonts.ready.then(touch);
@@ -470,7 +626,7 @@
     btn.addEventListener("click", () => {
       on = !on;
       store.set(on ? "on" : "off");
-      if (on) { queue = board.coin ? tour(blockerOf(board.gates)) : []; cut(); }
+      if (on) { queue = board.coin ? tour(board) : []; later = []; cut(); }
       apply();
       dispatchEvent(new Event("resize"));                 // app.js redraws the web with or without its own hub
     });

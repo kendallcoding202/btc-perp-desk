@@ -399,9 +399,10 @@
 
   let state = null, base = null, index = null;
   const live = { mids: {}, at: 0, candle: null };   // filled from Hyperliquid by the viewer's own browser
-  // spider.js listens: "desk:board" after a board loads, "desk:tick" after a live price (candle = newest high, chart px)
+  // spider.js listens: "desk:board" after a board loads, "desk:tick" after a live price. candle() = the newest
+  // candle's high in #chart px as last drawn, so it stays right after a resize
   const newest = () => lastGeom && { x: lastGeom.X(lastGeom.cs.length - 1), y: lastGeom.Y(lastGeom.cs[lastGeom.cs.length - 1][2]) };
-  const emit = (name, detail) => window.dispatchEvent(new CustomEvent(name, { detail: { coin: state && state.header.coin, candle: newest(), ...detail } }));
+  const emit = (name, detail) => window.dispatchEvent(new CustomEvent(name, { detail: { coin: state && state.header.coin, candle: newest, ...detail } }));
 
   async function hl(body) {
     const res = await fetch(HL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -508,7 +509,8 @@
         index = ir && ir.ok ? await ir.json() : null;
       }
       render();
-      emit("desk:board", { updated: base.updated, scanned: base.analysis?.scanned, gates: base.analysis?.gates || [] });
+      emit("desk:board", { updated: base.updated, scanned: base.analysis?.scanned, gates: base.analysis?.gates || [],
+        agents: (base.agents || []).map((a) => a.key), static: staticMode });
     } catch (err) {
       $("foot").textContent = `can't reach the desk (${err.message}). is \`python -m desk paper\` running?`;
     }

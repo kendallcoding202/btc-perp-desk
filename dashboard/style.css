@@ -192,6 +192,7 @@ body { padding: 10px; }
 .spider-layer[hidden] { display: none; }
 .spider, .spider-silk { position: absolute; left: 0; top: 0; pointer-events: none; will-change: transform; }
 .spider { width: 36px; height: 36px; image-rendering: pixelated; filter: drop-shadow(0 0 3px rgba(255,95,210,.55)); }
+.spider.asleep { opacity: .55; filter: none; }   /* no fresh board: the desk is not running */
 .spider-silk { display: none; width: 1px; height: 1px; background: rgba(241,241,246,.7); transform-origin: 0 0; }
 
 /* phones and narrow windows */
