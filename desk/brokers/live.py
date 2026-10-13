@@ -428,6 +428,9 @@ class LiveBroker:
             if self.stop_order_id not in ids:
                 self.stop_order_id = ids[0]
             self.stop_px = want
+            if len(stops) > 1:      # left by tries whose read-back failed, or an old level: one stop, the desk's
+                self.log(f"{self.coin}: {len(stops) - 1} more stop(s) resting beside the desk's: cancelling them")
+                self._cancel_stops(keep=self.stop_order_id)
             return
         if at_stop:     # at the desk's level but too small: the position grew. Put a full-size one on.
             self.log(f"{self.coin}: the resting stop covers {at_stop[0].get('amount')} of the open "
@@ -788,9 +791,15 @@ class LiveBroker:
             self.log(f"{self.coin}: stop at {stop:,.2f}, try {attempt + 1}/{STOP_ATTEMPTS}: {err}")
         if keep_old:
             try:
+                found = self._find_stop(None, stop)     # one of the tries took after all: it's the stop
                 old = self._resting_stops(self._closing_side(pos.side))
             except Exception:
-                old = []
+                found, old = None, []
+            if found is not None:
+                self.stop_order_id, self.stop_px = str(found["id"]), _trigger(found)
+                self._cancel_stops(keep=self.stop_order_id)
+                self._save_local()
+                return True
             if old:
                 self.alert(f"could not move the stop to {stop:,.2f} after {STOP_ATTEMPTS} tries ({err}); the stop at "
                            f"{_trigger(old[0]):,.2f} still protects the position, trying again at the next sync")

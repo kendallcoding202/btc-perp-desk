@@ -1192,3 +1192,18 @@ def test_a_restart_after_a_kill_mid_catch_up_replays_the_gap_as_paper_did(tmp_pa
     assert broker.trades == [] and broker.position is not None                     # still long, like paper
     for k in range(431, 445):
         assert rows["live"][bars[k].ts] == rows["paper"][bars[k].ts]
+
+
+# ---------------------------------------------------------------- review: one stop, not a pile of them
+
+def test_stops_placed_while_their_read_back_failed_dont_pile_up(tmp_path):
+    """During a trail move every open-orders read fails (4 tries), so each try places a stop it can't confirm. They
+    used to stay: five reduce-only stops (80,000 and 4 x 81,000) for one 0.005 BTC long, never cleaned by later checks."""
+    ex = FakeHyperliquid(PRICES)
+    b = _long_btc(tmp_path, ex, sleep=Sleeps())
+    ex.fail["open_orders"] = live_mod.STOP_ATTEMPTS
+    b.update_stop(81_000.0)
+    for k in range(3):
+        b.check_stop_price(82_000.0, T0 + 60_000 * (k + 1))
+    stops = ex.fetch_open_orders("BTC/USDC:USDC")
+    assert [(o["triggerPrice"], o["amount"]) for o in stops] == [(81_000.0, 0.005)] and b.stop_order_id == stops[0]["id"]
