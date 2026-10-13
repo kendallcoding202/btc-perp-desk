@@ -506,6 +506,19 @@ def _vt_market():
     return series, {c: hourly_funding(b, k) for k, (c, b) in enumerate(series.items())}
 
 
+def test_vt_report_is_well_formed(tmp_path):
+    series, funding = _vt_market()                        # 2023-11 to 2024-07: both sides of the 2024 split
+    rep = voltrend.report(series, funding)
+    path = voltrend.write_report(rep, out_dir=tmp_path)
+    assert path.read_text().startswith("# Backtest — VT vol-trend basket")
+    saved = json.loads((tmp_path / "backtest-VT.json").read_text())
+    assert saved["full"]["cagr"] == rep["full"]["cagr"] and saved["out_of_sample"]["from"] == "2024-01-01"
+    assert [r["start"] for r in rep["fresh_starts"]["out_of_sample"]] == [50, 150, 250, 500, 1000, None]
+    small, free = rep["fresh_starts"]["out_of_sample"][0], rep["fresh_starts"]["out_of_sample"][-1]
+    assert small["blocked"] > free["blocked"] == 0 and free["orders"] > 0
+    assert set(rep["per_year"]) == {"2023", "2024"} and rep["order_sizes"]["entry"]["orders"] > 0
+
+
 def test_vt_paper_stepping_matches_the_backtest(tmp_path):
     """Stepping the VT ledger as the cron does must give exactly what one backtest over the same days gives (same
     fills, cash, equity curve and events): through missed days, an 80-day outage, a feed that's a day behind for
