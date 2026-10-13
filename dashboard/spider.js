@@ -9,6 +9,16 @@
 //   nothing new                                  a slow walk along the panel edges, long rests, now and then a
 //                                                drop on silk
 //   no board yet, or one too old to trust        it curls up at home and keeps still until a fresh board lands
+// On the VT basket's tab (no agents, chart or trigger line) the same moves read the basket instead:
+//   a new board                                  each coin's row in #holdings (BTC, ETH, SOL), by its order or its
+//                                                50-day average, never on their words (a row with no room for it
+//                                                is skipped): longer on a coin in a different state from the other
+//                                                two, a twitch on one with an order waiting for the next open;
+//                                                then the bank in the basket's ticker. A row that is scrolled
+//                                                away (a phone, at the top of the page) has the coin's name in
+//                                                the VT tab's label stand in for it, and waits for later too
+//   a live tick that changes the bank's figure   a quick hop to it, at most one per 20 s (the basket has no price)
+//   a new fill (BOUGHT, SOLD, ADDED, TRIMMED)    its event line, or that coin's row when the line is scrolled away
 // It only goes where you can see it. A stop that is scrolled out of view waits (one peek from the screen's edge
 // towards it) and is visited when you scroll to it; it never scrolls the page for you.
 // It is decoration. It changes nothing about how the desk trades: the rules are fixed in desk/thresholds.py.
@@ -113,10 +123,13 @@
   const edge = (b, top, f, inset = -0.22) => ({ x: b.x + b.w * f, y: top ? b.y + S * inset : b.y + b.h - S * inset });
 
   // ---- the spots it visits ------------------------------------------------------------------------
+  // the VT basket's tab is showing (app.js's render() sets the class before it tells the spider anything)
+  const basket = () => document.body.classList.contains("kind-basket");
+  const tickerEl = () => $(basket() ? "vt-ticker" : "ticker");
   function home() {               // desktop: the hub app.js spins the chart web from. narrower: the stage's top edge
-    const wrap = box(document.querySelector(".chart-wrap"));
+    const wrap = box(document.querySelector(".chart-wrap"));   // (VT: no stage; the basket panel's top edge)
     if (wrap && innerWidth >= 980) return { x: wrap.x + wrap.w * 0.56, y: wrap.y + wrap.h * 0.78 };
-    const st = box($("stage"));
+    const st = box($("stage")) || box($("basket"));
     return st ? { x: st.x + st.w - S * 1.6, y: st.y - S * 0.22 } : { x: fx + S, y: fy + S };
   }
   function cardSpot(key, blocker) {
@@ -136,27 +149,107 @@
     const b = box(el);              // on the box's top-right corner, clear of the heading's words and the level
     return b ? { x: b.x + b.w - S * 0.2, y: b.y - S * 0.22, perch: { el, top: true } } : null;
   }
-  function priceSpot() {          // just above the coin's price in the ticker (the first $ amount in it)
-    const t = $("ticker");
+  function textBox(t, re) {       // the first match of `re` in element t, as a page box (its first line, if it wraps)
     if (!t) return null;
     const walk = document.createTreeWalker(t, NodeFilter.SHOW_TEXT);
     for (let n = walk.nextNode(); n; n = walk.nextNode()) {
-      const m = /\$[\d,.]+/.exec(n.data);
+      const m = re.exec(n.data);
       if (!m) continue;
       const range = document.createRange();
       range.setStart(n, m.index); range.setEnd(n, m.index + m[0].length);
-      const r = range.getBoundingClientRect();
-      if (r.width) return { x: r.left + scrollX + r.width / 2, y: r.top + scrollY - S * 0.45 };
+      const r = [...range.getClientRects()].find((q) => q.width > 2);
+      if (r) return { x: r.left + scrollX, y: r.top + scrollY, w: r.width, h: r.height };
     }
     return null;
   }
+  function amountSpot(t, re) {    // just above the first match of `re` in element t
+    const r = textBox(t, re);
+    return r ? { x: r.x + r.w / 2, y: r.y - S * 0.45 } : null;
+  }
+  function words(el) {            // every line of text in el, as page boxes
+    const out = [];
+    if (!el) return out;
+    const walk = document.createTreeWalker(el, NodeFilter.SHOW_TEXT), range = document.createRange();
+    for (let n = walk.nextNode(); n; n = walk.nextNode()) {
+      range.selectNodeContents(n);
+      for (const r of range.getClientRects()) if (r.width) out.push({ l: r.left + scrollX, r: r.right + scrollX, t: r.top + scrollY, b: r.bottom + scrollY });
+    }
+    return out;
+  }
+  // would the sprite standing at p touch none of these words? (its drawn part: S/2 either side, S/2 above, 11/24 S
+  // below; with `shake`, also while it twitches there: 2 px either side, 4 px up)
+  function clear(p, ws, shake) {
+    const sx = S / 2 + (shake ? 2 : 0), up = S / 2 + (shake ? 4 : 0);
+    return !ws.some((q) => q.r > p.x - sx && q.l < p.x + sx && q.b > p.y - up && q.t < p.y + S * 11 / 24);
+  }
+  const priceSpot = () => amountSpot($("ticker"), /\$[\d,.]+/);    // the coin's price: the ticker's first $ amount
+  // the basket's bank in its ticker. A phone wraps it after BANK: it then stands above that word, on the panel's
+  // edge, not over the ticker's first line
+  const BANK = /BANK -?\$[\d,.]+/;
+  const bankSpot = () => amountSpot($("vt-ticker"), BANK);
+  function bankText() {
+    const t = $("vt-ticker"), m = t && BANK.exec(t.textContent);
+    return m ? m[0] : null;
+  }
+  // the basket's rows, as renderBasket draws them: COIN, VS 50-DAY AVG, 10-DAY VOL, UNITS, HELD, UNREALISED, ORDER
+  // (an order waiting for the next open is the cell marked .pend). app.js redraws them on every price, so a row is
+  // looked up by its coin each time, never kept
+  const AVG = 1;
+  const coinOf = (row) => { const b = row.querySelector(".h-coin b"); return b ? b.textContent : ""; };
+  const sleeves = () => [...document.querySelectorAll("#holdings .h-row:not(.h-head)")];
+  // where it stands in a row's cell, at the cell's right-hand end: beside the cell's words if they leave room there,
+  // or (under) just below them, reaching no further than the next row's top padding. Only where it touches no word
+  // in the basket (all)
+  function inCell(el, row, all, under, shake) {
+    const b = box(el), rb = box(row);
+    if (!b || !rb) return null;
+    const ws = words(el), x = b.x + b.w - S * 0.62;
+    const p = under ? { x, y: Math.max(b.y, ...ws.map((q) => q.b)) + S / 2 + (shake ? 5 : 1) }
+      : ws.every((q) => q.r <= b.x + b.w - S * 1.2) ? { x, y: b.y + b.h / 2 } : null;
+    return p && p.y + S * 11 / 24 <= rb.y + rb.h + 7 && clear(p, all, shake) ? p : null;
+  }
+  // a coin's row: at its order when one is waiting, else at its 50-day average, else at another of its cells (a
+  // narrow table): beside the cell's words, or under them. A row with no room anywhere is skipped, never stood on.
+  // An order waiting gets the twitch, or where that has no room, the same long look standing still
+  function sleeveSpot(coin, twitch) {
+    const row = sleeves().find((r) => coinOf(r) === coin);
+    if (!row) return null;
+    const pend = row.querySelector(".pend"), all = words($("basket"));
+    const cells = [pend, ...[...row.children].slice(AVG).filter((c) => c !== pend)].filter(Boolean);
+    const place = (shake) => {
+      for (const c of cells) { const p = inCell(c, row, all, false, shake) || inCell(c, row, all, true, shake); if (p) return p; }
+      return null;
+    };
+    return shaken(place, !!(twitch && pend));
+  }
+  function shaken(place, found) { // a spot with room for the twitch, else (found) one to stand still on as long
+    const spot = place(found);
+    if (spot) return { ...spot, found };
+    const still = found && place(false);
+    return still ? { ...still, dwell: 2600 } : null;
+  }
+  // a row that is scrolled away (a phone, at the top of the page): the coin's name in the VT tab's own label
+  // ("BTC·ETH·SOL") stands in for it, with the row's own order waiting, if the sprite fits just under the name
+  function nameSpot(coin) {
+    const row = sleeves().find((r) => coinOf(r) === coin);
+    const r = row && /^[A-Z0-9]+$/.test(coin) && textBox(document.querySelector(".coin.on .c-name i"), new RegExp(`\\b${coin}\\b`));
+    if (!r) return null;
+    const ws = words($("coins"));
+    return shaken((shake) => {
+      const p = { x: r.x + r.w / 2, y: r.y + r.h + S / 2 + (shake ? 5 : 1) };
+      return clear(p, ws, shake) ? p : null;
+    }, !!row.querySelector(".pend"));
+  }
+  const FILL = /\b(?:BOUGHT|SOLD|ADDED|TRIMMED) [\d.]+ ([A-Z]+)\b/;   // voltrend.py's fill lines name the coin
   const eventLine = (text) => [...document.querySelectorAll("#events li")].find((li) => li.textContent === text);
   function eventSpot(text) {
     const b = box(eventLine(text));
     return b ? { x: b.x + S * 0.35, y: b.y + S * 0.1 } : null;     // on the agent's name; the trade text stays clear
   }
-  function tradeSpot() {          // a trade whose line is scrolled away also shows in the ticker's position, or the tab
-    const chip = document.querySelector("#ticker .hl"), c = box(chip);
+  function tradeSpot(text) {      // a trade whose line is scrolled away also shows in the ticker's position, or the tab
+    const m = basket() && FILL.exec(text || ""), row = m && sleeveSpot(m[1]);   // VT: first that coin's row
+    if (row && seen(row.y, S / 2)) return row;
+    const chip = tickerEl() && tickerEl().querySelector(".hl"), c = box(chip);
     if (c && seen(c.y, S / 2)) return { x: c.x + c.w / 2, y: c.y - S * 0.45, perch: { el: chip, top: true } };
     const tab = document.querySelector(".coin.on"), t = box(tab);
     if (t && seen(t.y, S / 2)) return { ...edge(t, true, 0.5), perch: { el: tab, top: true } };
@@ -335,7 +428,7 @@
     }
     plan = route(to, pace, visit.hop);
     const how = spot.found ? "found" : visit.kind === "idle" ? "idle" : "read";
-    plan.push(arrive(spot.perch || null), sit(spot.found ? 2600 : visit.dwell, how));
+    plan.push(arrive(spot.perch || null), sit(spot.found ? 2600 : spot.dwell || visit.dwell, how));
   }
   function sleep() {              // no board, or a stale one: home, curl up, and no frames until a fresh board
     queue = []; later = [];
@@ -364,7 +457,7 @@
         if (dirty) refresh();
         const room = Math.min(visit.drop, scrollY + innerHeight - sp.y - S, fy + fh - sp.y - S);
         if (room < 30 || silk) continue;
-        const tk = box($("ticker")), y = sp.y + room;          // never hang over the ticker's numbers
+        const tk = box(tickerEl()), y = sp.y + room;           // never hang over the ticker's numbers
         if (tk && y + S / 2 > tk.y && y - S / 2 < tk.y + tk.h) continue;
         plan = [lower(y, room / 0.09, 45), sit(rand(1400, 2400), "hang"), climb(room / 0.07), sit(rand(3000, 6000), "idle")];
         return true;
@@ -375,13 +468,19 @@
         if (visit.kind === "event") {       // its line is scrolled away: go to where the trade also shows
           later = later.filter((v) => v.kind !== "event");
           later.push(visit);
-          spot = tradeSpot();
+          spot = tradeSpot(visit.text);
           if (!spot) continue;
         } else if (visit.kind === "tour") {
           if (visit.peek) continue;
           later.push(visit);
-          if (visit.batch && !visit.batch.peeked) { visit.batch.peeked = true; peekFor = visit; }   // one peek a tour
-          continue;
+          const alt = visit.alt && visit.alt();             // VT: the coin's name in its tab, while its row is away
+          if (alt && seen(alt.y, S / 2)) {
+            visit = { ...visit, at: visit.alt, alt: null, peek: true };   // like a peek, never kept for later
+            spot = alt;
+          } else {
+            if (visit.batch && !visit.batch.peeked) { visit.batch.peeked = true; peekFor = visit; }   // one peek a tour
+            continue;
+          }
         }
       }
       if (peekFor) { queue.unshift(peekAt(peekFor), visit); peekFor = null; continue; }
@@ -474,6 +573,7 @@
 
   // ---- what the desk is doing -----------------------------------------------------------------------
   let board = {}, lastTour = 0, tickCoin = null, lastPrice = null, lastHop = Date.now();   // no hop in the first 20 s
+  let switched = false;           // a tab was clicked: the next board tours, whichever it is
   function alive() {              // a board has landed and it is recent enough to say the desk is running
     if (!board.updated) return false;
     return Date.now() - board.updated < (board.static === false ? STALE_LIVE : STALE_STATIC);
@@ -499,7 +599,24 @@
     const gate = (gates || []).find((x) => x.verdict === "DROP" || x.verdict === "WAIT");
     return gate ? gate.owner : null;
   }
+  // VT: each coin's row in the basket's order, then the bank. A row's state is what it shows: ABOVE / BELOW its
+  // average and its ORDER word (HOLD, FLAT, PREVIEW, or the order waiting: BUY, ADD, TRIM, SELL ALL). A coin whose
+  // state none of the others share, while two of them do share one, gets the longer look
+  function basketTour() {
+    const word = (el) => (el ? el.textContent.trim().split(" ")[0] : "");
+    const rows = sleeves(), states = rows.map((r) => `${word(r.children[AVG] && r.children[AVG].querySelector("b"))} ${word(r.lastElementChild.querySelector("b"))}`);
+    const many = (st) => states.filter((x) => x === st).length;
+    const shared = states.some((st) => many(st) > 1);
+    const batch = { peeked: false };
+    const stops = rows.map((r, k) => {
+      const coin = coinOf(r), odd = shared && many(states[k]) === 1;
+      return { kind: "tour", batch, at: () => sleeveSpot(coin, true), alt: () => nameSpot(coin), dwell: odd ? rand(2000, 2500) : rand(800, 1300) };
+    });
+    stops.push({ kind: "tour", batch, at: bankSpot, dwell: 1400 });
+    return stops;
+  }
   function tour(d) {              // each card the first time it owns a gate, in the board's gate order
+    if (basket()) return basketTour();
     const blocker = blockerOf(d.gates), keys = [];
     (d.gates || []).forEach((x) => { if (x.owner && !keys.includes(x.owner)) keys.push(x.owner); });
     if (!keys.length) keys.push(...ORDER);
@@ -533,8 +650,8 @@
     touch();
     candle = d.candle || null;
     const fills = newFills(d.coin), now = Date.now();
-    const fresh = d.coin !== board.coin || d.scanned !== board.scanned || (d.updated !== board.updated && now - lastTour > RETOUR);
-    board = d;
+    const fresh = switched || d.coin !== board.coin || d.scanned !== board.scanned || (d.updated !== board.updated && now - lastTour > RETOUR);
+    board = d; switched = false;
     label();
     reveal();
     if (!on) return;
@@ -551,7 +668,7 @@
     if (fills.length) {
       queue = queue.filter((v) => v.kind !== "idle");
       later = later.filter((v) => v.kind !== "event");
-      queue.unshift({ kind: "event", at: () => eventSpot(fills[0]), dwell: 4000, pace: 520, until: now + 10 * 60000 });
+      queue.unshift({ kind: "event", text: fills[0], at: () => eventSpot(fills[0]), dwell: 4000, pace: 520, until: now + 10 * 60000 });
       if (!visit || visit.kind !== "event") cut();
     }
     kick();
@@ -561,8 +678,9 @@
     const d = e.detail || {};
     touch();
     if (d.candle) candle = d.candle;
-    const moved = d.coin === tickCoin && lastPrice != null && d.price != null && d.price !== lastPrice;
-    tickCoin = d.coin; lastPrice = d.price;
+    const vt = basket(), price = vt ? bankText() : d.price;   // VT has no price: its bank, as the ticker shows it
+    const moved = d.coin === tickCoin && lastPrice != null && price != null && price !== lastPrice;
+    tickCoin = d.coin; lastPrice = price;
     label();
     if (!on) return;
     if (reduced.matches) { rest(); return; }
@@ -571,7 +689,7 @@
     if (visit && visit.kind === "sleep") { cut(); kick(); return; }
     if (!moved || Date.now() - lastHop < HOP_EVERY) return;
     if ((visit && (visit.kind === "event" || visit.kind === "hop")) || (queue[0] && queue[0].kind === "event")) return;
-    const p = priceSpot();
+    const p = vt ? bankSpot() : priceSpot();
     if (!p || !seen(p.y, S / 2)) return;
     lastHop = Date.now();
     const from = { x: sp.x, y: sp.y, perch };
@@ -581,10 +699,12 @@
     kick();
   });
 
-  // another tab: drop the old coin's plan; the new board's tour follows as soon as it loads
+  // another tab: drop the old coin's plan; the tour of whichever board loads next follows as soon as it does (the
+  // clicked tab's, or the shown one's again when another tab was clicked before that one loaded)
   document.addEventListener("click", (e) => {
     const tab = e.target instanceof Element && e.target.closest(".coin[data-coin]");
     if (!tab || tab.dataset.coin === board.coin) return;  // the tab already shown: nothing changes
+    switched = true;
     queue = queue.filter((v) => v.kind !== "tour" && v.kind !== "event");
     later = [];
     if (visit && (visit.kind === "tour" || visit.kind === "event")) cut();
