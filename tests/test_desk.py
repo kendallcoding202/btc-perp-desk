@@ -485,16 +485,20 @@ def test_vt_perp_accounting_realises_pnl_as_the_position_shrinks():
 
 class FakeDailyFeed:
     """One coin's daily candles as an exchange serves them at clock["now"]: the closed ones plus the one forming.
-    `lag` hides the newest N of them, like a feed that hasn't caught up yet (they show up on a later call)."""
+    `lag` hides the newest N of them, like a feed that hasn't caught up yet (they show up on a later call); `hide`
+    drops bars from the answers until it's cleared (a hole); `late_ms` answers as of that much after the clock
+    (a request retried after a 429)."""
 
     def __init__(self, bars, funding, clock):
         self.bars, self.all_funding, self.clock = bars, funding, clock
         self.requests, self.last_latency_ms, self.bar_ms, self.lag = 0, 1.0, DAY, 0
+        self.hide, self.late_ms = set(), 0
 
     def candles(self, start_ms=0, end_ms=None, closed_only=True):
         self.requests += 1
-        now = self.clock["now"]
-        out = [b for b in self.bars if start_ms <= b.ts <= now and (not closed_only or b.ts + DAY <= now)]
+        now = self.clock["now"] + self.late_ms
+        out = [b for b in self.bars if start_ms <= b.ts <= now and b.ts not in self.hide
+               and (not closed_only or b.ts + DAY <= now)]
         return out[:len(out) - self.lag]
 
     def funding(self, start_ms, end_ms=None):
@@ -541,12 +545,17 @@ def test_vt_paper_stepping_matches_the_backtest(tmp_path):
         caught_up = max(caught_up, s["paper"]["bars_processed_this_run"])
         led = json.loads((tmp_path / "paper.json").read_text())["broker"]
         forming_fills += sum(1 for f in led["fills"] if f["ts"] == t0 + k * DAY and k < 260)   # filled before it closed
-    led = json.loads((tmp_path / "paper.json").read_text())
+    assert caught_up >= 80 and forming_fills > 0 and lagged > 3
+    _assert_vt_ledger_is_the_backtest(tmp_path, series, funding, t0 + start * DAY)
 
-    ref = voltrend.run(series, funding, VOLTREND, start_ms=t0 + start * DAY).book
+
+def _assert_vt_ledger_is_the_backtest(ledger, series, funding, start_ms):
+    """The ledger, after a last run with every bar closed, against one backtest from its first day: the same fills
+    and events in the same order, the same cash, equity curve and positions."""
+    led = json.loads((ledger / "paper.json").read_text())
+    ref = voltrend.run(series, funding, VOLTREND, start_ms=start_ms).book
     b = led["broker"]
     assert {f["kind"] for f in ref.fills} == {"entry", "resize", "exit"} and len(ref.fills) > 10
-    assert caught_up >= 80 and forming_fills > 0 and lagged > 3
     assert b["fills"] == ref.fills and b["trades"] == ref.trades and b["pending"] == ref.pending
     assert b["cash"] == ref.cash and b["funding_total"] == ref.funding_total != 0
     assert [tuple(x) for x in b["equity_curve"]] == ref.equity_curve
@@ -555,7 +564,37 @@ def test_vt_paper_stepping_matches_the_backtest(tmp_path):
     assert "opened" in events[0][2] and len(events) < 200
     assert events[1:] == [(e.ts, e.agent, e.text) for e in ref.events]
     assert led["meta"]["strategy"] == "voltrend" and led["meta"]["interval"] == "1d"
-    assert led["meta"]["last_bar_ts"] == t0 + 259 * DAY
+    assert led["meta"]["last_bar_ts"] == series["BTC"][-1].ts
+
+
+def test_vt_paper_matches_the_backtest_through_feed_glitches(tmp_path):
+    """The same, through what a real feed does now and then: one coin's forming bar not in its answer yet, the bar
+    that just closed missing from one answer only, and an answer that arrives just after 00:00 (a retried request),
+    so it already holds the new day's bar while the run's clock is still on the old day."""
+    series, funding = _vt_market()
+    clock = {}
+    feeds = {c: FakeDailyFeed(series[c], funding[c], clock) for c in series}
+    t0, start = series["BTC"][0].ts, 60
+    clock["now"] = t0 + start * DAY + DAY // 2
+    paper.step_basket(VOLTREND, tmp_path, feeds=feeds, log=lambda *a: None, now_ms=clock["now"])
+    rnd, k, glitches = random.Random(5), start, {"forming": 0, "hole": 0, "late": 0}
+    while k < 258:
+        k += rnd.choice([1, 1, 2])
+        clock["now"] = t0 + k * DAY + 4 * 60_000         # 00:04: bar k is forming
+        f, glitch = rnd.choice(list(feeds.values())), rnd.choice([*glitches, None])
+        if glitch == "forming":
+            f.lag = 1
+        elif glitch == "hole":
+            f.hide = {t0 + (k - 1) * DAY}
+        elif glitch == "late":                           # 23:59:50 on day k, that coin answered at 00:00:20
+            clock["now"], f.late_ms = t0 + (k + 1) * DAY - 10_000, 30_000
+        glitches[glitch] = glitches.get(glitch, 0) + 1
+        paper.step_basket(VOLTREND, tmp_path, feeds=feeds, log=lambda *a: None, now_ms=clock["now"])
+        f.lag, f.hide, f.late_ms = 0, set(), 0
+    clock["now"] = t0 + 261 * DAY                        # every bar closed
+    paper.step_basket(VOLTREND, tmp_path, feeds=feeds, log=lambda *a: None, now_ms=clock["now"])
+    assert min(glitches.values()) >= 10
+    _assert_vt_ledger_is_the_backtest(tmp_path, series, funding, t0 + start * DAY)
 
 
 def test_vt_board_carries_the_experiment_label(tmp_path):

@@ -186,15 +186,17 @@ def step_basket(vt: VolTrend = VOLTREND, ledger_dir: str | Path = "ledger/VT", f
     since = now - VT_LOOKBACK_DAYS * day
     if meta["last_bar_ts"]:
         since = min(since, meta["last_bar_ts"] - (need + 10) * day)
-    raw = {c: feeds[c].candles(start_ms=since, closed_only=False) for c in vt.coins}
+    # Judged by this run's clock: an answer that arrives after 00:00 (a retried request) also has the new day's bar,
+    # which would make the day that just closed look like neither closed nor forming.
+    raw = {c: [b for b in feeds[c].candles(start_ms=since, closed_only=False) if b.ts <= now] for c in vt.coins}
     closed = {c: [b for b in bars if b.ts + day <= now] for c, bars in raw.items()}
     forming = {c: bars[-1] for c, bars in raw.items() if bars and bars[-1].ts + day > now}
     for c in vt.coins:
         if len(closed[c]) < need:   # a short or broken answer must never read as "below the average": sell everything
             raise RuntimeError(f"{c}: only {len(closed[c])} closed daily candles from the feed, need {need}")
-    # A day is processed once every coin has reported it: its bar has closed, or a later bar exists (then that
-    # coin's bar for the day is missing for good, and it sits the day out, as in the backtest).
-    covered = min(forming[c].ts - day if c in forming else closed[c][-1].ts for c in vt.coins)
+    # A day is processed once every coin has a closed bar on or after it. A coin with no bar that day sits it out, as
+    # in the backtest, but only once a later bar of its has closed: a bar missing from one answer is waited for.
+    covered = min(closed[c][-1].ts for c in vt.coins)
 
     processed = 0
     if not meta["last_bar_ts"]:
@@ -220,12 +222,14 @@ def step_basket(vt: VolTrend = VOLTREND, ledger_dir: str | Path = "ledger/VT", f
             meta["last_bar_ts"] = days[-1]
             processed = len(days)
 
-    # The bar that's forming now: orders decided at the last close fill at its open, as in the backtest. Only for a
-    # coin whose closed bars are all processed (otherwise its order belongs to an earlier open).
-    for c in vt.coins:
-        bar = forming.get(c)
-        if bar is not None and bar.ts > meta["last_bar_ts"] and not any(b.ts > meta["last_bar_ts"] for b in closed[c]):
-            book.fill_pending(c, bar.open, bar.ts)
+    # The bar that's forming now: orders decided at the last close fill at its open, as in the backtest. Every coin
+    # together and in coin order, as on_day fills them, and only once every closed bar is processed (otherwise an
+    # order belongs to an earlier open). If a coin's forming bar isn't in the answer, they all wait for the next run.
+    last = meta["last_bar_ts"]
+    if all(c in forming and forming[c].ts > last for c in vt.coins) and \
+            not any(b.ts > last for c in vt.coins for b in closed[c]):
+        for c in vt.coins:
+            book.fill_pending(c, forming[c].open, forming[c].ts)
     marks = {c: (forming[c] if c in forming else closed[c][-1]).close for c in vt.coins}
     preview = {}
     for c in vt.coins:
