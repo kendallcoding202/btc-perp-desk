@@ -1246,10 +1246,13 @@ def test_a_cap_too_small_for_any_ticket_at_the_current_price_refuses_to_start(tm
     ex2 = FakeHyperliquid({"BTC": bars[299].close}, usdc=10_000.0)
     paths = runner.live_paths(tmp_path / "live", "BTC")
     small = LiveBroker(P, exchange=ex2, state_path=paths["position"], max_notional_usd=10.0, log=lambda *a: None)
+    def one_poll(_):
+        raise StopLoop                  # if it got as far as the loop, it didn't refuse
+
     with pytest.raises(LiveSetupError, match="smallest ticket"):
         runner.run(P, "live", state_dir=str(tmp_path / "live"), dashboard=False, log=lambda *a: None,
                    feed=LiveFeed(bars, funding, 300), broker=small, clock=lambda: bars[300].ts + 60_000,
-                   sleep=lambda s: None)
+                   sleep=one_poll)
     assert ex2.orders == []
     # and the line is exactly where an entry starts going out
     p = params_for("BTC")
