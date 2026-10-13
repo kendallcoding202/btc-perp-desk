@@ -158,7 +158,9 @@ def trigger_outlook(f: ind.Features, i: int, n: int, limit: int = 10, short: boo
 
 def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict | None = None,
           jev_client=None, now_ms: int | None = None, candles: int = 140, goal_pace: dict | None = None,
-          elapsed_days: float | None = None, flows=None) -> dict:
+          elapsed_days: float | None = None, flows=None, start_equity: float | None = None) -> dict:
+    """start_equity: the account's own starting balance (a live account's first exchange balance); paper boards
+    leave it out and start from the paper setting."""
     p, broker, dec = desk.p, desk.broker, desk.last_decision
     coin = p.market.symbol
     shorts = p.strategy.allow_shorts and p.strategy.short_mode == "breakdown"
@@ -173,7 +175,7 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
     wins = sum(1 for t in trades if t.net_pnl > 0)
     losses = len(trades) - wins
     a = f.atr[i] or 0.0
-    start_eq = p.sizing.starting_equity
+    start_eq = p.sizing.starting_equity if start_equity is None else start_equity
     bars_per_day = max(1, int(86400_000 / f.bar_ms))
     prev = bars[max(0, i - bars_per_day)].close
     chg_24h = price / prev - 1 if prev else 0.0

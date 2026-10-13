@@ -1779,3 +1779,19 @@ def test_the_feed_prices_a_moment_from_the_minute_candle_and_falls_back_to_the_h
     assert feed.price_at(ts) == 80_500.0
     book["1h"] = []
     assert feed.price_at(ts) is None
+
+
+def test_the_live_board_measures_pnl_from_the_live_accounts_own_start(tmp_path, monkeypatch):
+    """The live board's P&L and goal start from the account's real starting balance (meta start_equity), not the
+    paper account's setting: a flat $500 live account reads $0 and 0%, not -$9,500 against P's $10,000."""
+    bars, funding = series(n=520, vol=0.0, drift=0.0, start=80_000.0)
+    p = P.with_(hard={"max_data_age_bars": 1e9})
+    assert p.sizing.starting_equity != 500.0
+    states, real = [], runner.board_mod.build
+    monkeypatch.setattr(runner.board_mod, "build", lambda *a, **k: states.append(real(*a, **k)) or states[-1])
+    _run_live(tmp_path, p, bars, funding, 500, [1, 1], ex=FakeHyperliquid({"BTC": 80_000.0}, usdc=500.0))
+    live = [s for s in states if s["header"]["mode"] != "REPLAY"]
+    assert live
+    t = live[-1]["ticker"]
+    assert t["bank"] == pytest.approx(500.0) and t["pnl"] == pytest.approx(0.0) and t["pnl_pct"] == pytest.approx(0.0)
+    assert live[-1]["goal"]["start"] == pytest.approx(500.0)
