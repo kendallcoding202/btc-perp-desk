@@ -1,6 +1,6 @@
 # BTC Perp Desk (now BTC · ETH · SOL)
 
-A multi-agent trading desk for **BTC, ETH and SOL perpetual futures** (three separate $150 paper accounts), modelled on the "GROKBOT + JEV" dashboard, with one difference: every number it trades on has been backtested, with fees and funding charged. A fourth paper account, **VT**, runs a different, slower strategy on the same three coins ([below](#vt-the-vol-trend-basket-a-4th-paper-account)).
+A multi-agent trading desk for **BTC, ETH and SOL perpetual futures** (three separate paper accounts: BTC $500, ETH and SOL $150 each), modelled on the "GROKBOT + JEV" dashboard, with one difference: every number it trades on has been backtested, with fees and funding charged. A fourth paper account, **VT**, runs a different, slower strategy on the same three coins ([below](#vt-the-vol-trend-basket-a-4th-paper-account)).
 
 ```
 CHIEF    never takes a position     runs the gates in order, every 2h close
@@ -22,7 +22,7 @@ Full report with every table: [`reports/backtest.md`](reports/backtest.md). Re-r
 
 | | Desk | Buy & hold BTC |
 |---|---|---|
-| Total return | **+1,475%** ($150 → $2,363) | +1,059% |
+| Total return | **+1,475%** ($500 → $7,876) | +1,059% |
 | Per year | +50% | |
 | Worst drop from a peak | **28%** | 77% |
 | Out-of-sample (2024-01 → 2026-09; settings were picked on 2020–23) | +95%, profit factor 1.44 | +103% |
@@ -34,7 +34,7 @@ The honest read:
 - **This is the aggressive profile you asked for.** Each trade risks 5% of the account. Leverage is set by the stop distance: a tight setup gets more (median 1.7×, max 4×). The worst losing streak so far was 8 trades in a row. At 2% risk the same strategy made +21%/yr with a 12% worst drop.
 - **The backtest flatters it.** Many variants were tried to get here, and the 2h/5% choice was made after seeing them. 2026 has been a losing year. The paper experiment is the real test.
 - **Whole-period profit isn't the result of one lucky setting.** Every nearby setting tested was profitable, and tripling fees and slippage still leaves it profitable.
-- **$150 → $100,000 is a 667× goal.** At the whole backtest's +50%/yr that's about 16 years, but that pace includes 2020–23, where the settings were picked. At the 2024–26 out-of-sample pace, +28%/yr, it's about 26 years. The board projects every account at its own backtest's 2024–26 pace ("at 2024–26 backtest pace"), and once an account is 30 days old, at the pace it has actually made too. For ETH and SOL that period is only partly unseen: their 2% risk was picked after seeing ETH's 2024, and ETH's shorts were switched on after missing their own bar ([`reports/edge-hunt-2026-10.md`](reports/edge-hunt-2026-10.md)).
+- **$500 → $100,000 is a 200× goal.** At the whole backtest's +50%/yr that's about 13 years, but that pace includes 2020–23, where the settings were picked. At the 2024–26 out-of-sample pace, +28%/yr, it's about 21 years. With the planned $100 a month for 5 years it's about 13 years at that pace (about $13,500 after 5 years, $6,500 of it deposited); at +10%/yr it would be about 31 years. These are backtest paces, not forecasts. The board projects every account at its own backtest's 2024–26 pace ("at 2024–26 backtest pace"), and once an account is 30 days old, at the pace it has actually made too. For ETH and SOL that period is only partly unseen: their 2% risk was picked after seeing ETH's 2024, and ETH's shorts were switched on after missing their own bar ([`reports/edge-hunt-2026-10.md`](reports/edge-hunt-2026-10.md)).
 
 ### ETH and SOL: same desk, smaller bets
 
@@ -70,7 +70,7 @@ python3 -m desk backtest --research          # download history, write reports/b
 python3 -m desk backtest --coin ETH          # same for ETH (or SOL): reports/backtest-ETH.md
 python3 -m desk vt-backtest                  # the VT basket: reports/backtest-VT.md
 python3 -m desk replay                       # watch it trade 2024→now at http://127.0.0.1:8787
-python3 -m desk paper                        # a $150 paper account (add --coin ETH), live board at :8787
+python3 -m desk paper                        # a $500 BTC paper account ($150 with --coin ETH or SOL), board at :8787
 python3 -m desk step                         # one step for every account (BTC, ETH, SOL, VT), the way the Action runs it
 python3 -m pytest                            # 112 tests, incl. "paper ledger == backtest" for the desk and for VT,
                                              # and live mode against a fake exchange (tests/test_live.py)
@@ -78,9 +78,11 @@ python3 -m pytest                            # 112 tests, incl. "paper ledger ==
 
 ## The paper experiments
 
-**Three $150 paper accounts** (BTC, ETH, SOL; $450 in all) trade live Hyperliquid prices, plus the **$500 VT basket** ([below](#vt-the-vol-trend-basket-a-4th-paper-account)). Each account is separate, with its own cash, positions and record; the three desk accounts also have their own kill switches. A GitHub Actions job ([`.github/workflows/paper.yml`](.github/workflows/paper.yml)) runs `python -m desk step` every 15 minutes, so the experiments keep running with no computer on. If one account's step fails (say, a rate-limited API call), the others still run and save, and the failed one catches up next run.
+**Three desk paper accounts** (BTC $500, ETH and SOL $150 each; $800 in all) trade live Hyperliquid prices, plus the **$500 VT basket** ([below](#vt-the-vol-trend-basket-a-4th-paper-account)). Each account is separate, with its own cash, positions and record; the three desk accounts also have their own kill switches. A GitHub Actions job ([`.github/workflows/paper.yml`](.github/workflows/paper.yml)) runs `python -m desk step` every 15 minutes, so the experiments keep running with no computer on. If one account's step fails (say, a rate-limited API call), the others still run and save, and the failed one catches up next run.
 
-**Why $150, not $50.** Hyperliquid won't take an order under $10. The desk's ETH and SOL orders come to about 0.3–0.5× the account (BTC's about 1.7×), so at $50 some of their trades get skipped, and more after a losing streak. From every historical entry: BTC clears $10 on every trade from about $17 of equity; ETH and SOL need about $85–90, so $150 keeps them trading through a 40% drawdown. The accounts were restarted at $150 on 2026-10-12; the $50 runs (opened 10-09 and 10-10) had made no trades, and their ledgers are kept in `ledger/archive/` on the paper-ledger branch. One thing this changed: at $150 SOL takes 13 trades the $50 account had to skip (12 of them in 2021), and 12 of those 13 lost. Skipping them had flattered SOL's old report (+40%, now +16% at $150; 2024 onwards is the same either way).
+**Why BTC is $500.** BTC is the account planned for real money first, on Coinbase's US-regulated nano BTC perp (Hyperliquid isn't available in the US). Coinbase trades whole contracts of 0.01 BTC, about $830 at $83,000, with about 21% overnight margin, so a $150 account can't hold even one contract. The paper account mirrors the planned $500 start. It was restarted at $500 on 2026-10-13; the $150 run (opened 2026-10-12, no trades) is kept in `ledger/archive/` on the paper-ledger branch. Its backtest is the same in percentage terms at $500 as at $150: BTC's tickets clear the $10 minimum from about $17 of equity, so no trade changes. The paper account still trades Hyperliquid prices in fractional sizes; whole-contract Coinbase sizing comes with the Coinbase work.
+
+**Why $150 for ETH and SOL, not $50.** Hyperliquid won't take an order under $10. The desk's ETH and SOL orders come to about 0.3–0.5× the account (BTC's about 1.7×), so at $50 some of their trades get skipped, and more after a losing streak. From every historical entry: BTC clears $10 on every trade from about $17 of equity; ETH and SOL need about $85–90, so $150 keeps them trading through a 40% drawdown. The accounts were restarted at $150 on 2026-10-12; the $50 runs (opened 10-09 and 10-10) had made no trades, and their ledgers are kept in `ledger/archive/` on the paper-ledger branch. One thing this changed: at $150 SOL takes 13 trades the $50 account had to skip (12 of them in 2021), and 12 of those 13 lost. Skipping them had flattered SOL's old report (+40%, now +16% at $150; 2024 onwards is the same either way).
 
 - **The record** lives on the [`paper-ledger`](../../tree/paper-ledger/ledger) branch, saved whenever something happens, so the history is permanent and public:
   - `ledger/<COIN>/paper.json` (`BTC`, `ETH`, `SOL`): the account, open position, every trade, and the desk's memory

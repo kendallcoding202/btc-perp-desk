@@ -347,7 +347,7 @@ def test_each_coin_gets_its_own_symbol_and_risk():
     assert (btc.market.symbol, eth.market.symbol, sol.market.symbol) == ("BTC", "ETH", "SOL")
     assert btc.sizing.risk_per_trade == DEFAULT.sizing.risk_per_trade
     assert eth.sizing.risk_per_trade == sol.sizing.risk_per_trade == 0.02    # 5% hit the drawdown halt in backtests
-    assert all(q.sizing.starting_equity == 150 for q in (btc, eth, sol))
+    assert btc.sizing.starting_equity == 500 and eth.sizing.starting_equity == 150 == sol.sizing.starting_equity
     assert eth.strategy.allow_shorts and eth.strategy.short_mode == "breakdown"   # the user's paper experiment
     assert not btc.strategy.allow_shorts and not sol.strategy.allow_shorts
     assert (report_name("BTC"), report_name("eth")) == ("backtest", "backtest-ETH")

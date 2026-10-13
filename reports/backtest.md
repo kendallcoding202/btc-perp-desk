@@ -1,7 +1,7 @@
 # Backtest — BTC perp, 2h bars
 
-2020-01-01 → 2026-10-01 (6.7 years). Generated 2026-10-12T22:50:28+00:00.
-Costs charged: taker fee 4.5 bps + slippage 3.0 bps per side, plus real funding prints. Start equity $150, risk 5.0%/trade, max 5x.
+2020-01-01 → 2026-10-01 (6.7 years). Generated 2026-10-13T17:30:18+00:00.
+Costs charged: taker fee 4.5 bps + slippage 3.0 bps per side, plus real funding prints. Start equity $500, risk 5.0%/trade, max 5x.
 
 | | Desk | Buy & hold BTC |
 |---|---|---|
@@ -9,9 +9,9 @@ Costs charged: taker fee 4.5 bps + slippage 3.0 bps per side, plus real funding 
 | CAGR | +50.5% | |
 | Max drawdown | 28.2% | 77.2% |
 | Sharpe (daily) | 1.21 | |
-| Final equity | $2,363 | |
+| Final equity | $7,876 | |
 
-Trades 118 (118 long / 0 short), win rate 42%, profit factor 1.70, avg win $110, avg loss $-46. Fees paid $254, funding paid $206. In the market 12% of the time.
+Trades 118 (118 long / 0 short), win rate 42%, profit factor 1.70, avg win $365, avg loss $-153. Fees paid $846, funding paid $687. In the market 12% of the time.
 
 ## In-sample vs out-of-sample
 
@@ -126,7 +126,7 @@ The trailing stop already sells winners: it ratchets up behind every new high an
 
 ## Jev experiment — does a second opinion predict which trades win?
 
-_Carried over from the 2026-10-09 report (the $50 start). The 118 entries are the same at $150, and Jev's answers don't depend on account size, so it was not re-run._
+_Carried over from the 2026-10-09 report (the $50 start). The 118 entries are the same at $150 and at $500, and Jev's answers don't depend on account size, so it was not re-run. Its dollar figures are from the $50 run._
 
 Every one of the 118 historical entries was described to Jev (relative numbers only, no dates or prices) and asked the desk's three questions. 0 correlation = no predictive value.
 

@@ -17,7 +17,7 @@ export EDGE_END=$(date -u +%Y-%m-01)                   # harness.OOS_END = first
 
 ## A. The accounts we run
 
-The accounts: BTC, ETH and SOL desk accounts at $150 each, and the VT vol-trend basket at $500.
+The accounts: the BTC desk account at $500 (restarted 2026-10-13 from $150 for the planned real-money start; the $150 run is archived), ETH and SOL desk accounts at $150 each, and the VT vol-trend basket at $500.
 
 1. **Paper vs backtest.** Run each account's backtest over its paper period on Hyperliquid data, or replay its fills, and compare with its ledger. REVIEW if a paper account's cumulative return differs from the same-period backtest by more than 2 percentage points without an explained cause, such as a single wick, a missed run or a known venue difference.
 2. **Health.** For each account, from its paper start and on the new data: return, max drawdown, trades, and fees and funding paid.
