@@ -461,7 +461,7 @@
   if (!ACCOUNTS.includes(coin)) coin = "BTC";
 
   let state = null, base = null, index = null;
-  const live = { mids: {}, at: 0, candle: null, candleCoin: null };   // filled from Hyperliquid by the viewer's own browser
+  const live = { mids: {}, at: 0, candle: null };   // filled from Hyperliquid by the viewer's own browser
 
   async function hl(body) {
     const res = await fetch(HL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -544,7 +544,7 @@
       }
       start += c.start; bank += b;
       const label = basket ? (c.holdings || []).map((h) => h.coin).join("·") : lp ? px(lp) : px(c.price);
-      const sub = basket ? " · vol-trend basket" : ` · risk ${(c.risk_per_trade * 100).toFixed(0)}%${c.shorts ? " · +shorts" : ""}`;
+      const sub = basket ? " · basket" : ` · risk ${(c.risk_per_trade * 100).toFixed(0)}%${c.shorts ? " · +shorts" : ""}`;
       return `<button class="coin ${c.coin === coin ? "on" : ""}" data-coin="${esc(c.coin)}" aria-pressed="${c.coin === coin}">` +
         `<span class="c-name">${esc(c.coin)}<i>${esc(label)}</i></span><span class="c-bank">${usd(b)}</span>` +
         `<span class="c-sub">${pct(b / c.start - 1)} · ${esc(c.position)} · ${esc(c.record)}${sub}</span></button>`;
@@ -554,7 +554,7 @@
     nav.style.setProperty("--tabs", cards.length);
     nav.innerHTML = cards.join("");
     nav.querySelectorAll("[data-coin]").forEach((b) => b.addEventListener("click", () => {
-      coin = b.dataset.coin; storeSet("desk-coin", coin); history.replaceState(null, "", "#" + coin);
+      coin = b.dataset.coin; storeSet("desk-coin", coin); history.replaceState(null, "", "#" + coin); missing = null;
       live.candle = null; src = `boards/${coin}.json`; tick().then(pollCandle);   // the candle for the new tab's board
     }));
   }
@@ -579,6 +579,7 @@
     const age = Math.round((Date.now() - s.updated) / 60000);
     $("foot").textContent = `desk updated ${new Date(s.updated).toISOString().replace("T", " ").slice(0, 16)} UTC (${age} min ago)` +
       (live.at ? ` · live price ${Math.round((Date.now() - live.at) / 1000)}s ago from Hyperliquid` : "") +
+      (missing ? ` · no ${missing} board this run (its step failed), showing ${hdr.coin || "BTC"}` : "") +
       ` · not financial advice; the desk can and will lose money`;
     if (staticMode) {
       document.querySelectorAll("[data-kill]").forEach((b) => { b.disabled = true; });
@@ -590,12 +591,18 @@
   const params = new URLSearchParams(location.search);
   let src = params.get("state") || "api/state";
   let staticMode = !!params.get("state");
+  let missing = null;   // an account with no board this run: its step failed, and the workflow publishes no stale one
   async function tick() {
     try {
       const url = staticMode && src !== "api/state" ? src.split("?")[0] + `?t=${Date.now()}` : src;
       let res = await fetch(url, { cache: "no-store" });
       if (!res.ok && src === "api/state" && res.status !== 503) {
         staticMode = true; src = `boards/${coin}.json`;
+        res = await fetch(`${src}?t=${Date.now()}`, { cache: "no-store" });
+      }
+      if (res.status === 404 && staticMode && coin !== "BTC" && src === `boards/${coin}.json`) {
+        // show BTC's board (and the tab row) instead of a blank page; the remembered tab stays, for when it's back
+        missing = coin; coin = "BTC"; src = "boards/BTC.json";
         res = await fetch(`${src}?t=${Date.now()}`, { cache: "no-store" });
       }
       if (!res.ok && src === "boards/BTC.json") {            // an older deploy with a single BTC board
@@ -623,7 +630,7 @@
     try {
       const rows = await hl({ type: "candleSnapshot", req: { coin: c, interval: iv, startTime: now - 2 * ms, endTime: now } });
       const f = rows.find((r) => r.T >= now);
-      live.candle = f ? [f.t, +f.o, +f.h, +f.l, +f.c] : null; live.candleCoin = c;
+      live.candle = f ? [f.t, +f.o, +f.h, +f.l, +f.c] : null; live.candleCoin = c;   // whose candle it is
       render();
     } catch { /* the chart just shows closed candles */ }
   }

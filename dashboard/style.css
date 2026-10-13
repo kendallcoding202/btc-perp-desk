@@ -60,6 +60,8 @@ body { padding: 10px; }
 .coin .c-name i { font-style: normal; font-family: var(--mono); font-size: 10px; color: var(--muted); letter-spacing: 0; }
 .coin .c-bank { font-weight: 700; font-size: 16px; }
 .coin .c-sub { font-size: 10px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* five tabs don't fit a desktop's width in one line: let the sub-line wrap there (phones keep one line) */
+@media (min-width: 561px) { .coin { align-content: start; } .coin .c-sub { white-space: normal; } }
 .live-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--green); margin-right: 5px; vertical-align: middle; animation: pulse 1.6s infinite; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
 @media (prefers-reduced-motion: reduce) { .live-dot { animation: none; } }
