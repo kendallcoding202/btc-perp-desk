@@ -700,14 +700,14 @@
       base = board; index = idx;
       render();
       emit("desk:board", { updated: base.updated, scanned: base.analysis?.scanned, gates: base.analysis?.gates || [],
-        agents: (base.agents || []).map((a) => a.key), static: staticMode });
+        agents: (base.agents || []).map((a) => a.key), static: staticMode, board: base, index: idx });
     } catch (err) {
       if (mine === asked) $("foot").textContent = `can't reach the desk (${err.message}). is \`python -m desk paper\` running?`;
     }
   }
 
   async function pollMids() {
-    try { live.mids = await hl({ type: "allMids" }); live.at = Date.now(); render(); emit("desk:tick", { price: state && state.ticker.price }); } catch { /* keep the last price */ }
+    try { live.mids = await hl({ type: "allMids" }); live.at = Date.now(); render(); emit("desk:tick", { price: state && state.ticker.price, mids: live.mids, at: live.at }); } catch { /* keep the last price */ }
   }
   async function pollCandle() {
     const c = (base && base.header.coin) || coin, iv = (base && base.header.interval) || "2h";

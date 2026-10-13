@@ -373,6 +373,7 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
             "calls": getattr(jev_client, "calls", 0), "answers": dec.jev_answers if dec else None,
         },
         "events": [{"ts": e.ts, "agent": e.agent, "text": e.text} for e in list(desk.events)[-30:]],
+        "rules": rules(p),
     }, flows, equity, now_ms)
 
 
@@ -467,3 +468,12 @@ def basket(book, *, now_ms: int, marks: dict[str, float], meta: dict, crawler: d
                   "cooldown": False},
         "jev": {"mode": "off", "enabled": False, "calls": 0, "answers": None},
     }, flows, equity, now_ms)
+
+
+def rules(p) -> dict:
+    """The strategy settings a desk board's page recomputes with: the EMA periods for its live trend row, the
+    breakout window and stop widths for its labels. Read from Params, so the page never hard-codes them."""
+    s = p.strategy
+    return {"interval": p.market.interval, "ema_fast": s.ema_fast, "ema_slow": s.ema_slow,
+            "breakout_bars": s.breakout_bars, "stop_atr": s.stop_atr, "trail_atr": s.trail_atr,
+            "risk_per_trade": p.sizing.risk_per_trade, "allow_shorts": s.allow_shorts}
