@@ -30,11 +30,18 @@ Design rules:
   * a desk close that doesn't go through is kept (close_wanted) and sent again at every
     check, across restarts, until the position is flat;
   * each coin's state is its own file (state/<COIN>/live_position.json);
-  * any exception while placing an order leaves the desk in entry_kill.
+  * any exception while placing an order leaves the desk in entry_kill;
+  * money moved in or out of the account (a deposit, a withdrawal, a transfer between accounts, spot <-> perp) is
+    read from the exchange's ledger before every balance read and handed to the runner as a flow, never as profit or
+    loss (desk/flows.py): on Hyperliquid, userNonFundingLedgerUpdates through ccxt's fetch_ledger, the only one of
+    ccxt's calls that sees every kind (fetch_deposits and fetch_withdrawals return bridge deposits and withdrawals
+    only). A move in the account's value that P&L, fees, funding and the recorded flows don't explain raises an
+    alert (and entry_kill) instead of a guess.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -141,6 +148,59 @@ STOP_BACKOFF_S = 1.0
 FILL_LOOKBACK_MS = 60_000   # an order's own fills are looked up from a minute before it was sent (clock skew)
 FUNDING_MAX_PAGES = 100     # 500 rows a page: years of hourly funding for a few coins
 PROVISIONAL_TRIES = 240     # an exit booked without its fills is re-read at every check for about an hour (15 s polls)
+LEDGER_PAGES = 20           # deposit/withdrawal history pages read per check (more only after a long time away)
+RECONCILE_MIN_USD = 1.0     # a move in the account's value that nothing explains, beyond the larger of $1...
+RECONCILE_FRACTION = 0.02   # ...and 2% of the account, is alerted (price marks, fees and funding stay well inside)
+LEDGER_ALERT_EVERY = 40     # a ledger that can't be read alerts at the first failure and every 40th after (~10 min)
+
+
+class UnknownLedgerEntry(ValueError):
+    """An entry on the exchange's ledger that hl_flow doesn't know: alerted, never guessed at."""
+
+
+# Hyperliquid's userNonFundingLedgerUpdates entries that don't move the perp account's value as money in or out:
+# a liquidation is trading (booked with its trade); the rest happen on the spot side.
+HL_NOT_FLOWS = {"liquidation", "spotTransfer", "spotGenesis", "cStakingTransfer"}
+
+
+def hl_flow(info: dict, me: str) -> tuple[float, str] | None:
+    """(dollars into (+) or out of (-) the perp account `me`, what it was) for one Hyperliquid
+    userNonFundingLedgerUpdates entry ({"time", "hash", "delta": {"type", ...}}, ccxt's fetch_ledger info), None when
+    it isn't money in or out of that account. Raises UnknownLedgerEntry for anything else: never a guess.
+
+    ccxt 4.5.85's parse_ledger_entry gives every entry's "usdc" unsigned with no direction (and no amount at all for a
+    vault withdrawal), so the direction is read here from the delta: who sent it, who got it, toPerp."""
+    d = info.get("delta") or {}
+    kind, me = d.get("type"), (me or "").lower()
+
+    def usd(key: str = "usdc") -> float:
+        try:
+            return abs(float(d[key]))
+        except (KeyError, TypeError, ValueError):
+            raise UnknownLedgerEntry(f"{kind} entry without a readable {key}: {d}") from None
+
+    sender, receiver = str(d.get("user") or "").lower(), str(d.get("destination") or "").lower()
+    if kind == "deposit":
+        return usd(), "deposit"
+    if kind == "withdraw":
+        return -usd(), "withdrawal"              # the withdrawal fee comes out of the amount withdrawn
+    if kind in ("internalTransfer", "subAccountTransfer"):
+        what = "sub-account transfer" if kind == "subAccountTransfer" else "transfer"
+        if receiver == me and sender != me:
+            return usd(), f"{what} in"
+        if sender == me and receiver != me:
+            fee = abs(float(d.get("fee") or 0.0))
+            return -(usd() + fee), f"{what} out"
+        raise UnknownLedgerEntry(f"{kind} that is neither to nor from {me or 'this account'}: {d}")
+    if kind == "accountClassTransfer":
+        return (usd(), "spot → perp") if d.get("toPerp") else (-usd(), "perp → spot")
+    if kind == "vaultDeposit":
+        return -usd(), "into a vault"
+    if kind == "vaultWithdraw":
+        return usd("netWithdrawnUsd"), "out of a vault"
+    if kind in HL_NOT_FLOWS:
+        return None
+    raise UnknownLedgerEntry(f"unknown ledger entry type {kind!r}: {d}")
 
 
 def _trigger(o: dict) -> float | None:
@@ -194,8 +254,27 @@ class LiveBroker:
         self.last_price: float | None = None
         self.stops_to_clean = False           # a close left reduce-only stops behind that couldn't be cancelled yet
         self.defer_stops = False              # catching up missed bars: trail moves are kept, sent once at the end
+        # Money in and out (desk/flows.py): every deposit, withdrawal or transfer read from the exchange's ledger, the
+        # time read up to, the entries already seen, and the runner's hook that takes each one out of the P&L.
+        self.flows: list[dict] = []
+        self.flows_cursor: int | None = None
+        self.flows_seen: list[str] = []
+        self.on_flow = None
+        self.flow_gap: str | None = None      # an unexplained move in the account's value, for the runner (entry_kill)
+        self._recon: dict | None = None       # the last check's account value, price and position, to explain the next
+        self._ledger_failures = 0
+        self._ledger_ok = True
+        self.account = str((getattr(self.ex, "options", None) or {}).get("subAccountAddress")
+                           or getattr(self.ex, "walletAddress", "") or "").lower()
+        self.flows_readable = bool((getattr(self.ex, "has", None) or {}).get("fetchLedger")) and \
+            callable(getattr(self.ex, "fetch_ledger", None))
         self.cash = self._balance()
         self._load_local()
+        if self.flows_cursor is None:         # first start: what funded the account so far is the start, not a flow
+            self.flows_cursor = self.clock() + 1
+        if not self.flows_readable:
+            self.alert(f"{self.venue}'s deposits and withdrawals can't be read here (no fetch_ledger): one would count as "
+                       f"profit or loss, brakes included. A move nothing explains is still alerted")
         if self.cash <= 0 and self.position is None:
             raise LiveSetupError(f"the {self.venue} account reads ${self.cash:,.2f}: nothing to trade with. On "
                                  f"Hyperliquid, HL_WALLET_ADDRESS (and HL_SUBACCOUNT_ADDRESS for a sub-account) must "
@@ -422,8 +501,116 @@ class LiveBroker:
             self._cancel_stops(keep=None)
         if self.provisional:
             self._resolve_provisional()
-        self.cash = self._balance()
+        self.cash = self._refresh_cash()
+        self.reconcile()
         self._save_local()
+
+    # ---- money in and out ----------------------------------------------------
+    def _read_flows(self) -> list[dict] | None:
+        """New deposits, withdrawals and transfers on the exchange's ledger since the last read, oldest first; None if
+        it couldn't be read this time (the next check reads from the same point again)."""
+        if not self.flows_readable:
+            return []
+        seen, out, since = set(self.flows_seen), [], self.flows_cursor
+        for _ in range(LEDGER_PAGES):
+            try:
+                page = self.ex.fetch_ledger(None, since)
+            except Exception as exc:
+                self._ledger_failures += 1
+                text = (f"could not read deposits and withdrawals ({type(exc).__name__}: {exc}); reading again at the "
+                        f"next check")
+                if self._ledger_failures == 1 or self._ledger_failures % LEDGER_ALERT_EVERY == 0:
+                    self.alert(text)
+                else:
+                    self.log(f"{self.coin}: {text}")
+                return out or None
+            fresh = []
+            for e in sorted(page, key=lambda e: e.get("timestamp") or 0):
+                info = e.get("info") or {}
+                fid = "exchange-" + hashlib.sha1(json.dumps(info, sort_keys=True, default=str).encode()).hexdigest()[:16]
+                if fid not in seen:
+                    seen.add(fid)
+                    self.flows_seen.append(fid)
+                    fresh.append((fid, int(e.get("timestamp") or info.get("time") or since), info))
+            if not fresh:
+                break
+            for fid, ts, info in fresh:
+                try:
+                    got = hl_flow(info, self.account)
+                except UnknownLedgerEntry as exc:
+                    self.alert(f"{exc}. Not recorded as a deposit or withdrawal: check it on the exchange; if it moved "
+                               f"the account, the brakes count it as profit or loss")
+                    continue
+                if got is not None:
+                    out.append({"id": fid, "ts": ts, "amount": round(got[0], 6), "what": got[1],
+                                "type": (info.get("delta") or {}).get("type")})
+            since = max(since, max(ts for _, ts, _ in fresh))
+        self._ledger_failures = 0
+        self.flows_cursor = since
+        self.flows_seen = self.flows_seen[-1000:]
+        return out
+
+    def _refresh_cash(self) -> float:
+        """The account's value, after reading the money moved in or out since the last read. Each flow is handed to the
+        runner (on_flow) before the new value is used, so the brakes are scaled before anything sees it. Several flows
+        in one read: the k-th one's equity_after is the value less the flows after it."""
+        new = self._read_flows()
+        bal = self._balance()
+        self._ledger_ok = new is not None
+        after = bal
+        for fl in reversed(new or []):
+            fl["equity_after"] = after
+            after -= fl["amount"]
+        for fl in new or []:
+            self.flows = (self.flows + [fl])[-500:]
+            self.log(f"{self.coin}: {'deposit' if fl['amount'] > 0 else 'withdrawal'} of ${abs(fl['amount']):,.2f} "
+                     f"({fl['what']}) read from the exchange")
+            if self.on_flow is not None:
+                self.on_flow(fl)
+        if new:
+            self._save_local()
+        return bal
+
+    def _snapshot(self) -> dict:
+        pos = self.position
+        return {"av": self.cash, "px": self.last_price, "flows": sum(f["amount"] for f in self.flows),
+                "trades": len(self.trades), "ts": self.clock(),
+                "pos": None if pos is None else [pos.side.sign, pos.qty, pos.entry_price, pos.entry_ts]}
+
+    def reconcile(self) -> float | None:
+        """Explain the move in the account's value since the last check: the price on the position held, the trades
+        booked, the flows recorded. What's left beyond RECONCILE_MIN_USD / RECONCILE_FRACTION (fees, funding and the
+        mark against the mid stay well inside) is alerted and handed to the runner, which sets entry_kill: a deposit
+        the ledger doesn't show would read as profit, a withdrawal as a loss. Returns the unexplained dollars."""
+        if not getattr(self, "_ledger_ok", True):
+            return None                       # the flows couldn't be read: explain this stretch with the next check's
+        prev, now = self._recon, self._snapshot()
+        self._recon = now
+        if prev is None or prev["px"] is None or now["px"] is None:
+            return None
+        new_trades = self.trades[prev["trades"]:]
+        pos, held = self.position, prev["pos"]
+        expected = 0.0
+        if held is not None:
+            sign, qty, _, ets = held
+            if pos is not None and pos.entry_ts == ets and pos.side.sign == sign:
+                expected += sign * qty * (now["px"] - prev["px"])        # the move on what was held
+            else:
+                t = next((t for t in new_trades if t.entry_ts == ets), None)
+                if t is not None:
+                    expected += sign * t.qty * (t.exit_price - prev["px"])
+        expected += sum(t.net_pnl for t in new_trades if held is None or t.entry_ts != held[3])
+        if pos is not None and (held is None or pos.entry_ts != held[3]):
+            expected += pos.unrealized(now["px"]) - pos.fees_paid
+        left = (now["av"] - prev["av"]) - (now["flows"] - prev["flows"]) - expected
+        tol = max(RECONCILE_MIN_USD, RECONCILE_FRACTION * max(abs(prev["av"]), abs(now["av"])))
+        if abs(left) > tol:
+            self.flow_gap = (f"the account's value moved {now['av'] - prev['av']:+,.2f} (to ${now['av']:,.2f}) and "
+                             f"{left:+,.2f} of it isn't explained by the position's P&L, fees, funding or a recorded "
+                             f"deposit or withdrawal. Not guessed at: the brakes now count it as "
+                             f"{'profit' if left > 0 else 'a loss'}. Check the exchange's history; entry_kill is on")
+            self.alert(self.flow_gap)
+        return left
 
     def _follow_size(self, qty: float, entry: float) -> None:
         """The exchange holds the desk's side at another size: something closed part of it (by hand, or a close
@@ -735,7 +922,7 @@ class LiveBroker:
         t = self._book_desk_close(pos, res, ts, ref, reason)
         self._cancel_stops(keep=None)
         self.orders_filled += 1
-        self.cash = self._balance()
+        self.cash = self._refresh_cash()
         self._save_local()
         return t
 
@@ -932,6 +1119,7 @@ class LiveBroker:
             "stop_order_id": self.stop_order_id, "stop_px": self.stop_px, "stops_to_clean": self.stops_to_clean,
             "entry_order_id": self.entry_order_id, "close_wanted": self.close_wanted, "provisional": self.provisional,
             "bar_ts": self.bar_ts,
+            "flows": self.flows, "flows_cursor": self.flows_cursor, "flows_seen": self.flows_seen,
             "position": None if pos is None else {
                 "side": pos.side.value, "qty": pos.qty, "entry_price": pos.entry_price, "entry_ts": pos.entry_ts,
                 "stop": pos.stop, "best_close": pos.best_close, "fees_paid": pos.fees_paid,
@@ -952,6 +1140,9 @@ class LiveBroker:
         self.close_wanted = d.get("close_wanted")
         self.provisional = list(d.get("provisional") or [])
         self.bar_ts = self.replay_until = d.get("bar_ts")
+        self.flows = list(d.get("flows") or [])
+        self.flows_cursor = d.get("flows_cursor")
+        self.flows_seen = list(d.get("flows_seen") or [])
         pd = d.get("position")
         if pd:
             self.position = Position(Side(pd["side"]), pd["qty"], pd["entry_price"], pd["entry_ts"], pd["stop"],

@@ -6,7 +6,9 @@ come back from fetch_open_orders with triggerPrice and reduceOnly, fills from fe
 and the fee, funding from fetch_funding_history is signed USDC, 500 rows a call, for every coin on the account and
 each labelled with the symbol asked for (ccxt's parse_income), its own coin only in info.delta.coin, sizes are
 rounded half-up to the size step and a positive size that rounds to zero raises). It records every order, can fail any call on demand, and fills resting
-stops when the test moves the price through them.
+stops when the test moves the price through them. Money moved in or out (deposit, withdraw, transfer, ...) changes its
+cash and goes on its ledger, which fetch_ledger serves as ccxt 4.5.85's does (userNonFundingLedgerUpdates: each entry's
+usdc unsigned, no direction, the raw entry in info).
 """
 
 from __future__ import annotations
@@ -47,10 +49,15 @@ def _q(x, places: int, rounding=ROUND_HALF_UP) -> Decimal:
     return Decimal(str(x)).quantize(Decimal(1).scaleb(-places), rounding=rounding)
 
 
+ME = "0x" + "aa" * 20                     # the fake's account address (walletAddress)
+
+
 class FakeHyperliquid:
     id = "hyperliquid"
     precisionMode = 4                     # ccxt TICK_SIZE
     FUNDING_PAGE = 500                    # rows per userFunding answer
+    LEDGER_PAGE = 2000                    # rows per userNonFundingLedgerUpdates answer
+    walletAddress = ME
 
     def __init__(self, marks: dict[str, float], usdc: float = 1_000.0, fee_bps: float = 4.5, slip_bps: float = 1.0,
                  coins=tuple(SZ_DECIMALS)):
@@ -81,7 +88,9 @@ class FakeHyperliquid:
         self.calls: list[str] = []
         self.now = T0
         self.oid = 100
-        self.has = {"fetchMyTrades": True, "fetchFundingHistory": True, "fetchOpenOrders": True, "fetchOrder": True}
+        self.has = {"fetchMyTrades": True, "fetchFundingHistory": True, "fetchOpenOrders": True, "fetchOrder": True,
+                    "fetchLedger": True}
+        self.ledger: list[dict] = []              # userNonFundingLedgerUpdates entries, as Hyperliquid returns them
         self.stop_fill_under_new_oid = False      # True: a triggered stop's fill carries a fresh order id
         self.liquidity: dict[str, float] = {}     # symbol -> the most one market (IOC) order finds inside its band
 
@@ -256,6 +265,33 @@ class FakeHyperliquid:
         self._maybe_fail("funding")
         rows = [e for e in self.incomes if since is None or e["timestamp"] >= since][:self.FUNDING_PAGE]
         return [{**e, "symbol": symbol or e["symbol"]} for e in rows]
+
+    def fetch_ledger(self, code=None, since=None, limit=None, params=None):
+        """ccxt 4.5.85's hyperliquid fetch_ledger: userNonFundingLedgerUpdates from `since`, oldest first, each through
+        parse_ledger_entry: amount = delta.usdc as given (unsigned, None when there's none), direction None."""
+        self._maybe_fail("ledger")
+        rows = [e for e in self.ledger if since is None or e["time"] >= since][:self.LEDGER_PAGE]
+        kinds = {"internalTransfer": "transfer", "accountClassTransfer": "transfer"}
+        return [{"info": e, "id": e["hash"], "direction": None, "account": None,
+                 "referenceAccount": e["delta"].get("user"), "referenceId": e["hash"],
+                 "type": kinds.get(e["delta"]["type"], e["delta"]["type"]), "currency": None,
+                 "amount": float(e["delta"]["usdc"]) if "usdc" in e["delta"] else None, "timestamp": e["time"],
+                 "datetime": None, "before": None, "after": None, "status": None, "fee": None} for e in rows]
+
+    # ---- money in and out ---------------------------------------------------
+    def money(self, change: float, delta: dict, dt_ms: int = 1_000, on_ledger: bool = True) -> None:
+        """The account's cash changes by `change` dollars; the ledger gets `delta` (unless on_ledger is False: money
+        that moved without an entry the desk can read)."""
+        self.now += dt_ms
+        self.cash += change
+        if on_ledger:
+            self.ledger.append({"time": self.now, "hash": "0x%064x" % (len(self.ledger) + 1), "delta": delta})
+
+    def deposit(self, usd: float, **kw):
+        self.money(usd, {"type": "deposit", "usdc": f"{usd}"}, **kw)
+
+    def withdraw(self, usd: float, **kw):           # the $1 fee comes out of the amount: the account loses usd
+        self.money(-usd, {"type": "withdraw", "usdc": f"{usd}", "nonce": self.now, "fee": "1.0"}, **kw)
 
     # ---- the passage of time ------------------------------------------------
     def move(self, coin: str, price: float, fill_at: float | None = None, dt_ms: int = 60_000) -> None:
@@ -594,7 +630,8 @@ def _run_paper(tmp_path, p, bars, funding, start, end, monkeypatch):
         paper.step(p, led, feed=feed, log=lambda *a: None, now_ms=bars[upto].ts + H4 // 2)
 
 
-def _run_live(tmp_path, p, bars, funding, start, script, ex=None, desk_meta=None, kills=None, wake_ms=None):
+def _run_live(tmp_path, p, bars, funding, start, script, ex=None, desk_meta=None, kills=None, wake_ms=None,
+              desk_state=None):
     """runner.run against the fake exchange. The first poll is a minute after bar start-1 closes; then each entry of
     `script` sleeps through that many bar closes (1 = a normal poll each bar, 5 = the laptop slept through 5, 0 = the
     next 15 s check inside the same bar),
@@ -627,7 +664,7 @@ def _run_live(tmp_path, p, bars, funding, start, script, ex=None, desk_meta=None
         clock["now"] = ex.now = bars[feed.upto].ts + wakes.get(step, 60_000)
 
     if desk_meta is not None:
-        paths["desk"].write_text(json.dumps({"meta": desk_meta}))
+        paths["desk"].write_text(json.dumps({"meta": desk_meta, **(desk_state or {})}))
     for name, on in (kills or {}).items():
         paths["kills"].write_text(json.dumps({name: on}))
     try:
@@ -1268,3 +1305,186 @@ def test_a_cap_too_small_for_any_ticket_at_the_current_price_refuses_to_start(tm
     b.execute_now(83_000.0, ex.now)
     assert [o["kind"] for o in ex.orders][:1] == ["entry"] and b.position is not None      # exactly enough: it trades
     assert ex.orders[0]["amount"] * 83_000.0 <= need and p.costs.slippage_bps == 3.0
+
+
+# ---------------------------------------------------------------- deposits, withdrawals, transfers (desk/flows.py)
+
+OTHER = "0x" + "cc" * 20
+
+
+def _money_broker(tmp_path, usdc=1_000.0):
+    """A BTC broker on the fake, its clock the fake's, with every flow it reads and every alert it raises kept."""
+    ex, said, got = FakeHyperliquid(PRICES, usdc=usdc, slip_bps=0.0), [], []
+    b = _broker("BTC", ex, tmp_path, sleep=Sleeps(), on_alert=said.append, clock=lambda: ex.now)
+    b.on_flow = got.append
+    b.check_stop_price(PRICES["BTC"], ex.now)            # a first check: the reconciliation starts from here
+    return ex, b, said, got
+
+
+def test_money_moved_on_the_exchange_is_read_once_with_its_sign_never_as_pnl(tmp_path):
+    """Every kind of money in or out of the perp account on Hyperliquid's ledger: the bridge, a sub-account, another
+    account, spot <-> perp, a vault. Each is handed over once, signed, with the account's value right after it."""
+    ex, b, said, got = _money_broker(tmp_path)
+    ex.deposit(100.0)
+    ex.withdraw(30.0)
+    ex.money(50.0, {"type": "subAccountTransfer", "usdc": "50.0", "user": OTHER, "destination": ME})
+    ex.money(-21.0, {"type": "internalTransfer", "usdc": "20.0", "user": ME, "destination": OTHER, "fee": "1.0"})
+    ex.money(40.0, {"type": "accountClassTransfer", "usdc": "40.0", "toPerp": True})
+    ex.money(-10.0, {"type": "accountClassTransfer", "usdc": "10.0", "toPerp": False})
+    ex.money(-5.0, {"type": "vaultDeposit", "vault": OTHER, "usdc": "5.0"})
+    ex.money(7.0, {"type": "vaultWithdraw", "vault": OTHER, "user": ME, "requestedUsd": "7.5", "commission": "0.5",
+                   "closingCost": "0.0", "basis": "7.0", "netWithdrawnUsd": "7.0"})
+    ex.money(0.0, {"type": "spotTransfer", "token": "PURR:0xc1fb", "amount": "3.0", "usdcValue": "1.0", "user": ME,
+                   "destination": OTHER, "fee": "0.0"})              # the spot side: not the perp account's value
+    for _ in range(3):
+        b.check_stop_price(PRICES["BTC"], ex.now)                    # the second and third read nothing new
+    assert [(f["amount"], f["what"]) for f in got] == [
+        (100.0, "deposit"), (-30.0, "withdrawal"), (50.0, "sub-account transfer in"), (-21.0, "transfer out"),
+        (40.0, "spot → perp"), (-10.0, "perp → spot"), (-5.0, "into a vault"), (7.0, "out of a vault")]
+    assert b.flows == got and len({f["id"] for f in got}) == 8 and b.cash == pytest.approx(1_131.0)
+    assert [f["equity_after"] for f in got] == pytest.approx([1_100.0, 1_070.0, 1_120.0, 1_099.0, 1_139.0, 1_129.0,
+                                                              1_124.0, 1_131.0])
+    assert said == [] and b.flow_gap is None                         # all of it explained: nothing alerted
+    ex.money(50.0, {"type": "send", "usdcValue": "50.0", "user": OTHER, "destination": ME, "sourceDex": "spot",
+                    "destinationDex": ""})                           # a kind this desk doesn't know: never guessed at
+    b.check_stop_price(PRICES["BTC"], ex.now)
+    assert len(b.flows) == 8 and "unknown ledger entry type 'send'" in said[0]
+    assert "+50.00 of it isn't explained" in said[1] and b.flow_gap == said[1]   # and the $50 it moved is alerted
+
+
+def test_a_move_in_the_account_nothing_explains_is_alerted_never_guessed(tmp_path):
+    """Money that moved with no entry the desk can read: alerted (and the runner sets entry_kill), never recorded as a
+    flow it might not be. A position's P&L as the price moves is explained, and alerts nothing."""
+    ex, b, said, got = _money_broker(tmp_path)
+    b.submit(Order("open", Side.LONG, 0.01, "breakout", stop=78_000.0))
+    b.execute_now(PRICES["BTC"], ex.now)
+    for px in (82_900.0, 81_500.0, 83_400.0):                       # +-1.7%: $8-19 on the $820 position
+        ex.move("BTC", px)
+        b.check_stop_price(px, ex.now)
+    assert said == [] and b.flow_gap is None
+    ex.money(100.0, {"type": "deposit", "usdc": "100.0"}, on_ledger=False)
+    b.check_stop_price(83_400.0, ex.now)
+    assert got == [] and b.flows == [] and len(said) == 1
+    assert "+100.00 of it isn't explained" in said[0] and "entry_kill is on" in said[0] and b.flow_gap == said[0]
+
+
+def test_a_ledger_that_cant_be_read_is_read_again_and_nothing_is_counted_twice_or_before_the_start(tmp_path):
+    ex = FakeHyperliquid(PRICES, usdc=400.0, slip_bps=0.0)
+    ex.deposit(100.0)                                                 # what funded it before the desk first started
+    said = []
+    b = _broker("BTC", ex, tmp_path, sleep=Sleeps(), on_alert=said.append, clock=lambda: ex.now)
+    b.check_stop_price(PRICES["BTC"], ex.now)
+    assert b.flows == [] and b.cash == 500.0
+    ex.deposit(100.0)
+    ex.fail["ledger"] = 1
+    b.check_stop_price(PRICES["BTC"], ex.now)                         # can't read it: no flow, no guess, no gap
+    assert b.flows == [] and b.flow_gap is None and "could not read deposits and withdrawals" in said[0]
+    b.check_stop_price(PRICES["BTC"], ex.now)
+    assert [f["amount"] for f in b.flows] == [100.0] and b.flow_gap is None and len(said) == 1
+    again = _broker("BTC", ex, tmp_path, sleep=Sleeps(), clock=lambda: ex.now)   # a restart, the same state file
+    ex.withdraw(40.0)
+    again.check_stop_price(PRICES["BTC"], ex.now)
+    assert [f["amount"] for f in again.flows] == [100.0, -40.0]
+
+
+def test_ccxt_reads_the_sub_accounts_whole_ledger_and_the_desk_signs_each_entry():
+    """The real ccxt class, no network. fetch_ledger asks userNonFundingLedgerUpdates for the sub-account being
+    traded, and every kind comes back with the raw entry in info; its own amount is unsigned (and missing for a
+    vault withdrawal), so the desk signs each one from the entry. fetch_deposits and fetch_withdrawals see only the
+    bridge: a sub-account transfer, spot <-> perp or a vault would be missed by them."""
+    ccxt = pytest.importorskip("ccxt")
+    ex = ccxt.hyperliquid(live_mod.exchange_config("hyperliquid", wallet=MASTER, key=NOT_A_KEY, sub_account=SUB))
+    asked, t = [], T0
+    rows = [{"time": t + 1, "hash": "0x01", "delta": {"type": "deposit", "usdc": "100.0"}},
+            {"time": t + 2, "hash": "0x02", "delta": {"type": "withdraw", "usdc": "30.0", "nonce": 1, "fee": "1.0"}},
+            {"time": t + 3, "hash": "0x03", "delta": {"type": "subAccountTransfer", "usdc": "50.0", "user": MASTER,
+                                                      "destination": SUB}},
+            {"time": t + 4, "hash": "0x04", "delta": {"type": "accountClassTransfer", "usdc": "10.0", "toPerp": False}},
+            {"time": t + 5, "hash": "0x05", "delta": {"type": "vaultWithdraw", "vault": OTHER, "user": SUB,
+                                                      "requestedUsd": "8.0", "commission": "1.0", "closingCost": "0.0",
+                                                      "basis": "7.0", "netWithdrawnUsd": "7.0"}}]
+
+    def no_network(*a, **k):
+        raise AssertionError("network access attempted")
+
+    ex.fetch = no_network
+    ex.markets = {}
+    ex.publicPostInfo = lambda params=None, context=None: asked.append(dict(params)) or [dict(r) for r in rows]
+    got = ex.fetch_ledger(None, t)
+    assert asked == [{"type": "userNonFundingLedgerUpdates", "user": SUB, "startTime": t}]
+    assert [live_mod.hl_flow(e["info"], SUB) for e in got] == [
+        (100.0, "deposit"), (-30.0, "withdrawal"), (50.0, "sub-account transfer in"), (-10.0, "perp → spot"),
+        (7.0, "out of a vault")]
+    assert [e["amount"] for e in got] == [100.0, 30.0, 50.0, 10.0, None] and {e["direction"] for e in got} == {None}
+    assert [d["info"]["hash"] for d in ex.fetch_deposits(None, t)] == ["0x01"]
+    assert [w["info"]["hash"] for w in ex.fetch_withdrawals(None, t)] == ["0x02"]
+    b_ex = ccxt.hyperliquid(live_mod.exchange_config("hyperliquid", wallet=MASTER, key=NOT_A_KEY))
+    assert b_ex.handle_public_address("fetchLedger", {})[0] == MASTER
+
+
+class MoneyFake(FakeHyperliquid):
+    """The fake, with money moved at set times while the runner trades (`plan`: [(ms, fn(ex))])."""
+
+    def __init__(self, *a, plan=(), **k):
+        super().__init__(*a, **k)
+        self.plan = sorted(plan, key=lambda x: x[0])
+
+    def move(self, coin, price, fill_at=None, dt_ms=60_000):
+        super().move(coin, price, fill_at, dt_ms)
+        while self.plan and self.now >= self.plan[0][0]:
+            self.plan.pop(0)[1](self)
+
+
+def _flat_live(tmp_path, monkeypatch, usdc, money):
+    """runner.run on a market that never moves (no ATR, so no entries): the account holds `usdc` against a peak of
+    $10,000, and `money(ex)` moves money in or out after the third bar. Returns the boards, the saved desk, the kills
+    and the log."""
+    bars, funding = series(n=520, vol=0.0, drift=0.0, start=80_000.0)
+    p = P.with_(hard={"max_data_age_bars": 1e9})
+    start = 500
+    ex = MoneyFake({"BTC": 80_000.0}, usdc=usdc, plan=[(bars[start + 3].ts, money)])
+    states = []
+
+    class Recorder:
+        def __init__(self, path):
+            pass
+
+        def set(self, state):
+            states.append(state)
+
+    monkeypatch.setattr(runner, "Board", Recorder)
+    broker, ex, logs = _run_live(tmp_path, p, bars, funding, start, [1] * 8, ex=ex,
+                                 desk_meta={"started_ts": bars[start].ts, "start_equity": 10_000.0},
+                                 desk_state={"risk": {"peak_equity": 10_000.0}})
+    paths = runner.live_paths(tmp_path / "live", "BTC")
+    saved = json.loads(paths["desk"].read_text())
+    kills = json.loads(paths["kills"].read_text()) if paths["kills"].exists() else {}
+    dd = next(g["value"] for g in states[-1]["analysis"]["gates"] if g["name"] == "drawdown_halt")
+    return states, saved, kills, logs, dd
+
+
+def test_live_a_deposit_during_a_35pct_drawdown_doesnt_hide_it(tmp_path, monkeypatch):
+    states, saved, kills, logs, dd = _flat_live(tmp_path, monkeypatch, 6_500.0, lambda ex: ex.deposit(5_000.0))
+    assert [(r["amount"], r["kind"], r["note"]) for r in saved["flows"]] == [(5_000.0, "exchange", "deposit")]
+    assert dd == pytest.approx(0.35) and not saved["risk"]["halted"] and not kills.get("entry_kill")
+    assert saved["risk"]["peak_equity"] == pytest.approx(10_000.0 * 11_500 / 6_500)
+    said = [e["text"] for e in saved["events"] if e["agent"] == "bank"]
+    assert said == ["DEPOSIT $5,000.00 recorded (on the exchange: deposit) — money in, not profit. bank $6,500.00 → "
+                    "$11,500.00; performance unchanged"]
+    t = states[-1]["ticker"]
+    assert t["bank"] == 11_500.0 and t["pnl"] == pytest.approx(-3_500.0) and t["pnl_pct"] == pytest.approx(-0.35)
+    assert not any("isn't explained" in x for x in logs)
+
+
+def test_live_a_withdrawal_doesnt_trip_the_drawdown_halt(tmp_path, monkeypatch):
+    states, saved, kills, logs, dd = _flat_live(tmp_path, monkeypatch, 7_000.0, lambda ex: ex.withdraw(3_000.0))
+    assert [r["amount"] for r in saved["flows"]] == [-3_000.0] and states[-1]["ticker"]["bank"] == 4_000.0
+    assert not saved["risk"]["halted"] and dd == pytest.approx(0.30) and not kills.get("entry_kill")
+    assert not any("DRAWDOWN HALT" in e["text"] for e in saved["events"])
+
+
+def test_live_money_with_no_ledger_entry_is_alerted_and_stops_entries(tmp_path, monkeypatch):
+    states, saved, kills, logs, dd = _flat_live(tmp_path, monkeypatch, 6_500.0, lambda ex: ex.money(
+        5_000.0, {"type": "deposit", "usdc": "5000.0"}, on_ledger=False))
+    assert "flows" not in saved and kills.get("entry_kill") is True
+    assert any("isn't explained" in e["text"] and e["text"].startswith("ALERT") for e in saved["events"])

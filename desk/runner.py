@@ -16,6 +16,7 @@ import urllib.request
 from pathlib import Path
 
 from . import board as board_mod
+from . import flows as flows_mod
 from . import indicators as ind
 from .brokers.sim import SimBroker
 from .engine import Desk, Kills
@@ -59,7 +60,8 @@ def _atomic_write(path: Path, data: dict) -> None:
 
 def run_paper(p: Params, *, ledger_dir: str = "ledger", poll_s: float = 60.0, host: str = "127.0.0.1",
               port: int = 8787, dashboard: bool = True, jev=None, log=print):
-    """Paper = the ledger step (same fills as the backtest) on a loop, with the board served live."""
+    """Paper = the ledger step (same fills as the backtest) on a loop, with the board served live. deposits.json is
+    read before every step, as the Action reads it."""
     from . import paper
 
     board = Board(Path(ledger_dir) / "kills.json")
@@ -68,7 +70,8 @@ def run_paper(p: Params, *, ledger_dir: str = "ledger", poll_s: float = 60.0, ho
         log(f"board: http://{host}:{port}")
     while True:
         try:
-            board.set(paper.step(p, ledger_dir, jev=jev, log=log))
+            sched = flows_mod.schedule(flows_mod.load(), p.market.symbol) or None
+            board.set(paper.step(p, ledger_dir, jev=jev, log=log, flows=sched))
         except KeyboardInterrupt:
             raise
         except Exception as exc:  # a network blip just means we catch up on the next poll
@@ -242,13 +245,41 @@ def run(p: Params, mode: str, *, state_dir: str = "state", poll_s: float = 15.0,
         _push(f"{p.market.symbol} LIVE: ALERT", text)
 
     meta = {"started_ts": clock(), "start_equity": broker.cash, "last_bar_ts": 0}
+    recorded: list[dict] = []           # money in and out (desk/flows.py), read from the exchange by the broker
     if desk_path.exists():
         saved = json.loads(desk_path.read_text())
         desk.load_dict(saved)
         meta.update(saved.get("meta", {}))
+        recorded = list(saved.get("flows") or [])
     broker.on_alert = on_alert
     for _, text in broker.alerts:       # raised while the broker started up, before the board existed
         on_alert(text)
+
+    def on_flow(fl: dict) -> None:
+        """A deposit, withdrawal or transfer the broker read from the exchange: money in or out, never profit or loss.
+        The brakes are scaled so they read the same percentage, and the units bought or sold at the NAV keep the
+        performance figure unchanged. Once per flow (by id), and never one from before this desk's start."""
+        if fl["id"] in {r["id"] for r in recorded} or fl["ts"] < meta["started_ts"]:
+            return
+        before = fl["equity_after"] - fl["amount"]
+        when = time.strftime("%Y-%m-%d", time.gmtime(fl["ts"] / 1000))
+        try:
+            rec = flows_mod.record(flows_mod.Flow(fl["id"], when, fl["ts"], fl["amount"], "exchange", fl["what"]),
+                                   fl["ts"], before, before, meta["start_equity"], recorded)
+        except flows_mod.FlowsError as exc:
+            on_alert(f"{exc}: not recorded, so the brakes count it as profit or loss. Check the account")
+            return
+        flows_mod.rescale_brakes(desk.risk, before, fl["amount"])
+        recorded.append(rec)
+        text = flows_mod.describe(rec)
+        desk.say(clock(), "bank", text)
+        _push(f"{p.market.symbol} LIVE: {'DEPOSIT' if fl['amount'] > 0 else 'WITHDRAWAL'}", text)
+        # Saved with the desk at the end of this check, as everything else is. If the process dies first, the broker
+        # still holds the flow (with the value it was read at) and the restart applies it to the desk it saved.
+
+    broker.on_flow = on_flow
+    for fl in list(broker.flows):       # read while the broker started up (or before a crash), not yet applied
+        on_flow(fl)
 
     board = Board(kills_path)
     if dashboard:
@@ -279,6 +310,10 @@ def run(p: Params, mode: str, *, state_dir: str = "state", poll_s: float = 15.0,
             desk.kills = Kills.load(kills_path)
             mid = feed.mid()
             broker.check_stop_price(mid, now)
+            if getattr(broker, "flow_gap", None):     # the account moved by money nothing explains: alerted already
+                desk.kills.entry_kill = True
+                desk.kills.save(kills_path)
+                broker.flow_gap = None
 
             if broker.close_wanted and broker.position is not None:
                 # a close the desk decided that didn't go through: send it again now, not at the next bar close
@@ -324,13 +359,14 @@ def run(p: Params, mode: str, *, state_dir: str = "state", poll_s: float = 15.0,
                     process_closed_bars(desk, broker, f, new, ctx=ctx, now=now, mid=mid, meta=meta, log=log)
 
             state = board_mod.build(desk, f, len(f.bars) - 1, mode=mode, ctx=ctx, jev_client=jev, now_ms=now,
-                                    goal_pace=goal_pace, elapsed_days=(now - meta["started_ts"]) / 86400_000, crawler={
+                                    goal_pace=goal_pace, elapsed_days=(now - meta["started_ts"]) / 86400_000,
+                                    flows=flows_mod.State(meta["start_equity"], recorded), crawler={
                 "source": f"hyperliquid · {p.market.interval}", "funding_prints": len(funding),
                 "requests": feed.requests, "latency_ms": feed.last_latency_ms,
                 "age_s": (now - (f.bars[-1].ts + f.bar_ms)) / 1000})
             state["ticker"]["price"] = mid
             board.set(state)
-            _atomic_write(desk_path, {**desk.to_dict(), "meta": meta})
+            _atomic_write(desk_path, {**desk.to_dict(), "meta": meta, **({"flows": recorded} if recorded else {})})
         except KeyboardInterrupt:
             raise
         except Exception as exc:  # network blips must not kill the loop; the exchange-side stop protects us
