@@ -597,7 +597,9 @@
   let src = params.get("state") || "api/state";
   let staticMode = !!params.get("state");
   let missing = null;   // an account with no board this run: its step failed, and the workflow publishes no stale one
+  let asked = 0;        // a tab clicked while another board is still loading: only the newest request is shown
   async function tick() {
+    const mine = ++asked;
     try {
       const url = staticMode && src !== "api/state" ? src.split("?")[0] + `?t=${Date.now()}` : src;
       let res = await fetch(url, { cache: "no-store" });
@@ -605,6 +607,7 @@
         staticMode = true; src = `boards/${coin}.json`;
         res = await fetch(`${src}?t=${Date.now()}`, { cache: "no-store" });
       }
+      if (mine !== asked) return;
       if (res.status === 404 && staticMode && coin !== "BTC" && src === `boards/${coin}.json`) {
         // show BTC's board (and the tab row) instead of a blank page; the remembered tab stays, for when it's back
         missing = coin; coin = "BTC"; src = "boards/BTC.json";
@@ -614,16 +617,19 @@
         src = "board.json"; res = await fetch(`${src}?t=${Date.now()}`, { cache: "no-store" });
       }
       if (!res.ok) throw new Error(res.status);
-      base = await res.json();
+      const board = await res.json();
+      let idx = index;
       if (staticMode) {
         const ir = await fetch(`boards/index.json?t=${Date.now()}`, { cache: "no-store" }).catch(() => null);
-        index = ir && ir.ok ? await ir.json() : null;
+        idx = ir && ir.ok ? await ir.json() : null;
       }
+      if (mine !== asked) return;
+      base = board; index = idx;
       render();
       emit("desk:board", { updated: base.updated, scanned: base.analysis?.scanned, gates: base.analysis?.gates || [],
         agents: (base.agents || []).map((a) => a.key), static: staticMode });
     } catch (err) {
-      $("foot").textContent = `can't reach the desk (${err.message}). is \`python -m desk paper\` running?`;
+      if (mine === asked) $("foot").textContent = `can't reach the desk (${err.message}). is \`python -m desk paper\` running?`;
     }
   }
 
