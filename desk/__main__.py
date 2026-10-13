@@ -265,6 +265,14 @@ def promotion_status(p: Params) -> list[tuple[str, bool, str]]:
     return checks
 
 
+LIVE_CONFIRM_PHRASE = "I understand this trades real money and can lose all of it"
+
+
+def _live_confirmed() -> bool:
+    """Gate 3: DESK_LIVE_CONFIRM (in .env) is the exact phrase."""
+    return os.environ.get("DESK_LIVE_CONFIRM") == LIVE_CONFIRM_PHRASE
+
+
 def cmd_live(args) -> int:
     from . import runner
 
@@ -280,9 +288,8 @@ def cmd_live(args) -> int:
     if args.max_notional is None:
         print("  live requires --max-notional (start with something you can lose, e.g. 50)")
         return 2
-    phrase = "I understand this trades real money and can lose all of it"
-    if os.environ.get("DESK_LIVE_CONFIRM") != phrase:
-        print(f'  set DESK_LIVE_CONFIRM="{phrase}" in .env to arm live trading.')
+    if not _live_confirmed():
+        print(f'  set DESK_LIVE_CONFIRM="{LIVE_CONFIRM_PHRASE}" in .env to arm live trading.')
         return 2
     from .brokers.live import LiveSetupError
 

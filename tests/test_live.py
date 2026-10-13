@@ -742,3 +742,75 @@ def test_reset_halt_for_live_clears_only_that_coins_desk(tmp_path, monkeypatch, 
     assert cli.cmd_reset_halt(argparse.Namespace(mode="live", coin="ETH")) == 0
     assert json.loads(runner.live_paths("state", "ETH")["desk"].read_text())["risk"]["halted"] is False
     assert json.loads(runner.live_paths("state", "BTC")["desk"].read_text())["risk"]["halted"] is True
+
+
+# ---------------------------------------------------------------- the go-live gate still holds
+
+REPO = Path(__file__).resolve().parents[1]
+
+
+def _gate(tmp_path, monkeypatch, *, report="pass", paper_days=20.0, paper_cash=160.0, confirmed=True, stub_run=True):
+    """A working directory for `python -m desk live --coin BTC`: a backtest report, a paper ledger and the
+    confirmation, each as asked. Connecting to an exchange fails the test."""
+    import time as _time
+
+    from desk import __main__ as cli
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "reports").mkdir()
+    if report is not None:
+        rep = json.loads((REPO / "reports" / "backtest.json").read_text())
+        if report == "fail":
+            rep["full"]["max_drawdown"] = 0.50
+        (tmp_path / "reports" / "backtest.json").write_text(json.dumps(rep))
+    if paper_days is not None:
+        (tmp_path / "ledger" / "BTC").mkdir(parents=True)
+        (tmp_path / "ledger" / "BTC" / "paper.json").write_text(json.dumps({
+            "meta": {"started_ts": _time.time() * 1000 - paper_days * 86400_000, "start_equity": 150.0},
+            "broker": {"cash": paper_cash}}))
+    if confirmed:     # stands in for DESK_LIVE_CONFIRM, which is never set here
+        monkeypatch.setattr(cli, "_live_confirmed", lambda: True)
+    started = []
+    if stub_run:
+        monkeypatch.setattr(runner, "run", lambda *a, **kw: started.append(kw))
+
+    def no_exchange(venue):
+        raise AssertionError("the gate must refuse before any exchange is created")
+
+    monkeypatch.setattr(live_mod, "make_exchange", no_exchange)
+    return cli, started
+
+
+def _live_args(**kw):
+    import argparse
+
+    base = dict(coin="BTC", interval=None, risk=None, jev_mode="off", poll=15.0, host="127.0.0.1", port=8787,
+                no_dashboard=True, max_notional=50.0, force_unproven=False)
+    return argparse.Namespace(**{**base, **kw})
+
+
+@pytest.mark.parametrize("missing", ["backtest report", "backtest passes", "paper ledger", "14 days of paper",
+                                     "paper is up", "--max-notional", "DESK_LIVE_CONFIRM"])
+def test_live_refuses_to_start_without_each_gate_condition(tmp_path, monkeypatch, missing):
+    monkeypatch.delenv("DESK_LIVE_CONFIRM", raising=False)
+    cli, started = _gate(tmp_path, monkeypatch,
+                         report={"backtest report": None, "backtest passes": "fail"}.get(missing, "pass"),
+                         paper_days={"paper ledger": None, "14 days of paper": 13.5}.get(missing, 20.0),
+                         paper_cash=150.0 if missing == "paper is up" else 160.0,
+                         confirmed=missing != "DESK_LIVE_CONFIRM")
+    args = _live_args(max_notional=None) if missing == "--max-notional" else _live_args()
+    assert cli.cmd_live(args) == 2 and started == []
+
+
+def test_live_starts_only_when_every_gate_condition_holds(tmp_path, monkeypatch):
+    cli, started = _gate(tmp_path, monkeypatch)
+    assert cli.cmd_live(_live_args()) == 0 and len(started) == 1 and started[0]["max_notional"] == 50.0
+
+
+def test_live_refuses_on_old_shared_state_even_with_the_gate_passed(tmp_path, monkeypatch, capsys):
+    """The real runner this time: it refuses before creating an exchange, and `live` exits 2."""
+    cli, _ = _gate(tmp_path, monkeypatch, stub_run=False)
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "live_position.json").write_text("{}")
+    assert cli.cmd_live(_live_args()) == 2
+    assert "Not going live: found live state from before it was kept per coin" in capsys.readouterr().out
