@@ -49,8 +49,8 @@ body { padding: 10px; }
 .mode.live { color: var(--red); }
 .mode.replay { color: var(--blue); }
 
-/* coin tabs: one $50 paper account each, plus the total */
-.coins { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; padding: 0; overflow: hidden; background: var(--line); }
+/* account tabs: one per paper account (BTC, ETH, SOL, the VT basket), plus the total. app.js sets --tabs */
+.coins { display: grid; grid-template-columns: repeat(var(--tabs, 4), minmax(0, 1fr)); gap: 1px; padding: 0; overflow: hidden; background: var(--line); }
 .coins[hidden] { display: none; }
 .coin { background: var(--panel); border: 0; color: var(--text); text-align: left; padding: 9px 12px; cursor: pointer; display: grid; gap: 2px; font-family: var(--mono); min-width: 0; }
 .coin:focus-visible { outline: 2px solid var(--pink); outline-offset: -2px; }
@@ -63,6 +63,10 @@ body { padding: 10px; }
 .live-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--green); margin-right: 5px; vertical-align: middle; animation: pulse 1.6s infinite; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
 @media (prefers-reduced-motion: reduce) { .live-dot { animation: none; } }
+
+/* the VT basket's tab (render() sets body.kind-basket) has no agents, candle chart, gates or kill switches */
+body.kind-basket .desk-only, body:not(.kind-basket) .basket-only { display: none; }
+body.kind-basket .analysis-body { grid-template-columns: minmax(0, 1fr); }
 
 /* agent cards */
 .agents { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
@@ -120,6 +124,24 @@ body { padding: 10px; }
 .kill-state { font-family: var(--pixel); font-size: 10px; display: grid; gap: 3px; width: 100%; }
 .kill-state div { display: flex; justify-content: space-between; color: var(--dim); }
 .kill-state .on { color: var(--red); }
+
+/* the VT basket: one row per coin */
+.basket { overflow: hidden; }
+.vt-body { padding: 10px 14px 12px; display: grid; gap: 8px; }
+.vt-body .ol-exp { margin: 0; }
+.vt-rule, .vt-note { margin: 0; font-size: 10.5px; color: var(--muted); line-height: 1.5; }
+.holdings { display: grid; gap: 1px; background: var(--line); border: 1px solid var(--line); }
+.h-row { display: grid; grid-template-columns: 84px repeat(6, minmax(0, 1fr)); gap: 1px; }
+.h-row > div { background: var(--panel-2); padding: 6px 8px; min-width: 0; }
+.h-row > div > span { display: none; font-size: 9.5px; color: var(--dim); }   /* per-cell labels: phones only */
+.h-row b { display: block; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.h-row i { display: block; font-style: normal; font-size: 10px; color: var(--muted); }
+.h-row .h-coin b { font-family: var(--pixel); font-size: 13px; color: var(--orange); }
+.h-row .pend b { color: var(--yellow); }
+.h-head > div { background: var(--panel); font-size: 9.5px; color: var(--dim); padding: 5px 8px; }
+.rule { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 8px; padding: 2px 0 3px 12px; border-bottom: 1px dotted var(--line); }
+.rule .n { color: var(--text); }
+.rule i { grid-column: 1 / -1; font-style: normal; font-size: 10px; color: var(--dim); }
 
 /* balance */
 .balance { padding: 12px 14px; }
@@ -193,13 +215,22 @@ body { padding: 10px; }
   .bal-body, .bottom, .analysis-body { grid-template-columns: minmax(0, 1fr); }
   .bal-side { align-items: flex-start; order: -1; }
   .stats { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .h-row { grid-template-columns: 64px repeat(6, minmax(0, 1fr)); }
+  .h-row b { white-space: normal; }
 }
 @media (max-width: 560px) {
   body { padding: 4px; }
   .frame { padding: 6px; gap: 6px; }
   /* on a phone, what you check first goes first: money, position, chart, then the desk */
   .header { order: 1; } .coins { order: 1; } .balance { order: 2; }
-  .coins { grid-template-columns: repeat(2, minmax(0, 1fr)); } .stage { order: 3; } .agents { order: 4; }
+  .coins { grid-template-columns: repeat(2, minmax(0, 1fr)); } .stage, .basket { order: 3; } .agents { order: 4; }
+  .coin.total:nth-child(odd) { grid-column: 1 / -1; }   /* five tabs: ALL takes the last row */
+  .h-head { display: none; }
+  .h-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .h-row .h-coin { grid-column: 1 / -1; display: flex; align-items: baseline; gap: 10px; }
+  .h-row .h-coin > span { display: none; }
+  .h-row > div > span { display: block; }
+  .rule { padding-left: 0; }
   .bottom { order: 5; } .foot { order: 6; }
   .clock { width: 100%; justify-content: space-between; }
   .ticker { white-space: normal; line-height: 1.7; }

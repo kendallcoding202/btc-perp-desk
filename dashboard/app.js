@@ -53,6 +53,8 @@
   const num = (x, dp = 2) => x == null || isNaN(x) ? "—" : Number(x).toLocaleString("en-US", { minimumFractionDigits: dp, maximumFractionDigits: dp });
   const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const hhmm = (ms) => new Date(ms).toISOString().slice(11, 16);
+  const mmddhhmm = (ms) => new Date(ms).toISOString().slice(5, 16).replace("T", " ");
+  const DAY_MS = 86400000;
 
   // ---- canvas helpers -------------------------------------------------------
   function fit(canvas) {
@@ -326,9 +328,13 @@
   };
 
   function renderAnalysis(s) {
-    const st = s.analysis.stats;
-    $("scanned").textContent = `${s.analysis.scanned.toLocaleString("en-US")} BARS SCANNED`;
-    const cells = [
+    const st = s.analysis.stats, basket = s.header.kind === "basket", t = s.ticker;
+    $("analysis-title").textContent = basket ? "BASKET · ANALYSIS" : "DESK · ANALYSIS";
+    $("scanned").textContent = `${s.analysis.scanned.toLocaleString("en-US")} ${basket ? "DAILY CLOSES" : "BARS SCANNED"}`;
+    const cells = basket ? [
+      ["$" + s.header.coin, "basket", "sym"], ["Cash", usd(t.cash)], ["Held", usd(t.notional)],
+      ["Exposure", `${num(t.exposure)}x`], ["Unrealised", usd(t.unrealised)], ["Fees", usd(t.fees)], ["Funding", usd(t.funding)],
+    ] : [
       ["$" + (s.header.coin || "BTC"), "perp · " + s.header.venue, "sym"], ["Price", px(st.price)], ["24h", pct(st.change_24h)],
       ["ATR", `${num(st.atr_pct)}%`], ["Funding APR", `${num(st.funding_apr, 1)}%`],
       ["Open interest", usdShort(st.open_interest_usd)], ["Spread", st.spread_bps == null ? "—" : `${num(st.spread_bps, 2)} bps`],
@@ -345,8 +351,9 @@
       `<b>${px(r.level)}</b><i>${pct(r.level / st.price - 1, 1)}</i></div>`).join("") + `</div>` : "");
     $("gates").innerHTML = s.analysis.gates.map((g) =>
       `<li><span>${esc(g.name.replace(/_/g, " "))} <i class="na">${esc(GATE_FMT(g))}</i></span><span class="v ${g.verdict}">${g.verdict}</span></li>`).join("");
+    const when = basket ? mmddhhmm : hhmm;   // the basket trades once a day: its events need the date
     $("events").innerHTML = s.events.slice().reverse().map((e) =>
-      `<li><b style="color:var(${COLORS[e.agent] || "--muted"})">${esc(e.agent.toUpperCase())}</b>${hhmm(e.ts)} ${esc(e.text)}</li>`).join("") ||
+      `<li><b style="color:var(${COLORS[e.agent] || "--muted"})">${esc(e.agent.toUpperCase())}</b>${when(e.ts)} ${esc(e.text)}</li>`).join("") ||
       `<li>no events yet — the desk speaks when something happens.</li>`;
   }
 
@@ -362,6 +369,63 @@
         const thr = r.threshold == null ? (r.verdict === "SKIP" && r.value != null ? "info" : "") : `${r.op || "vs"} ${fmt(r.threshold)}`;
         return `<div class="thr-row"><span class="n">${esc(r.name)}</span><span class="t">${esc(thr)}</span><span class="c">${fmt(r.value)}</span>${mark}</div>`;
       }).join("")).join("");
+  }
+
+  // ---- the VT basket's tab ---------------------------------------------------------
+  function renderBasket(s) {
+    const t = s.ticker, b = s.basket, r = b.rules, now = Date.now();
+    const liveTag = live.at ? `<span class="live-dot" aria-hidden="true"></span>LIVE · ` : "";
+    $("vt-ticker").innerHTML = `‹ ${liveTag}BASKET · ${esc(s.header.coins.join(" · "))} · BANK ${usd(t.bank)} · ` +
+      `<span class="hl">${esc(t.position)}${t.position_detail ? " " + esc(t.position_detail) : ""}</span>` +
+      ` · ${esc(t.record)} · HOLD ${pct(t.hold_pct)} · P&amp;L ${usd(t.pnl)} (${pct(t.pnl_pct)}) · FEES ${usd(t.fees)} · FUNDING ${usd(t.funding)}`;
+    const next = Math.floor(now / DAY_MS + 1) * DAY_MS, left = next - now;   // every 00:00 UTC
+    $("vt-next").textContent = `NEXT DECISION 00:00 UTC · IN ${Math.floor(left / 3600000)}H ${Math.floor(left % 3600000 / 60000)}M`;
+    $("vt-exp").textContent = s.header.experiment ? `EXPERIMENT · ${s.header.experiment}` : "";
+    $("vt-rule").textContent = `A ${r.coins.length === 3 ? "third" : "share"} of the book per coin. A coin is held while its daily close ` +
+      `is above its ${r.sma_bars}-day average, sized ${r.target_vol.toFixed(2)} ÷ its ${r.vol_lookback}-day vol (at most ${r.max_units} units; ` +
+      `1 unit = ${r.book_leverage} ÷ ${r.coins.length} of the bank), and resized only when the new size is more than ` +
+      `${Math.round(r.band * 100)}% away. Orders fill at the next day's open; under $${r.min_order_usd} they're skipped (exits always go through).`;
+    const head = ["COIN", `VS ${r.sma_bars}-DAY AVG`, `${r.vol_lookback}-DAY VOL`, "UNITS", "HELD", "UNREALISED", "ORDER"];
+    const cell = (k, v, sub, cls = "") => `<div class="${cls}"><span>${head[k]}</span><b>${v}</b>${sub ? `<i>${sub}</i>` : ""}</div>`;
+    const rows = b.holdings.map((h) => {
+      const gap = h.sma_gap == null ? "—" : `<span class="${h.above_sma ? "ok" : "bad"}">${h.above_sma ? "ABOVE" : "BELOW"} ${pct(h.sma_gap, 1)}</span>`;
+      const band = h.held_units > 0 && h.target_units > 0 && num(h.target_units) !== num(h.held_units) ? ` · within the ${Math.round(r.band * 100)}% band` : "";
+      const o = h.pending;
+      const verb = o && (o.kind === "exit" ? "SELL ALL" : o.kind === "entry" ? "BUY" : o.usd > 0 ? "ADD" : "TRIM");
+      const order = o ? [o.kind === "exit" ? verb : `${verb} ${usd(Math.abs(o.usd))}`, "fills at the next open"]
+        : h.decided_ts == null ? ["PREVIEW", "the first decision is at the next close"]
+        : h.qty > 0 ? ["HOLD", h.entry_ts ? `since ${new Date(h.entry_ts).toISOString().slice(0, 10)}` : ""]
+        : h.target_units > 0 ? ["FLAT", `entry under the $${r.min_order_usd} minimum; checked again at the next close`]
+        : ["FLAT", h.warm ? `waits for a close above the ${r.sma_bars}-day average` : "warming up the averages"];
+      return `<div class="h-row">` +
+        `<div class="h-coin"><span>COIN</span><b>${esc(h.coin)}</b><i>${px(h.mark)}</i></div>` +
+        cell(1, gap, h.sma50 ? `avg ${px(h.sma50)}` : "warming up") +
+        cell(2, h.vol10 == null ? "—" : `${(h.vol10 * 100).toFixed(0)}%`, "annualised") +
+        cell(3, `${num(h.held_units)} held`, `target ${num(h.target_units ?? 0)}${band}`) +
+        cell(4, usd(h.notional), h.qty > 0 ? `${(h.weight * 100).toFixed(1)}% of the bank · ${num(h.qty, 5)} ${esc(h.coin)}` : "") +
+        cell(5, h.qty > 0 ? `<span class="${h.unrealised >= 0 ? "ok" : "bad"}">${usd(h.unrealised)}</span>` : "—", h.qty > 0 ? `avg entry ${px(h.avg_entry)}` : "") +
+        cell(6, order[0], order[1], o ? "pend" : "") + `</div>`;
+    });
+    $("holdings").innerHTML = `<div class="h-row h-head">${head.map((x) => `<div>${x}</div>`).join("")}</div>` + rows.join("");
+    const caught = b.last_close_ts && b.last_close_ts < Math.floor(now / DAY_MS) * DAY_MS
+      ? " The latest 00:00 close is picked up on the next run (every 15 minutes)." : "";
+    $("vt-note").textContent = `Prices live from Hyperliquid; averages, vol and units are from the last close` +
+      (b.last_close_ts ? ` (${new Date(b.last_close_ts).toISOString().slice(0, 10)} 00:00 UTC)` : "") + `. ` +
+      `${b.orders.filled} fills, ${b.orders.blocked} orders skipped by the $${r.min_order_usd} minimum.${caught}`;
+  }
+
+  const RULES = {
+    coins: "one sleeve each, an equal share of the book", interval: "decided at the 00:00 UTC close, filled at the next open",
+    vol_lookback: "days of returns in the realised vol (x √365)", target_vol: "units = this ÷ the coin's realised vol",
+    max_units: "no coin gets more units than this", sma_bars: "held only while the close is above this many days' average",
+    band: "held units change only when the new size is further away than this", book_leverage: "a coin's notional = bank x this ÷ 3 x units",
+    min_order_usd: "Hyperliquid's minimum order: smaller entries and resizes are skipped", starting_equity: "the paper account's start",
+    goal_equity: "the goal the balance panel tracks",
+  };
+  function renderRules(rules) {
+    const fmt = (k, v) => Array.isArray(v) ? v.join(" · ") : /usd|equity/.test(k) ? usd(v, 0) : String(v);
+    $("thr").innerHTML = `<div class="thr-sec">VolTrend — frozen: these exact numbers passed the edge hunt's pre-set bar; not tuned</div>` +
+      Object.entries(rules).map(([k, v]) => `<div class="rule"><span class="n">${esc(k)}</span><b>${esc(fmt(k, v))}</b><i>${esc(RULES[k] || "")}</i></div>`).join("");
   }
 
   function renderKills(k) {
@@ -389,15 +453,15 @@
   }));
 
   // ---- coins, live prices, main loop ----------------------------------------------
-  const COINS = ["BTC", "ETH", "SOL"];
+  const ACCOUNTS = ["BTC", "ETH", "SOL", "VT"];   // VT = the vol-trend basket (BTC + ETH + SOL), paper only
   const HL = "https://api.hyperliquid.xyz/info";
   const storeGet = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
   const storeSet = (k, v) => { try { localStorage.setItem(k, v); } catch { /* private mode */ } };
   let coin = (location.hash.slice(1) || storeGet("desk-coin") || "BTC").toUpperCase();
-  if (!COINS.includes(coin)) coin = "BTC";
+  if (!ACCOUNTS.includes(coin)) coin = "BTC";
 
   let state = null, base = null, index = null;
-  const live = { mids: {}, at: 0, candle: null };   // filled from Hyperliquid by the viewer's own browser
+  const live = { mids: {}, at: 0, candle: null, candleCoin: null };   // filled from Hyperliquid by the viewer's own browser
 
   async function hl(body) {
     const res = await fetch(HL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -405,10 +469,43 @@
     return res.json();
   }
 
+  // A bank re-marked at live mids: its P&L, the goal, and a point on the equity curve.
+  function rebank(s, bank) {
+    const t = s.ticker, g = s.goal;
+    t.bank = bank; t.pnl = bank - g.start; t.pnl_pct = bank / g.start - 1;
+    g.equity = bank;
+    g.progress = Math.max(0, Math.min(1, Math.log(bank / g.start) / Math.log(g.target / g.start)));
+    g.multiple_left = g.target / bank;
+    if (s.equity && s.equity.length) s.equity.push([Date.now(), bank]);
+  }
+
+  // The basket's bank at live mids, perp-style: cash (the realised balance) plus each coin's quantity x (mid - average
+  // entry). A coin with no mid keeps the board's mark.
+  function basketLive(cash, holdings) {
+    let u = 0, cost = 0, held = 0;
+    holdings.forEach((h) => {
+      const mid = parseFloat(live.mids[h.coin]);
+      if (mid) { h.mark = mid; h.notional = h.qty * mid; h.unrealised = h.qty * (mid - h.avg_entry); }
+      u += h.qty * (h.mark - h.avg_entry); cost += h.qty * h.avg_entry; held += h.qty * h.mark;
+    });
+    return { bank: cash + u, u, cost, held };
+  }
+
+  function withLiveBasket(s) {
+    if (!live.at || s.ticker.cash == null) return s;
+    const t = s.ticker, m = basketLive(t.cash, s.basket.holdings);
+    if (!(m.bank > 0)) return s;
+    s.basket.holdings.forEach((h) => { h.weight = h.qty * h.mark / m.bank; });
+    t.unrealised = m.u; t.notional = m.held; t.exposure = m.held / m.bank; t.hold_pct = m.cost ? m.u / m.cost : 0;
+    rebank(s, m.bank);
+    return s;
+  }
+
   // Overlay live prices on the last published snapshot: price, unrealised P&L, balance, forming candle.
   function withLive(snap) {
     if (!snap) return snap;
     const s = JSON.parse(JSON.stringify(snap));
+    if (s.header.kind === "basket") return withLiveBasket(s);
     const mid = parseFloat(live.mids[s.header.coin || "BTC"]);
     if (!mid) return s;
     const t = s.ticker;
@@ -416,15 +513,11 @@
     const p = t.pos;
     const u = p ? (p.side === "long" ? 1 : -1) * p.qty * (mid - p.entry) : 0;
     if (t.cash != null && t.cash + u > 0) {
-      t.bank = t.cash + u; t.hold_pct = p ? u / (p.qty * p.entry) : 0;
-      t.pnl = t.bank - s.goal.start; t.pnl_pct = t.bank / s.goal.start - 1;
-      const g = s.goal; g.equity = t.bank;
-      g.progress = Math.max(0, Math.min(1, Math.log(t.bank / g.start) / Math.log(g.target / g.start)));
-      g.multiple_left = g.target / t.bank;
-      if (s.equity && s.equity.length) s.equity.push([Date.now(), t.bank]);
+      t.hold_pct = p ? u / (p.qty * p.entry) : 0;
+      rebank(s, t.cash + u);
     }
     const c = live.candle, ch = s.chart;
-    if (c && ch.candles.length && c[0] > ch.candles[ch.candles.length - 1][0]) {
+    if (c && live.candleCoin === (s.header.coin || "BTC") && ch.candles.length && c[0] > ch.candles[ch.candles.length - 1][0]) {
       c[4] = mid; c[2] = Math.max(c[2], mid); c[3] = Math.min(c[3], mid);
       ch.candles.push(c);
       const line = (s.analysis.outlook && s.analysis.outlook[0]) ? s.analysis.outlook[0].level : null;
@@ -442,19 +535,27 @@
     let start = 0, bank = 0;
     const cards = index.coins.map((c) => {
       if (c.error) return `<button class="coin" data-coin="${esc(c.coin)}"><span class="c-name">${esc(c.coin)}</span><span class="c-sub">error: ${esc(c.error)}</span></button>`;
-      const lp = parseFloat(live.mids[c.coin]);
-      const b = c.coin === (state && state.header.coin) && state.ticker.bank != null ? state.ticker.bank : c.bank;
+      const basket = c.kind === "basket", lp = parseFloat(live.mids[c.coin]);
+      const open = c.coin === (state && state.header.coin) && state.ticker.bank != null;
+      let b = open ? state.ticker.bank : c.bank;
+      if (basket && !open && live.at && c.holdings) {   // the basket's tab isn't open: re-mark it from the same mids
+        const m = basketLive(c.cash, JSON.parse(JSON.stringify(c.holdings)));
+        if (m.bank > 0) b = m.bank;
+      }
       start += c.start; bank += b;
+      const label = basket ? (c.holdings || []).map((h) => h.coin).join("·") : lp ? px(lp) : px(c.price);
+      const sub = basket ? " · vol-trend basket" : ` · risk ${(c.risk_per_trade * 100).toFixed(0)}%${c.shorts ? " · +shorts" : ""}`;
       return `<button class="coin ${c.coin === coin ? "on" : ""}" data-coin="${esc(c.coin)}" aria-pressed="${c.coin === coin}">` +
-        `<span class="c-name">${esc(c.coin)}<i>${lp ? px(lp) : px(c.price)}</i></span><span class="c-bank">${usd(b)}</span>` +
-        `<span class="c-sub">${pct(b / c.start - 1)} · ${esc(c.position)} · ${esc(c.record)} · risk ${(c.risk_per_trade * 100).toFixed(0)}%${c.shorts ? " · +shorts" : ""}</span></button>`;
+        `<span class="c-name">${esc(c.coin)}<i>${esc(label)}</i></span><span class="c-bank">${usd(b)}</span>` +
+        `<span class="c-sub">${pct(b / c.start - 1)} · ${esc(c.position)} · ${esc(c.record)}${sub}</span></button>`;
     });
     cards.push(`<div class="coin total"><span class="c-name">ALL</span><span class="c-bank">${usd(bank)}</span>` +
       `<span class="c-sub">${pct(start ? bank / start - 1 : 0)} on ${usd(start, 0)} paper</span></div>`);
+    nav.style.setProperty("--tabs", cards.length);
     nav.innerHTML = cards.join("");
     nav.querySelectorAll("[data-coin]").forEach((b) => b.addEventListener("click", () => {
       coin = b.dataset.coin; storeSet("desk-coin", coin); history.replaceState(null, "", "#" + coin);
-      live.candle = null; src = `boards/${coin}.json`; tick(); pollCandle();
+      live.candle = null; src = `boards/${coin}.json`; tick().then(pollCandle);   // the candle for the new tab's board
     }));
   }
 
@@ -467,11 +568,14 @@
     $("mode").textContent = hdr.mode; $("mode").className = `mode ${hdr.mode.toLowerCase()}`;
     $("daydate").textContent = `DAY ${hdr.day} · ${hdr.date}`;
     $("time").textContent = hdr.time;
+    const basket = hdr.kind === "basket";
+    document.body.classList.toggle("kind-basket", basket);
     renderCoins();
-    renderAgents(s.agents); renderStage(s); renderBubbles(s.agents);
-    drawChart(s.chart); drawWeb();
+    if (basket) renderBasket(s);
+    else { renderAgents(s.agents); renderStage(s); renderBubbles(s.agents); drawChart(s.chart); drawWeb(); }
     renderBalance(s); drawEquity(s.equity); drawPnlBars(s.pnl_bars);
-    renderAnalysis(s); renderThresholds(s.thresholds); renderKills(s.kills);
+    renderAnalysis(s); if (basket) renderRules(s.basket.rules); else renderThresholds(s.thresholds);
+    renderKills(s.kills);
     const age = Math.round((Date.now() - s.updated) / 60000);
     $("foot").textContent = `desk updated ${new Date(s.updated).toISOString().replace("T", " ").slice(0, 16)} UTC (${age} min ago)` +
       (live.at ? ` · live price ${Math.round((Date.now() - live.at) / 1000)}s ago from Hyperliquid` : "") +
@@ -515,10 +619,11 @@
   async function pollCandle() {
     const c = (base && base.header.coin) || coin, iv = (base && base.header.interval) || "2h";
     const ms = (base && base.chart.bar_ms) || 7200000, now = Date.now();
+    if ((base && base.header.kind === "basket") || c === "VT") { live.candle = null; return; }   // no one candle to draw
     try {
       const rows = await hl({ type: "candleSnapshot", req: { coin: c, interval: iv, startTime: now - 2 * ms, endTime: now } });
       const f = rows.find((r) => r.T >= now);
-      live.candle = f ? [f.t, +f.o, +f.h, +f.l, +f.c] : null;
+      live.candle = f ? [f.t, +f.o, +f.h, +f.l, +f.c] : null; live.candleCoin = c;
       render();
     } catch { /* the chart just shows closed candles */ }
   }

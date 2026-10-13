@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import math
 import random
@@ -573,6 +574,50 @@ def test_vt_board_carries_the_experiment_label(tmp_path):
     held = sum(h["qty"] * (h["mark"] - h["avg_entry"]) for h in b["basket"]["holdings"])
     assert b["ticker"]["bank"] == pytest.approx(b["ticker"]["cash"] + held)   # re-markable from live mids
     assert b["goal"]["start"] == VOLTREND.starting_equity == 500 and b["paper"]["runs"] == 2
+
+
+# What dashboard/app.js reads on the VT tab (renderBasket, withLiveBasket, renderCoins, renderRules).
+VT_HOLDING_KEYS = {"coin", "decided_ts", "close", "sma50", "sma_gap", "above_sma", "vol10", "warm", "target_units",
+                   "held_units", "qty", "avg_entry", "entry_ts", "mark", "notional", "weight", "unrealised", "pending"}
+VT_TICKER_KEYS = {"bank", "cash", "pnl", "pnl_pct", "position", "position_detail", "record", "hold_pct", "fees",
+                  "funding", "notional", "exposure", "unrealised"}
+
+
+def test_vt_board_has_what_the_dashboard_draws(tmp_path):
+    series, funding = _vt_market()
+    t0 = series["BTC"][0].ts
+    clock = {"now": t0 + 120 * DAY + DAY // 2}
+    feeds = {c: FakeDailyFeed(series[c], funding[c], clock) for c in series}
+    day1 = paper.step_basket(VOLTREND, tmp_path, feeds=feeds, log=lambda *a: None, now_ms=clock["now"])
+    rows = day1["basket"]["holdings"]
+    assert all(VT_HOLDING_KEYS <= set(h) for h in rows) and VT_TICKER_KEYS <= set(day1["ticker"])
+    # day one previews what the rule sees at the last close: nothing decided, nothing held, but the averages are there
+    assert all(h["decided_ts"] is None and h["qty"] == 0 and h["sma50"] and h["vol10"] for h in rows)
+    assert day1["basket"]["last_close_ts"] == t0 + 120 * DAY and day1["header"]["coins"] == list(VOLTREND.coins)
+    assert set(day1["basket"]["rules"]) == {f.name for f in dataclasses.fields(VOLTREND)}
+
+    held = None
+    for k in range(121, 200):
+        clock["now"] = t0 + k * DAY + DAY // 2
+        s = paper.step_basket(VOLTREND, tmp_path, feeds=feeds, log=lambda *a: None, now_ms=clock["now"])
+        held = [h for h in s["basket"]["holdings"] if h["qty"] > 0]
+        if len(held) >= 2:
+            break
+    assert held and all(VT_HOLDING_KEYS <= set(h) for h in s["basket"]["holdings"])
+    fills = json.loads((tmp_path / "paper.json").read_text())["broker"]["fills"]
+    for h in held:
+        assert h["decided_ts"] % DAY == 0 and h["held_units"] > 0 and h["above_sma"] == (h["sma_gap"] > 0)
+        last_entry = max(f["ts"] for f in fills if f["coin"] == h["coin"] and f["kind"] == "entry")
+        assert h["entry_ts"] == last_entry and h["weight"] == pytest.approx(h["notional"] / s["ticker"]["bank"])
+
+    # the ALL tab re-marks the basket from live mids with the index row alone: cash + qty x (mid - average entry)
+    book = voltrend.Book(VOLTREND)
+    book.load_dict(json.loads((tmp_path / "paper.json").read_text())["broker"])
+    mids = {h["coin"]: h["mark"] * (1.07 if k % 2 else 0.95) for k, h in enumerate(s["basket"]["holdings"])}
+    row = {"cash": s["ticker"]["cash"], "holdings": [{k: h[k] for k in ("coin", "qty", "avg_entry", "mark")}
+                                                     for h in s["basket"]["holdings"]]}
+    remarked = row["cash"] + sum(h["qty"] * (mids[h["coin"]] - h["avg_entry"]) for h in row["holdings"])
+    assert remarked == pytest.approx(book.equity(mids)) and remarked != pytest.approx(s["ticker"]["bank"])
 
 
 def test_step_runs_vt_and_one_failure_never_stops_the_others(tmp_path, monkeypatch):

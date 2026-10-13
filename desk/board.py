@@ -333,7 +333,8 @@ def basket(book, *, now_ms: int, marks: dict[str, float], meta: dict, crawler: d
             "sma_gap": close / sma - 1 if close and sma else None, "above_sma": bool(close and sma and close > sma),
             "vol10": sig.get("vol"), "warm": sig.get("warm", False),
             "target_units": sig.get("target"), "held_units": s.units,
-            "qty": s.qty, "avg_entry": s.avg_entry, "mark": mark, "notional": s.qty * mark,
+            "qty": s.qty, "avg_entry": s.avg_entry, "entry_ts": s.entry_ts or None,      # this position's first fill
+            "mark": mark, "notional": s.qty * mark,
             "weight": s.qty * mark / equity if equity > 0 else 0.0, "unrealised": s.qty * (mark - s.avg_entry),
             "pending": book.pending.get(c),
         })

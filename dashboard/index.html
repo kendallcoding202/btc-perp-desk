@@ -26,9 +26,9 @@
 
   <nav class="panel coins" id="coins" hidden aria-label="paper accounts"></nav>
 
-  <section class="agents" id="agents"></section>
+  <section class="agents desk-only" id="agents"></section>
 
-  <section class="panel stage" id="stage">
+  <section class="panel stage desk-only" id="stage">
     <div class="ticker" id="ticker">‹ TRADES</div>
     <div class="stage-body">
       <aside class="stage-left">
@@ -50,6 +50,18 @@
         <div class="floor-label">HEAD OF THE FLOOR</div>
         <div class="kill-state" id="kill-state"></div>
       </aside>
+    </div>
+  </section>
+
+  <!-- the VT basket's tab: its three coins instead of the price chart and the agents -->
+  <section class="panel basket basket-only" id="basket">
+    <div class="ticker" id="vt-ticker">‹ BASKET</div>
+    <div class="panel-head"><span>HOLDINGS · AT THE 00:00 UTC CLOSE</span><span class="pink" id="vt-next">NEXT DECISION 00:00 UTC</span></div>
+    <div class="vt-body">
+      <div class="ol-exp" id="vt-exp"></div>
+      <p class="vt-rule" id="vt-rule"></p>
+      <div class="holdings" id="holdings"></div>
+      <p class="vt-note" id="vt-note"></p>
     </div>
   </section>
 
@@ -77,19 +89,20 @@
 
   <section class="bottom">
     <div class="panel analysis">
-      <div class="panel-head"><span>DESK · ANALYSIS</span><span class="pink" id="scanned">0 SCANNED</span></div>
+      <div class="panel-head"><span id="analysis-title">DESK · ANALYSIS</span><span class="pink" id="scanned">0 SCANNED</span></div>
       <div class="stats" id="stats"></div>
-      <div class="outlook" id="outlook"></div>
+      <div class="outlook desk-only" id="outlook"></div>
       <div class="analysis-body">
-        <ol class="gates" id="gates"></ol>
+        <ol class="gates desk-only" id="gates"></ol>
         <ul class="events" id="events"></ul>
       </div>
     </div>
     <div class="panel thresholds">
       <div class="panel-head"><span class="mono-title">thresholds.py</span><span class="pink">EVERY NUMBER THE DESK BELIEVES</span></div>
       <div id="thr"></div>
-      <div class="filter-line">filter.py · <b>THE ORDER IS THE WHOLE POINT</b></div>
-      <div class="kills">
+      <div class="filter-line desk-only">filter.py · <b>THE ORDER IS THE WHOLE POINT</b></div>
+      <div class="filter-line basket-only">voltrend.py · <b>ONE CODE PATH: PAPER = BACKTEST</b> · paper only, no kill switches</div>
+      <div class="kills desk-only">
         <button data-kill="flat_kill" title="close the position now and stop entering">flat_kill</button>
         <button data-kill="entry_kill" title="keep the position and stop, no new entries">entry_kill</button>
         <button data-kill="jev_kill" title="stop consulting Jev">jev_kill</button>
