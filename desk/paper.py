@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from . import board as board_mod
@@ -45,6 +46,11 @@ from .thresholds import VOLTREND, Params, VolTrend, venue_for
 LOOKBACK_BARS = 1500
 LOOKBACK_SPARE = 60       # Coinbase: the window asked for is this many bars longer (its closures have no candles)
 FUNDING_WINDOW_MS = 4 * 86400_000
+# Coinbase (a venue account) only:
+SESSION_FRESH_MS = 15 * 60_000   # Coinbase's "session open" flag speaks for a close's fill only this soon after it
+HOLE_RECENT_BARS = 90            # a missing candle this close to now moves the breakout, ATR and trail: waited for
+HOLE_WAIT_MS = 6 * 3600_000      # ...until two answers lacked it and it closed this long ago: then never published
+HOLE_KEEP_MS = 200 * 86400_000   # an accepted gap is remembered while it's in the history paper reads (130 days)
 VT_LOOKBACK_DAYS = 120    # daily candles per VT coin per run: the 50-day average and vol need 50, the rest is margin
 VT_MEMORY_BARS = 70       # closed daily bars per VT coin the ledger keeps: the 50-day window, plus 20 days to spare
 VT_GAP_WAIT_DAYS = 3      # a bar no answer has had is waited for this long after its close (and for a second answer)
@@ -125,12 +131,18 @@ def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=
         desk = Desk(p, broker, jev=jev)
     else:
         # This run's word on the contract first (margin, session, maintenance, the funding rate), the saved one if
-        # this answer has none: the rules for every bar this run processes.
+        # this answer has none: the rules for every bar this run processes. The funding log keeps what a catch-up
+        # after a long outage still needs: back to the funding window before the last bar processed.
         details = feed.product() if hasattr(feed, "product") else None
-        vstate = venue_mod.remember((saved or {}).get("venue"), details, now, spec)
+        last0 = ((saved or {}).get("meta") or {}).get("last_bar_ts") or 0
+        vstate = venue_mod.remember((saved or {}).get("venue"), details, now, spec,
+                                    keep_from_ms=min(last0, now) - FUNDING_WINDOW_MS if last0 else None)
         if hasattr(feed, "log"):
             feed.log = venue_mod.FundingLog(vstate["funding_log"], spec.funding_log_days)
         broker, desk = make_desk(p, jev=jev, windows=vstate["windows"], margin=vstate["margin"])
+        holes0 = vstate.get("holes") or {}
+        if isinstance(feed, _coinbase_feed()):  # what explains a missing candle, from the ledger
+            feed.sessions, feed.gaps = desk.venue.sessions, list(holes0.get("accepted") or [])
     meta = {"started_ts": now, "start_equity": p.sizing.starting_equity, "last_bar_ts": 0, "runs": 0,
             "interval": p.market.interval}
     if spec is not None:
@@ -165,13 +177,19 @@ def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=
     bars = raw[:-1] if forming else raw
     if spec is not None and forming is None:
         bars = bars[-LOOKBACK_BARS:]
+    before = list(desk.events)
+    cut, holes_changed = None, False
+    if spec is not None:    # a candle Coinbase should have and this answer hasn't: the bars from it on wait for it
+        cut, holes_changed = _wait_for_holes(desk, vstate, bars, feed.bar_ms, now, meta["last_bar_ts"], log)
     # Funding only matters for bars we're about to process and the 3-day average at the newest bar.
     # Fetching just that window keeps each step to ~4 light requests (Hyperliquid rate-limits by weight).
     since = min(meta["last_bar_ts"] or now, now) - FUNDING_WINDOW_MS
     funding = feed.funding(max(bars[0].ts, since))
     f = ind.compute(bars, funding, p)
     ctx = feed.context()
-    before = list(desk.events)
+    warned = False
+    if spec is not None:
+        ctx, warned = _venue_context(desk, vstate, ctx, now, spec)
 
     def qty(q: float) -> str:     # Coinbase: "3 contracts (0.03 BTC)"
         return desk.venue.describe(q, p.market.symbol) if desk.venue is not None else f"{q:.5f} {p.market.symbol}"
@@ -204,6 +222,8 @@ def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=
         for i, bar in enumerate(bars):
             if bar.ts <= meta["last_bar_ts"]:
                 continue
+            if cut is not None and bar.ts >= cut:
+                break
             take_flows(bar.ts, bar.open)
             n0, had = len(broker.trades), broker.position is not None
             broker.fill_pending(bar.open, bar.ts)
@@ -211,7 +231,12 @@ def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=
             note_fills(n0, had, bar.ts)
             broker.apply_funding(f.funding_bar[i], bar.close)
             is_latest = i == len(bars) - 1
-            orders = desk.on_bar_close(f, i, ctx=ctx if is_latest else None, now_ms=bar.ts + f.bar_ms)
+            bar_ctx = ctx if is_latest else None
+            if bar_ctx is not None and spec is not None and now - (bar.ts + f.bar_ms) > SESSION_FRESH_MS:
+                # decided late (missed runs): Coinbase's "open now" says nothing about this close's fill, which the
+                # schedule decides, as in the backtest
+                bar_ctx = replace(bar_ctx, session_open=None, session_note=None)
+            orders = desk.on_bar_close(f, i, ctx=bar_ctx, now_ms=bar.ts + f.bar_ms)
             meta["last_bar_ts"] = bar.ts
             processed += 1
             eq = broker.equity(bar.close)
@@ -221,7 +246,7 @@ def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=
                 + (", ".join(f"{o.action} {o.side.value} {o.qty:.5f}" for o in orders) if orders
                    else f"no trade ({blocked.name if blocked else 'holding'})"))
 
-    if forming is not None and forming.ts > meta["last_bar_ts"]:
+    if forming is not None and forming.ts > meta["last_bar_ts"] and cut is None:
         # The bar that's still forming: orders decided at the last close fill at its open (the backtest's price),
         # and the stop is checked against its range so far. Same fills as the backtest, minus the wait for the bar to close.
         n0, had = len(broker.trades), broker.position is not None
@@ -264,9 +289,106 @@ def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=
     state["paper"] = {"days": (now - meta["started_ts"]) / 86400_000, "start_equity": meta["start_equity"],
                       "runs": meta["runs"], "bars_processed_this_run": processed,
                       "new_events": [{"ts": e.ts, "agent": e.agent, "text": e.text} for e in new_events],
-                      "changed": bool(processed or new_events or logged)}
+                      "changed": bool(processed or new_events or logged or holes_changed or warned)}
     _write(ledger_dir / "board.json", state)
     return state
+
+
+def _coinbase_feed():
+    from .feeds.coinbase import CoinbaseFeed
+
+    return CoinbaseFeed
+
+
+def _when(ms: int) -> str:
+    return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ms / 1000))
+
+
+def _wait_for_holes(desk, vstate: dict, bars: list, bar_ms: int, now: int, last_bar_ts: int, log) -> tuple:
+    """A candle Coinbase should have (no closure explains it) that this answer hasn't: the bars from it on wait, as a
+    stop or signal on it would otherwise be lost for good (only bars after the last one processed are ever processed),
+    and so does everything while one is missing among the newest HOLE_RECENT_BARS (it moves the breakout, the ATR, the
+    trail). It's a candle Coinbase never published once an earlier saved run's answer lacked it too and it closed
+    HOLE_WAIT_MS ago: then a desk event says so and the account goes on without it (an accepted gap, remembered
+    HOLE_KEEP_MS). Older holes (CoinbaseFeed raises past MAX_HOLES) only move the slow average a little: logged.
+    Day one waits for nothing: it doesn't trade, and its holes are accepted.
+
+    Returns (cut, changed): bars opening at `cut` or later wait (None: none do); changed = the hole memory moved."""
+    rec = vstate.get("holes") or {}
+    seen = {int(k): v for k, v in (rec.get("seen") or {}).items()}
+    accepted = [int(x) for x in rec.get("accepted") or []]
+    newest_closed = now - now % bar_ms - bar_ms
+    holes = venue_mod.missing([b.ts for b in bars], desk.venue.sessions, bars[0].ts if bars else now,
+                              newest_closed, bar_ms, accepted) if bars else []
+    recent = newest_closed - HOLE_RECENT_BARS * bar_ms
+    wait, old = [], []
+    for h in holes:
+        if not last_bar_ts:
+            accepted.append(h)
+            log(f"{desk.p.market.symbol}: Coinbase has no {_when(h)} candle (no closure explains it); the account "
+                "opens without it")
+        elif h > last_bar_ts or h >= recent:
+            if h in seen and seen[h] < now and now >= h + bar_ms + HOLE_WAIT_MS:
+                accepted.append(h)
+                desk.say(now, "crawler", f"Coinbase never published the {_when(h)} candle (missing from every answer "
+                                         f"since {_when(seen[h])}); going on without it")
+            else:
+                seen.setdefault(h, now)
+                wait.append(h)
+        else:
+            old.append(h)
+    if old:
+        log(f"{desk.p.market.symbol}: {len(old)} older candle(s) missing from Coinbase's answer ({_when(old[0])}"
+            + (f" to {_when(old[-1])}" if len(old) > 1 else "") + "); only the slow averages see them")
+    cut = None
+    if wait:
+        cut = wait[0] if wait[0] > last_bar_ts else last_bar_ts + 1
+        log(f"{desk.p.market.symbol}: waiting for Coinbase's {_when(wait[0])} candle"
+            + (f" (and {len(wait) - 1} more)" if len(wait) > 1 else "") + ": missing from this answer, no closure "
+            "explains it. " + ("Bars from it on" if cut == wait[0] else "Every bar") + " waits for the next run")
+    new = {"seen": {str(h): seen[h] for h in sorted(seen) if h in wait},
+           "accepted": sorted({a for a in accepted if a >= now - HOLE_KEEP_MS})[-100:]}
+    changed = new != {"seen": rec.get("seen") or {}, "accepted": rec.get("accepted") or []}
+    if new["seen"] or new["accepted"] or rec:
+        vstate["holes"] = new
+    if wait:
+        vstate["waiting_for"] = wait[0]     # for the board
+    else:
+        vstate.pop("waiting_for", None)
+    return cut, changed
+
+
+def _venue_context(desk, vstate: dict, ctx, now: int, spec) -> tuple:
+    """The newest bar's context with what only paper knows (how old the newest logged funding rate is: the funding
+    gate), and the warnings worth one desk event each while they last (said when they start): no new Coinbase
+    funding rate for 3 hours, then for a day (entries wait), an answer without the session details, Coinbase
+    reporting closed outside its schedule.
+    Returns (ctx, changed)."""
+    log_rows = vstate.get("funding_log") or []
+    age = now - log_rows[-1][0] if log_rows else None
+    if ctx is not None and age is not None:
+        ctx = replace(ctx, funding_age_ms=age)
+    ses = vstate.get("session") or {}
+    warn = {}
+    if age is not None and age >= venue_mod.FUNDING_STALE_MS:
+        warn["funding"] = ("crowd", f"no new Coinbase funding rate since {_when(log_rows[-1][0])}; charging the last "
+                                    "logged rate (est.)")
+    if age is not None and age >= venue_mod.FUNDING_UNKNOWN_MS:     # and when the funding gate starts waiting
+        warn["funding_unknown"] = ("crowd", f"still no new Coinbase funding rate (the last is from "
+                                            f"{_when(log_rows[-1][0])}): no entry until Coinbase answers one")
+    if ctx is not None and getattr(ctx, "session_note", None):
+        warn["session"] = ("crawler", ctx.session_note)
+    elif ses.get("open") is False and ses.get("read_ts") == now and desk.venue.sessions.closure(now) is None:
+        warn["closed"] = ("crawler", f"Coinbase reports its session closed ({ses.get('state') or 'no state given'}) "
+                                     "outside its schedule; no entry while it lasts")
+    was = dict(vstate.get("warn") or {})
+    for k, (agent, text) in warn.items():
+        if k not in was:
+            desk.say(now, agent, text)
+    kept = {k: was.get(k, now) for k in warn}
+    if kept or was:
+        vstate["warn"] = kept
+    return ctx, set(kept) != set(was)
 
 
 def step_basket(vt: VolTrend = VOLTREND, ledger_dir: str | Path = "ledger/VT", feeds: dict | None = None, log=print,

@@ -7,12 +7,15 @@ Coinbase's US nano BTC perp. The backtest and the paper step use this one module
               overnight margin rate; contracts are cut until it does, and none left = no entry.
     SESSION   no entry is decided while its fill (the next bar's open) falls in a closure: the weekly break, Friday
               17:00-18:00 New York time, or a maintenance window (known, or listed by Coinbase and recorded by paper),
-              nor while Coinbase reports its session closed (paper's newest bar only, like the spread and depth gates).
-              Coinbase has no candles while it's closed, so a stop isn't checked then and a gap fills at the reopen;
-              the backtest drops the Binance bars that fall wholly inside a closure to match.
+              nor while Coinbase reports its session closed (paper's newest bar only, like the spread and depth gates,
+              and only when that close is decided on time: a late one goes by the schedule, as in the backtest) or its
+              answer has no session details (closed for entries, saying why). Coinbase has no candles while it's
+              closed, so a stop isn't checked then and a gap fills at the reopen; the backtest drops the Binance bars
+              that fall wholly inside a closure to match, and paper waits for a candle missing outside one (missing).
     FEES      per side, max($0.20 x contracts, 5 bps of notional): an ESTIMATE until the real fee tier is known.
     FUNDING   Coinbase funds hourly and has no funding history API: paper keeps a log of each run's rate
-              (FundingLog) and charges each hour the nearest rate it knows. The backtest uses Binance's prints.
+              (FundingLog) and charges each hour the nearest rate it knows. The backtest uses Binance's prints. With
+              no new rate for a day the funding gate WAITs (paper's newest bar only).
 
 Nothing here touches an account whose venue has no rules of its own (ETH, SOL, VT on Hyperliquid).
 """
@@ -29,6 +32,10 @@ from .thresholds import ContractVenue
 HOUR_MS = 3600_000
 DAY_MS = 86400_000
 VENUE_GATES = ("session", "contracts", "margin")
+FUNDING_STALE_MS = 3 * HOUR_MS      # no new hourly rate for 3 funding hours: paper says so, once (an estimate gets older)
+FUNDING_UNKNOWN_MS = 24 * HOUR_MS   # a day: the funding gate WAITs rather than judge an entry on that old a rate
+WINDOW_KEEP_MS = 200 * DAY_MS       # a recorded maintenance window explains its missing candles this long (the 1,560-bar
+                                    # window paper reads is 130 days)
 
 
 def _ms(iso: str) -> int:
@@ -151,17 +158,30 @@ class Rules:
 
     # ---- the gates
     def session_gate(self, ts_fill: int, ctx=None) -> GateResult:
-        """No entry while its fill would fall in a closure, or (paper's newest bar) while Coinbase says it's closed."""
+        """No entry while its fill would fall in a closure, or (paper's newest bar, decided on time) while Coinbase says
+        it's closed, or while its answer doesn't say (ctx.session_note: fail closed, saying why)."""
         c = self.sessions.closure(ts_fill)
         if c:
             a, b, why = c
             return GateResult("session", Verdict.DROP, owner="fills",
-                              note=f"Coinbase is closed at the fill ({why}, {_hhmm(a)}-{_hhmm(b)} UTC); no entry "
-                                   f"until it reopens at {_hhmm(b)} UTC")
+                              note=f"Coinbase closed at the fill ({why}, reopens {_hhmm(b)} UTC)")
         if ctx is not None and getattr(ctx, "session_open", None) is False:
             return GateResult("session", Verdict.DROP, owner="fills",
-                              note="Coinbase reports its session closed right now; no entry until it reopens")
-        return GateResult("session", Verdict.PASS, owner="fills", note="Coinbase is open at the fill")
+                              note=getattr(ctx, "session_note", None) or "Coinbase reports its session closed")
+        return GateResult("session", Verdict.PASS, owner="fills", note="Coinbase open at the fill")
+
+    def funding_gate(self, ctx=None) -> GateResult | None:
+        """Paper's newest bar only (ctx.funding_age_ms: how old the newest logged funding rate is): no entry judged on a
+        funding rate a day old or older (Coinbase stopped answering it). None when there's nothing to judge (the
+        backtest, a catch-up bar)."""
+        age = getattr(ctx, "funding_age_ms", None) if ctx is not None else None
+        if age is None:
+            return None
+        if age >= FUNDING_UNKNOWN_MS:
+            return GateResult("funding_known", Verdict.WAIT, round(age / HOUR_MS, 1), FUNDING_UNKNOWN_MS / HOUR_MS,
+                              "max", "crowd", f"funding unknown: no new Coinbase rate for {age / HOUR_MS:.0f}h")
+        return GateResult("funding_known", Verdict.PASS, round(age / HOUR_MS, 1), FUNDING_UNKNOWN_MS / HOUR_MS, "max",
+                          "crowd", "hours since Coinbase's last funding rate")
 
     def size(self, qty: float, price: float, stop: float, equity: float, side_sign: int,
              risk_budget: float) -> tuple[float, list[GateResult]]:
@@ -225,6 +245,20 @@ def tradable(bars, sessions: Sessions, bar_ms: int):
     return [b for b in bars if not sessions.closed_through(b.ts, b.ts + bar_ms)]
 
 
+def missing(bar_ts, sessions: Sessions, first_ms: int, last_ms: int, bar_ms: int, gaps=()) -> list[int]:
+    """The bar opens in [first_ms, last_ms] (on the bar grid) the venue should have a candle for and the answer
+    (`bar_ts`, its candles' opens) hasn't: not wholly inside a closure, and not a gap already accepted (`gaps`: candles
+    Coinbase never published)."""
+    have, skip = set(bar_ts), {int(g) for g in gaps}
+    t = -(-first_ms // bar_ms) * bar_ms
+    out = []
+    while t <= last_ms:
+        if t not in have and t not in skip and not sessions.closed_through(t, t + bar_ms):
+            out.append(t)
+        t += bar_ms
+    return out
+
+
 # ---------------------------------------------------------------- funding, from snapshots
 
 class FundingLog:
@@ -249,9 +283,13 @@ class FundingLog:
         self.rows.sort(key=lambda x: x[0])
         return True
 
-    def trim(self, now_ms: int) -> None:
-        """Keep keep_days of it (never the newest snapshot)."""
-        keep = [r for r in self.rows if r[0] >= now_ms - self.keep_ms]
+    def trim(self, now_ms: int, keep_from_ms: int | None = None) -> None:
+        """Keep keep_days of it, or back to `keep_from_ms` if that's earlier (a run catching up after a longer outage
+        still charges those hours their nearest rate), plus the newest snapshot before that, the nearest for the hours
+        just after it. Never the newest snapshot of all."""
+        bound = now_ms - self.keep_ms if keep_from_ms is None else min(now_ms - self.keep_ms, keep_from_ms)
+        older = [r for r in self.rows if r[0] < bound]
+        keep = older[-1:] + [r for r in self.rows if r[0] >= bound]
         self.rows = keep or self.rows[-1:]
 
     def rate_at(self, ts: int) -> float | None:
@@ -277,10 +315,12 @@ class FundingLog:
 
 # ---------------------------------------------------------------- what paper remembers about the venue
 
-def remember(saved: dict | None, details: dict | None, now_ms: int, venue: ContractVenue) -> dict:
+def remember(saved: dict | None, details: dict | None, now_ms: int, venue: ContractVenue,
+             keep_from_ms: int | None = None) -> dict:
     """The ledger's "venue" record after this run: the margin rates and session Coinbase answered (or the last ones
-    saved, if this answer had none), the maintenance windows it has listed (kept while they're recent or ahead), and the
-    funding log with this run's snapshot. `details` = CoinbaseFeed.product()'s parse, or None (no answer this run)."""
+    saved, if this answer had none), the maintenance windows it has listed (kept WINDOW_KEEP_MS, as their missing
+    candles stay in the history paper reads that long), and the funding log with this run's snapshot, kept back to
+    `keep_from_ms` if a catch-up needs that. `details` = CoinbaseFeed.product()'s parse, or None (no answer this run)."""
     s = dict(saved or {})
     margin = dict(s.get("margin") or {})
     windows = [list(w) for w in s.get("windows") or []]
@@ -296,8 +336,8 @@ def remember(saved: dict | None, details: dict | None, now_ms: int, venue: Contr
         s["session"] = {"open": details.get("session_open"), "state": details.get("session_state"),
                         "read_ts": now_ms}
         s["read_ts"] = now_ms
-    windows = sorted(w for w in windows if w[1] >= now_ms - 30 * DAY_MS)[-20:]
-    log.trim(now_ms)
+    windows = sorted(w for w in windows if w[1] >= now_ms - WINDOW_KEEP_MS)[-40:]
+    log.trim(now_ms, keep_from_ms)
     s.update({"name": venue.name, "product": venue.product, "margin": margin, "windows": windows,
               "funding_log": log.to_list()})
     return s

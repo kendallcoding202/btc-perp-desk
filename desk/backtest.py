@@ -292,7 +292,8 @@ def pace(bars, funding, p: Params, oos_cagr: float | None = None, start: str = "
              + f". Fractional sizing as before (Hyperliquid, 4.5 bps, 5x) from the same start: "
                f"${out['fractional_before']['final_equity']:,.0f}, {_pct(frac[4])}/yr.", ""]
     yt = out["years_to_target"]
-    lines.append(f"At that pace, ${p.sizing.starting_equity:,.0f} plus ${monthly:,.0f} a month for {months // 12} years "
+    lines.append(f"At that pace (the one the board projects the account at: it's this account's situation), "
+                 f"${p.sizing.starting_equity:,.0f} plus ${monthly:,.0f} a month for {months // 12} years "
                  f"reaches ${target:,.0f} in about {yt:.0f} years" if yt else
                  f"At that pace it doesn't reach ${target:,.0f}")
     if cagr is not None:
@@ -300,8 +301,9 @@ def pace(bars, funding, p: Params, oos_cagr: float | None = None, start: str = "
                       f"${p.sizing.starting_equity + months * monthly:,.0f} of it put in).")
     yo = out["years_to_target_at_oos"]
     if oos_cagr is not None:
-        lines += ["", f"At the full run's out-of-sample pace ({_pct(oos_cagr)}/yr, the pace the board projects the "
-                      f"account at), the same plan reaches it in about {yo:.0f} years." if yo else
+        lines += ["", f"At the full run's out-of-sample pace ({_pct(oos_cagr)}/yr, from an account that held "
+                      f"thousands by then, where whole contracts are much finer), the same plan reaches it in about "
+                      f"{yo:.0f} years." if yo else
                   f"At the full run's out-of-sample pace ({_pct(oos_cagr)}/yr) the plan doesn't reach it."]
     lines += ["", "Backtest paces, not forecasts: the settings were picked on 2020-23, and 2026 so far has lost money."]
     return "\n".join(lines), out

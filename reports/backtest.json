@@ -1,5 +1,5 @@
 {
- "generated": "2026-10-13T21:03:34+00:00",
+ "generated": "2026-10-13T22:24:51+00:00",
  "interval": "2h",
  "coin": "BTC",
  "params": {
@@ -1855,6 +1855,7 @@
      "2026-07-25T17:00"
     ]
    ],
+   "listed": "2025-07-18T13:00",
    "funding_interval_hours": 1,
    "funding_log_days": 8.0,
    "history_note": "Binance BTCUSDT perp prices and funding prints, the proxy for Coinbase's (BIP listed 2025-07-18)"

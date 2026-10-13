@@ -179,8 +179,10 @@ def _notify(state: dict) -> None:
 
     t, coin = state["ticker"], state["header"].get("coin", "BTC")
     fl = state.get("flows")     # with deposits, the percentage is the time-weighted one: they aren't in it
+    v = state.get("venue")      # BTC on Coinbase: its fills read like the real product's, so the push says paper
     body = "\n".join(f"{e['agent'].upper()}: {e['text']}" for e in events)
-    body += f"\n\n{coin} account ${t['bank']:,.2f} ({t['pnl_pct']:+.2%}{' time-weighted' if fl else ''}) · {t['position']}"
+    body += (f"\n\n{coin} {'paper ' if v else ''}account ${t['bank']:,.2f} ({t['pnl_pct']:+.2%}"
+             f"{' time-weighted' if fl else ''}) · {t['position']}")
     body += f" · {coin} ${t['price']:,.2f}" if t.get("price") is not None else ""    # the VT basket has no one price
     if fl:
         body += f"\n{fl['net']:+,.2f} net deposited so far (not profit) · P&L {fl['pnl']:+,.2f}"
@@ -189,7 +191,8 @@ def _notify(state: dict) -> None:
                 for w in ("BOUGHT", "SOLD", "SHORTED", "COVERED", "ADDED", "TRIMMED", "HALT", "daily"))
     money = next((w + (" waiting" if " waiting (" in e["text"] else "") for w in ("DEPOSIT", "WITHDRAWAL")
                   for e in events if e["agent"] == "bank" and e["text"].startswith(w)), None)
-    name = "basket" if state["header"].get("kind") == "basket" else "desk"
+    name = "basket" if state["header"].get("kind") == "basket" else \
+        f"paper ({v['name'].capitalize()} rules, simulated)" if v else "desk"
     req = urllib.request.Request(f"https://ntfy.sh/{topic}", data=body.encode(), method="POST", headers={
         "Title": f"{coin} {name}: " + ("TRADE" if trade else money or "update"),
         "Priority": "high" if trade else "default",

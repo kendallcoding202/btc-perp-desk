@@ -235,6 +235,8 @@ class ContractVenue:
         ("2025-10-25T10:00", "2025-10-25T21:00"), ("2026-01-24T15:00", "2026-01-24T18:00"),
         ("2026-04-02T21:00", "2026-04-02T22:00"),   # the weekly break, moved to Thursday for Good Friday
         ("2026-04-18T14:00", "2026-04-18T17:00"), ("2026-07-25T14:00", "2026-07-25T17:00"))
+    listed: str | None = "2025-07-18T13:00"     # BIP's listing (new_at, 2026-10-13): a later new_at isn't trusted to
+                                                 # cut the history short unless Coinbase has no candles before it
     funding_interval_hours: int = 1     # funding_interval 3600s; no funding history API: paper logs each run's rate
     funding_log_days: float = 8.0       # how far back the ledger keeps those snapshots (the 3-day APR needs 3)
     history_note: str = ("Binance BTCUSDT perp prices and funding prints, the proxy for Coinbase's "

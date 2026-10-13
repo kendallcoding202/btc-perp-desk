@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 from . import backtest as bt
 from . import jev as jev_mod
-from .thresholds import Params
+from .thresholds import Params, venue_for
 
 SPLIT_YEAR = 2024
 OPEN_SOFT = {"min_trend_strength": None, "min_efficiency": None, "max_extension": None, "max_crowding": None}
@@ -38,7 +38,8 @@ def sensitivity(bars, funding, p: Params) -> str:
         for k in (2.0, 3.0, 4.0):
             r = bt.run(bars, funding, p.with_(strategy={"breakout_bars": nb, "stop_atr": k, "trail_atr": k}))
             s = bt.summarize(r)["full"]
-            cells.append(f"{s['return']:+.0%} / {s['max_drawdown']:.0%} / {s['profit_factor']:.2f}")
+            cells.append(f"{s['return']:+.0%} / {s['max_drawdown']:.0%} / {s['profit_factor']:.2f}"
+                         + (f" (halted {_halt_date(r)}, {s['trades']} trades)" if s["halted"] else ""))
         lines.append(f"| {nb} | " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
@@ -82,16 +83,19 @@ def _halt_date(r) -> str:
 
 
 def sizing(bars, funding, p: Params) -> str:
+    venue = venue_for(p) is not None     # whole contracts: a small risk budget often doesn't buy one
     lines = ["## Position size — profit scales with risk, and so does the pain", "",
-             f"| risk per trade | total return | CAGR | max drawdown | worst year | hit {p.risk.max_drawdown_halt:.0%} halt? |",
-             "|---|---|---|---|---|---|"]
+             f"| risk per trade | total return | CAGR | max drawdown | worst year | hit {p.risk.max_drawdown_halt:.0%} halt? | "
+             "trades |" + (" entries skipped: no whole contract fits |" if venue else ""),
+             "|---|---|---|---|---|---|---|" + ("---|" if venue else "")]
     for rk in (0.01, 0.02, 0.03, 0.05):
         r = bt.run(bars, funding, p.with_(sizing={"risk_per_trade": rk, "max_leverage": 5.0}))
         s = bt.summarize(r)
         f = s["full"]
         worst = min(v["return"] for v in s["per_year"].values() if v)
         lines.append(f"| {rk:.0%}{' ← default' if rk == p.sizing.risk_per_trade else ''} | {f['return']:+.0%} | "
-                     f"{bt._pct(f['cagr'])} | {f['max_drawdown']:.1%} | {worst:+.1%} | {'yes' if f['halted'] else 'no'} |")
+                     f"{bt._pct(f['cagr'])} | {f['max_drawdown']:.1%} | {worst:+.1%} | {'yes' if f['halted'] else 'no'} | "
+                     f"{f['trades']} |" + (f" {s['venue']['skipped'].get('contracts', 0)} |" if venue else ""))
     return "\n".join(lines)
 
 

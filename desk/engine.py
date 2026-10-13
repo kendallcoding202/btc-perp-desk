@@ -196,7 +196,7 @@ class Desk:
         g = skip_note(decision.gates) if flat else None
         key = g.name if g is not None else ""
         if key and key != self.venue_memo.get("skip", ""):
-            self.say(ts, g.owner, f"{g.owner.upper()}: skipped — {g.note}")
+            self.say(ts, g.owner, f"skipped — {g.note}")     # the board and the phone put "SIZE: " in front
             counts = self.venue_memo.setdefault("skipped", {})
             counts[key] = counts.get(key, 0) + 1
             self.venue_memo["last_skip"] = {"ts": ts, "gate": key, "note": g.note}

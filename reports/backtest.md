@@ -1,6 +1,6 @@
 # Backtest — BTC perp on Coinbase rules (BIP-20DEC30-CDE, whole 0.01 BTC contracts), 2h bars
 
-2020-01-01 → 2026-10-01 (6.7 years). Generated 2026-10-13T21:03:34+00:00.
+2020-01-01 → 2026-10-01 (6.7 years). Generated 2026-10-13T22:24:51+00:00.
 **COINBASE · BTC PERP rules** (BIP-20DEC30-CDE, simulated): whole contracts of 0.01 BTC at each bar's price, at most 4x, the overnight margin check at 21.02%, no entry into the weekly break (Fri 17:00-18:00 New York) or a known maintenance window (8 Binance bars wholly inside one left out). Fees: max($0.20 x contracts, 5 bps of notional) per side, plus 3 bps slippage, an ESTIMATE until the real fee tier is known. History: Binance BTCUSDT perp prices and funding prints, the proxy for Coinbase's (BIP listed 2025-07-18); Coinbase keeps no funding history, so funding is an ESTIMATE too. Stops are filled at the stop (or the open, gapped through), as Coinbase's stop-limit would if its limit is met. Start equity $500, risk 5.0%/trade.
 
 Contracts per trade: 1 to 23 (median 12). Entries skipped by the venue (once per episode): 0 too small for one contract, 0 short of overnight margin, 1 into a closure.
@@ -60,9 +60,9 @@ The same strategy on the same Binance history, Coinbase's rules added one at a t
 
 A fresh $500 account opened 2024-01-01 under these rules, $100 put in on the 1st of every month after it (32 deposits, $3,200, to 2026-10-01), as the paper account will: it ended at $4,442 with 56 trades, its worst drop 27% (time-weighted). Its time-weighted pace (deposits aren't growth) was +22.4%/yr; the venue skipped no entry. Fractional sizing as before (Hyperliquid, 4.5 bps, 5x) from the same start: $4,561, +28.0%/yr.
 
-At that pace, $500 plus $100 a month for 5 years reaches $100,000 in about 16 years (about $11,655 after the 5 years, $6,500 of it put in).
+At that pace (the one the board projects the account at: it's this account's situation), $500 plus $100 a month for 5 years reaches $100,000 in about 16 years (about $11,655 after the 5 years, $6,500 of it put in).
 
-At the full run's out-of-sample pace (+25.8%/yr, the pace the board projects the account at), the same plan reaches it in about 14 years.
+At the full run's out-of-sample pace (+25.8%/yr, from an account that held thousands by then, where whole contracts are much finer), the same plan reaches it in about 14 years.
 
 Backtest paces, not forecasts: the settings were picked on 2020-23, and 2026 so far has lost money.
 
@@ -72,10 +72,10 @@ Full-period total return / max drawdown / profit factor.
 
 | breakout bars \ stop=trail ATR | 2.0 | 3.0 | 4.0 |
 |---|---|---|---|
-| 20 | -14% / 41% / 0.84 | +1020% / 40% / 1.31 | +370% / 41% / 1.32 |
-| 30 | -16% / 41% / 0.78 | +593% / 41% / 1.30 | +461% / 35% / 1.47 |
-| 45 | -15% / 41% / 0.78 | +1407% / 30% / 1.61 | +709% / 25% / 1.80 |
-| 60 | -20% / 41% / 0.68 | +1126% / 28% / 1.69 | +487% / 23% / 1.83 |
+| 20 | -14% / 41% / 0.84 (halted 2020-10-10, 30 trades) | +1020% / 40% / 1.31 (halted 2026-05-01, 193 trades) | +370% / 41% / 1.32 (halted 2026-07-31, 167 trades) |
+| 30 | -16% / 41% / 0.78 (halted 2020-10-10, 27 trades) | +593% / 41% / 1.30 (halted 2026-07-31, 171 trades) | +461% / 35% / 1.47 |
+| 45 | -15% / 41% / 0.78 (halted 2020-10-10, 22 trades) | +1407% / 30% / 1.61 | +709% / 25% / 1.80 |
+| 60 | -20% / 41% / 0.68 (halted 2020-10-13, 19 trades) | +1126% / 28% / 1.69 | +487% / 23% / 1.83 |
 
 ## Ablation — which gates earn their place (chosen on 2020–2023 only)
 
@@ -133,12 +133,12 @@ The trailing stop already sells winners: it ratchets up behind every new high an
 
 ## Position size — profit scales with risk, and so does the pain
 
-| risk per trade | total return | CAGR | max drawdown | worst year | hit 40% halt? |
-|---|---|---|---|---|---|
-| 1% | +38% | +4.9% | 5.6% | +0.0% | no |
-| 2% | +213% | +18.4% | 12.1% | -4.2% | no |
-| 3% | +381% | +26.2% | 17.6% | -6.2% | no |
-| 5% ← default | +1126% | +45.0% | 27.8% | -11.8% | no |
+| risk per trade | total return | CAGR | max drawdown | worst year | hit 40% halt? | trades | entries skipped: no whole contract fits |
+|---|---|---|---|---|---|---|---|
+| 1% | +38% | +4.9% | 5.6% | +0.0% | no | 19 | 235 |
+| 2% | +213% | +18.4% | 12.1% | -4.2% | no | 94 | 59 |
+| 3% | +381% | +26.2% | 17.6% | -6.2% | no | 111 | 16 |
+| 5% ← default | +1126% | +45.0% | 27.8% | -11.8% | no | 118 | 0 |
 
 ## Cost stress
 

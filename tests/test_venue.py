@@ -138,10 +138,15 @@ def test_no_entry_is_decided_into_a_closure_or_while_coinbase_says_it_is_closed(
     r = rules()
     fri = _ms("2026-01-09T22:00")                                         # winter: the break is 22:00-23:00 UTC
     g = r.session_gate(fri)
-    assert g.verdict is Verdict.DROP and "weekly break, 22:00-23:00 UTC" in g.note and "23:00" in g.note
+    assert g.verdict is Verdict.DROP and g.note == "Coinbase closed at the fill (weekly break, reopens 23:00 UTC)"
+    assert len(g.note) < 70                                               # it fits a phone's gate row
     assert r.session_gate(fri + HOUR).verdict is Verdict.PASS
-    assert r.session_gate(fri + HOUR, MarketContext(session_open=False)).verdict is Verdict.DROP
+    g = r.session_gate(fri + HOUR, MarketContext(session_open=False))
+    assert g.verdict is Verdict.DROP and g.note == "Coinbase reports its session closed"
     assert r.session_gate(fri + HOUR, MarketContext(session_open=True)).verdict is Verdict.PASS
+    assert r.session_gate(fri + HOUR, MarketContext(session_open=None)).verdict is Verdict.PASS   # the schedule decides
+    g = r.session_gate(fri + HOUR, MarketContext(session_open=False, session_note="no session details"))
+    assert g.verdict is Verdict.DROP and g.note == "no session details"    # fails closed, saying why
     assert venue_mod.skip_note([g]) is g
 
 
@@ -171,7 +176,9 @@ def test_the_funding_log_charges_each_hour_the_nearest_rate_it_knows_and_stays_b
     for k in range(400):
         log.add(_ms("2026-10-14T00:00") + k * HOUR, 1e-5)
     log.trim(_ms("2026-10-14T00:00") + 399 * HOUR)
-    assert len(log.rows) == 8 * 24 + 1 and log.rows[-1][0] == _ms("2026-10-14T00:00") + 399 * HOUR
+    # 8 days, plus the newest snapshot before them (the nearest rate for the hours just after the bound)
+    assert len(log.rows) == 8 * 24 + 2 and log.rows[-1][0] == _ms("2026-10-14T00:00") + 399 * HOUR
+    assert log.rows[0][0] == _ms("2026-10-14T00:00") + 206 * HOUR
 
 
 def test_remember_keeps_margin_windows_and_the_funding_log_across_runs():
@@ -188,7 +195,10 @@ def test_remember_keeps_margin_windows_and_the_funding_log_across_runs():
     assert c["margin"]["overnight_long"] == 0.25 and len(c["funding_log"]) == 2
     assert venue_mod.Rules(COINBASE, c["windows"], c["margin"]).margin["overnight_long"] == 0.25
     d = venue_mod.remember(c, None, _ms("2026-12-01T00:00"), COINBASE)                  # weeks later
-    assert d["windows"] == [] and d["funding_log"] == [[_ms("2026-10-13T21:00"), -2e-6]]   # the newest is kept
+    assert d["windows"] == a["windows"]        # its missing candles are still in the 130 days paper reads
+    assert d["funding_log"] == [[_ms("2026-10-13T21:00"), -2e-6]]                        # the newest is kept
+    e = venue_mod.remember(c, None, _ms("2027-06-01T00:00"), COINBASE)                  # 200 days on
+    assert e["windows"] == [] and e["funding_log"] == [[_ms("2026-10-13T21:00"), -2e-6]]
 
 
 def test_live_refuses_btc_on_coinbase_with_why():
@@ -271,3 +281,26 @@ def test_the_pace_counts_the_monthly_deposits_as_paper_will_and_leaves_them_out_
     assert out["twr"] != pytest.approx(out["final_equity"] / 500.0 - 1)
     assert out["years_to_target_at_oos"] == pytest.approx(flows.years_to(100_000.0, 500.0, 0.25,
                                                                           [((k + 1) / 12, 100.0) for k in range(60)]))
+
+
+def test_the_research_tables_mark_each_halt_and_count_what_whole_contracts_skip(monkeypatch):
+    """The sensitivity table says when a variant hit the 40% halt (BTC on Coinbase: every 2 ATR stop, October 2020),
+    and the position-size table how many trades each risk took and how many entries no whole contract fit."""
+    from pathlib import Path
+
+    from desk import research
+
+    md = (Path(__file__).resolve().parents[1] / "reports" / "backtest.md").read_text()
+    sens = md[md.index("## Sensitivity"):md.index("## Ablation")]
+    rows = {r.split("|")[1].strip(): r.split("|")[2] for r in sens.splitlines() if r.startswith("| ") and "---" not in r
+            and "breakout" not in r}
+    assert all("(halted 2020-10-" in rows[nb] for nb in ("20", "30", "45", "60"))       # the 2 ATR column
+    size = md[md.index("## Position size"):md.index("## Cost stress")]
+    assert "| trades | entries skipped: no whole contract fits |" in size
+    assert "| 2% | +213% | +18.4% | 12.1% | -4.2% | no | 94 | 59 |" in size
+    monkeypatch.setitem(th.VENUES, "coinbase", TEST_VENUE)
+    bars, funding = series(seed=3, drift=0.0006, n=1200, start=3_000.0)
+    out = research.sizing(bars, funding, _coinbase_p(starting_equity=500.0))
+    assert out.splitlines()[2].endswith("| trades | entries skipped: no whole contract fits |")
+    plain = research.sizing(bars, funding, P)                                   # no venue: no skip column
+    assert plain.splitlines()[2].endswith("| trades |")

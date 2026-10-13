@@ -954,11 +954,17 @@ def test_every_board_projects_the_goal_at_its_out_of_sample_pace(tmp_path, monke
 
     root = Path(__file__).resolve().parents[1]
     monkeypatch.chdir(root)                      # the steps read reports/ from the repo root, as the workflow does
-    for acc in ("BTC", "ETH", "SOL", "VT"):
+    for acc in ("ETH", "SOL", "VT"):
         rep = json.loads((root / "reports" / f"{report_name(acc)}.json").read_text())
         oos = rep["out_of_sample"]
         assert board.report_pace(acc) == {"cagr": oos["cagr"], "from": oos["from"], "to": oos["to"]} != rep["full"]["cagr"]
-    assert board.report_pace("BTC")["cagr"] == pytest.approx(0.2580, abs=1e-4)      # under Coinbase's rules
+    # BTC on Coinbase: the pace of a fresh $500 account fed $100 a month from 2024 under the venue's rules (this
+    # account's own situation), not the full run's out-of-sample pace, which came from an account that held thousands
+    rep = json.loads((root / "reports" / "backtest.json").read_text())
+    assert board.report_pace("BTC") == {"cagr": rep["pace"]["cagr"], "from": "2024-01-01", "to": rep["pace"]["to"],
+                                        "label": "a fresh $500 + $100/mo"}
+    assert board.report_pace("BTC")["cagr"] == pytest.approx(0.2238, abs=1e-4)
+    assert rep["pace"]["cagr"] < rep["out_of_sample"]["cagr"] == pytest.approx(0.2580, abs=1e-4)
     assert board.report_pace("BTC", tmp_path) is None and board.oos_pace({"out_of_sample": {}}) is None
     g = board.goal(150.0, 150.0, 100_000.0, {"cagr": 0.25, "from": "2024-01-19", "to": "2026-10-01"}, 40)
     assert g["test_cagr"] == 0.25 and g["years_at_test_rate"] == pytest.approx(math.log(100_000 / 150) / math.log(1.25))

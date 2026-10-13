@@ -32,6 +32,8 @@ class MarketContext:
     funding_rate_now: float | None = None   # current predicted rate, per funding period
     funding_period_hours: float = 8.0
     session_open: bool | None = None        # a venue with sessions (Coinbase): is it open right now
+    session_note: str | None = None         # why session_open reads False when Coinbase didn't say so
+    funding_age_ms: int | None = None       # a venue with a funding log (Coinbase): its newest rate's age
 
 
 class Side(str, Enum):

@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import indicators as ind
+from . import venue as venue_mod
 from .models import Verdict
 from .thresholds import EXPERIMENTS, report_name
 
@@ -65,9 +66,20 @@ def oos_pace(summary: dict | None) -> dict | None:
 
 
 def report_pace(account: str, reports_dir: str | Path = "reports") -> dict | None:
-    """oos_pace from the account's backtest report (reports/backtest[-COIN].json); None if it has none."""
+    """oos_pace from the account's backtest report (reports/backtest[-COIN].json); None if it has none.
+
+    A report with a fresh-account pace (BTC on Coinbase: a fresh $500 opened 2024-01-01, $100 a month after, under the
+    venue's rules) gives that one instead: it's this account's situation, and at $500 whole contracts are coarse, so
+    the full run's out-of-sample pace (from an account that held thousands by 2024) flatters it."""
     path = Path(reports_dir) / f"{report_name(account)}.json"
-    return oos_pace(json.loads(path.read_text())) if path.exists() else None
+    if not path.exists():
+        return None
+    s = json.loads(path.read_text())
+    fresh = s.get("pace") or {}
+    if fresh.get("cagr") is not None:
+        return {"cagr": fresh["cagr"], "from": fresh.get("start"), "to": fresh.get("to"),
+                "label": f"a fresh ${fresh.get('start_equity', 0):,.0f} + ${fresh.get('monthly', 0):,.0f}/mo"}
+    return oos_pace(s)
 
 
 def goal(equity: float, start: float, target: float, pace: dict | None, elapsed_days: float | None,
@@ -96,6 +108,7 @@ def goal(equity: float, start: float, target: float, pace: dict | None, elapsed_
     return {"start": start, "target": target, "equity": equity, "progress": max(0.0, min(1.0, progress)),
             "multiple_left": target / equity if equity > 0 else None,
             "test_cagr": test, "test_from": (pace or {}).get("from"), "test_to": (pace or {}).get("to"),
+            **({"test_label": pace["label"]} if (pace or {}).get("label") else {}),   # whose pace, when not the run's
             "years_at_test_rate": years(test),
             # the same numbers under the old names, for an app.js from before test_cagr (a tab left open across a
             # deploy): it shows them as "at backtest pace", which they are
@@ -252,6 +265,12 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
         size_val = _usd(notional)
     elif skip is not None:
         quotes["size"], size_val = f"skipped: {skip.note}.", "SKIP"
+    elif dec and dec.qty and rules is not None:     # whole contracts: what they risk, not the budget they fit in
+        d = abs(bar.close - dec.stop)
+        eq_dec = dec.notional / dec.leverage if dec.leverage else equity
+        quotes["size"] = (f"{held(dec.qty)} at a {_usd(d)} stop risks {dec.qty * d / eq_dec:.1%} (budget "
+                          f"{p.sizing.risk_per_trade:.0%}; whole contracts round down), {dec.leverage:.2f}x.")
+        size_val = _usd(dec.notional)
     elif dec and dec.qty:
         quotes["size"] = (f"{p.sizing.risk_per_trade:.1%} risk with a {_usd(abs(bar.close - dec.stop))} stop "
                           f"= {held(dec.qty)}, {dec.leverage:.2f}x.")
@@ -338,7 +357,9 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
         "updated": now_ms,
         "header": {
             "title": title, "coin": coin, "risk_per_trade": p.sizing.risk_per_trade,
-            "tagline": "SCAN PICKS · RISK SIZES · FILLS TRADES" + (" · LONG + SHORT" if p.strategy.allow_shorts else ""),
+            "tagline": ("SCAN PICKS · RISK SIZES · FILLS TRADES" + (" · LONG + SHORT" if p.strategy.allow_shorts else "")
+                        if rules is None else    # its title is the real product's: say it's simulated, up front
+                        f"{mode.upper()} · SIMULATED ON {rules.spec.name.upper()} RULES · NO ORDERS SENT"),
             "shorts": p.strategy.allow_shorts, "experiment": EXPERIMENTS.get(coin),
             "mode": mode.upper(), "venue": p.market.venue, "interval": p.market.interval,
             "day": day_n, "date": now.strftime("%b %d").upper(), "time": now.strftime("%H:%M"),
@@ -410,6 +431,15 @@ def venue_block(desk, f, i: int, price: float, equity: float, now_ms: int, venue
     ses = vs.get("session") or {}
     memo = desk.venue_memo
     skip = _venue_skip(desk.last_decision)
+    # closed now: a scheduled closure (why, until when), or Coinbase saying so outside its schedule (this run's answer)
+    cur = rules.sessions.closure(now_ms)
+    fresh = ses.get("read_ts") == now_ms
+    closed_now = {"why": cur[2], "until": cur[1], "scheduled": True} if cur else \
+        {"why": "Coinbase reports its session closed; not a scheduled closure", "until": None, "scheduled": False} \
+        if fresh and ses.get("open") is False else \
+        {"why": "Coinbase's answer has no session details", "until": None, "scheduled": False} \
+        if fresh and ses.get("open") is None else None
+    stale = log[-1][0] if log and now_ms - log[-1][0] >= venue_mod.FUNDING_STALE_MS else None
     return {
         "name": sp.name, "product": sp.product, "display": sp.display, "contract_size": sp.contract_size,
         "max_leverage": sp.max_leverage,
@@ -424,9 +454,12 @@ def venue_block(desk, f, i: int, price: float, equity: float, now_ms: int, venue
                         f"{p.costs.slippage_bps:g} bps slippage",
         "funding": {"estimate": True, "rate_hourly": log[-1][1] if log else None,
                     "rate_ts": log[-1][0] if log else None, "apr": f.funding_apr[i], "logged": len(log),
-                    "paid": desk.broker.funding_total},
+                    "paid": desk.broker.funding_total, "stale_since": stale},
         "session": {"open": ses.get("open"), "read_ts": ses.get("read_ts"),
                     "next_closure": None if nxt is None else {"start": nxt[0], "end": nxt[1], "why": nxt[2]}},
+        "closed_now": closed_now,
+        "waiting_for": vs.get("waiting_for"),      # a missing Coinbase candle the bars from it on wait for
+        "stop_fill": "stops simulated as filled at the stop (Coinbase: stop-limit, which can miss in a fast market)",
         "skipping": None if skip is None else {"gate": skip.name, "note": skip.note},
         "skipped": dict(memo.get("skipped", {})), "last_skip": memo.get("last_skip"),
     }

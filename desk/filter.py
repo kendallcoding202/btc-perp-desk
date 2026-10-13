@@ -166,8 +166,11 @@ def evaluate_entry(p: Params, f: ind.Features, i: int, *, equity: float, kills: 
     gates.append(_hard("abs_funding_apr", abs(f.funding_apr[i]), h.max_abs_funding_apr, "max", "crowd"))
     gates.append(_hard("spread_bps", ctx.spread_bps if ctx else None, h.max_spread_bps, "max", "fills"))
     gates.append(_hard("depth_usd", ctx.depth_usd if ctx else None, h.min_depth_usd, "min", "fills"))
-    if venue is not None:   # the fill is the next bar's open
+    if venue is not None:   # the fill is the next bar's open; the funding gate only when paper knows how old its rate is
         gates.append(venue.session_gate(bar.ts + f.bar_ms, ctx))
+        known = venue.funding_gate(ctx)
+        if known is not None:
+            gates.append(known)
 
     # 4. SCAN — with-trend setups (strategy.entry_mode), then the optional counter-trend shorts
     setup, scan_gate = None, None
@@ -203,7 +206,8 @@ def evaluate_entry(p: Params, f: ind.Features, i: int, *, equity: float, kills: 
     qty = equity * z.risk_per_trade / risk_per_unit if risk_per_unit > 0 else 0.0
     qty = min(qty, equity * z.max_leverage / close) if equity > 0 else 0.0
     notional = qty * close
-    gates.append(_hard("ticket_usd", notional, z.min_notional_usd, "min", "size"))
+    # with venue rules this is the desk's size before whole contracts (the "contracts" gate below has the rounded one)
+    gates.append(_hard("ticket_usd" if venue is None else "desk_size_usd", notional, z.min_notional_usd, "min", "size"))
     if venue is not None:   # whole contracts, the venue's leverage cap, overnight margin
         qty, more = venue.size(qty, close, stop, equity, d, z.risk_per_trade)
         gates.extend(more)

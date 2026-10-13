@@ -10,11 +10,13 @@ plus product(): the contract's details, read every run (funding rate, margin rat
 
 Coinbase has no funding history: funding() answers from a log of the rates this feed (and earlier runs, through the
 ledger) have read, one snapshot a run (venue.FundingLog). A short, malformed or failed answer raises, so the account's
-step fails on its own and the next run catches up.
+step fails on its own and the next run catches up. A candle missing outside any closure is a hole: a few are listed in
+`holes` for paper to wait for (paper.py), more than MAX_HOLES is a short answer and raises.
 """
 
 from __future__ import annotations
 
+import http.client
 import json
 import time
 import urllib.error
@@ -24,13 +26,13 @@ from datetime import datetime
 
 from ..models import Bar, FundingEvent, MarketContext
 from ..thresholds import COINBASE, INTERVAL_SECONDS, ContractVenue
-from ..venue import FundingLog
+from ..venue import FundingLog, Sessions, missing
 
 BASE = "https://api.coinbase.com/api/v3/brokerage/market"
 GRANULARITY = {"1m": "ONE_MINUTE", "5m": "FIVE_MINUTE", "15m": "FIFTEEN_MINUTE", "30m": "THIRTY_MINUTE",
                "1h": "ONE_HOUR", "2h": "TWO_HOUR", "6h": "SIX_HOUR", "1d": "ONE_DAY"}
 PAGE = 300                      # candles per call, the API's maximum
-SHORT = 0.95                    # fewer than this share of a window's bars is a short answer (closures cost a few)
+MAX_HOLES = 12                  # more candles missing than this, outside every closure known: a short answer, raise
 
 
 class FeedError(RuntimeError):
@@ -41,6 +43,14 @@ def _iso_ms(s: str | None) -> int | None:
     if not s:
         return None
     return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp() * 1000)
+
+
+def _message(exc: urllib.error.HTTPError) -> str:
+    """Coinbase's own error message from an HTTP error's body ({"message": "no pricebook found"}), or its code."""
+    try:
+        return str(json.loads(exc.read()).get("message") or exc.code)
+    except Exception:
+        return f"HTTP {exc.code}"
 
 
 def _num(x) -> float | None:
@@ -65,23 +75,37 @@ class CoinbaseFeed:
         self.log = FundingLog(funding_log, venue.funding_log_days)
         self.details: dict | None = None
         self.clock = clock or time.time         # seconds, like time.time (tests freeze it)
+        # What explains a missing candle (paper sets these from the ledger before candles()): the closures (the weekly
+        # break, the known and the recorded maintenance windows) and the candles Coinbase never published (accepted
+        # gaps).
+        self.sessions = Sessions(venue)
+        self.gaps: list[int] = []
+        self.holes: list[int] = []              # the last candles() answer's unexplained missing candles
 
     # ---- http
     def _get(self, path: str, params: dict | None = None, retries: int = 3):
-        """GET with backoff on 429/5xx and network errors; anything else (or the last try) raises."""
+        """GET with backoff on 429/5xx, network errors, a body cut short and an answer that isn't JSON (a CDN or
+        maintenance page); anything else (or the last try) raises."""
         url = f"{BASE}/{path}" + (f"?{urllib.parse.urlencode(params)}" if params else "")
         for attempt in range(retries + 1):
             t = time.time()
+            body = b""
             try:
                 with urllib.request.urlopen(urllib.request.Request(url, headers={"Accept": "application/json"}),
                                             timeout=self.timeout) as resp:
-                    out = json.loads(resp.read())
+                    body = resp.read()
+                out = json.loads(body)
             except urllib.error.HTTPError as exc:
                 if exc.code not in (429, 500, 502, 503, 504) or attempt == retries:
                     raise
             except (urllib.error.URLError, TimeoutError, OSError):
                 if attempt == retries:
                     raise
+            except (ValueError, http.client.HTTPException) as exc:     # not JSON, or cut short (IncompleteRead)
+                if attempt == retries:
+                    what = f"something that isn't JSON: {body[:80]!r}" if isinstance(exc, ValueError) else \
+                        f"an answer cut short ({type(exc).__name__}: {exc})"
+                    raise FeedError(f"Coinbase answered {path} with {what}") from None
             else:
                 self.requests += 1
                 self.last_latency_ms = (time.time() - t) * 1000
@@ -97,11 +121,15 @@ class CoinbaseFeed:
     # ---- candles
     def candles(self, start_ms: int = 0, end_ms: int | None = None, closed_only: bool = True) -> list[Bar]:
         """The bars that opened in [start_ms, end_ms], oldest first, paged 300 at a time (newest page first). Never
-        earlier than the product's listing. `closed_only` drops the bar that is still forming."""
+        earlier than the product's listing (_listed). `closed_only` drops the bar that is still forming, which may be
+        missing (no trade in it yet).
+
+        A closed candle missing outside every closure (self.sessions) and not an accepted gap (self.gaps) is a hole,
+        listed in self.holes: paper waits for one (paper.py). More than MAX_HOLES is a short answer: FeedError."""
         now = int(self.clock() * 1000)
         bar = self.bar_ms
         end = min(end_ms or now, now)
-        listed = _iso_ms(self.details.get("new_at")) if self.details else None
+        listed = self._listed(start_ms)
         start = max(start_ms, listed or 0)
         out: dict[int, Bar] = {}
         hi = end - end % bar                               # the newest bar's open
@@ -112,10 +140,6 @@ class CoinbaseFeed:
             got = rows.get("candles")
             if not isinstance(got, list):
                 raise FeedError(f"Coinbase's candles answer has no candle list: {str(rows)[:120]}")
-            if not got and (listed is None or lo >= listed):
-                raise FeedError(f"Coinbase returned no {self.interval} candles for "
-                                f"{time.strftime('%Y-%m-%d %H:%M', time.gmtime(lo / 1000))} to "
-                                f"{time.strftime('%Y-%m-%d %H:%M', time.gmtime(hi / 1000))} UTC")
             for r in got:
                 try:
                     b = Bar(int(r["start"]) * 1000, float(r["open"]), float(r["high"]), float(r["low"]),
@@ -128,13 +152,29 @@ class CoinbaseFeed:
                     out[b.ts] = b
             hi = lo - bar
         bars = [out[k] for k in sorted(out)]
-        span = (end - end % bar - (start - start % bar)) // bar + 1
-        if len(bars) < SHORT * span:
-            raise FeedError(f"only {len(bars)} {self.interval} candles from Coinbase for a window of {span}: a short "
-                            "answer; the next run tries again")
+        newest_closed = (now - now % bar) - bar            # the forming bar's open is now - now % bar
+        self.holes = missing(out, self.sessions, start, min(end - end % bar, newest_closed), bar, self.gaps)
+        if len(self.holes) > MAX_HOLES:
+            t0, t1 = (time.strftime('%Y-%m-%d %H:%M', time.gmtime(x / 1000)) for x in (self.holes[0], self.holes[-1]))
+            raise FeedError(f"{len(self.holes)} {self.interval} candles missing from Coinbase's answer outside any "
+                            f"closure ({t0} to {t1} UTC): a short answer; the next run tries again")
         if closed_only:
             bars = [b for b in bars if b.ts + bar <= now]
         return bars
+
+    def _listed(self, start_ms: int) -> int | None:
+        """When the product listed, for the history's start: its new_at, a display field. A new_at later than the
+        listing desk/thresholds.py knows that would cut the window asked for is checked: if Coinbase has candles
+        before it, it moved and isn't the listing (no cut)."""
+        listed = _iso_ms(self.details.get("new_at")) if self.details else None
+        known = _iso_ms(self.venue.listed + "Z") if self.venue.listed else None
+        if listed and known and listed > known and start_ms < listed:
+            lo = max(start_ms, listed - PAGE * self.bar_ms)
+            rows = self._get(f"products/{self.product_id}/candles", {
+                "granularity": GRANULARITY[self.interval], "start": lo // 1000, "end": (listed - self.bar_ms) // 1000})
+            if rows.get("candles"):
+                return None
+        return listed
 
     # ---- the product
     def product(self) -> dict:
@@ -149,26 +189,48 @@ class CoinbaseFeed:
             raise FeedError(f"{self.product_id}'s contract size is {fut.get('contract_size')!r}, not the "
                             f"{self.venue.contract_size:g} BTC the desk sizes for (desk/thresholds.py): "
                             "not trading on it")
-        ses = d.get("fcm_trading_session_details") or {}
+        # Coinbase's order-size rules: orders the desk would size and Coinbase would refuse must not be simulated. A
+        # field the answer has must agree (a missing one says nothing); a higher maximum refuses nothing.
+        inc, lo, hi = (_num(d.get(k)) for k in ("base_increment", "base_min_size", "base_max_size"))
+        v = self.venue
+        has = {k: d.get(k) not in (None, "") for k in ("base_increment", "base_min_size", "base_max_size")}
+        if (has["base_increment"] and inc != 1) or (has["base_min_size"] and lo != v.min_contracts) or \
+                (has["base_max_size"] and (hi is None or hi < v.max_contracts)):
+            raise FeedError(f"{self.product_id}'s order sizes changed: base_increment {d.get('base_increment')!r}, "
+                            f"base_min_size {d.get('base_min_size')!r}, base_max_size {d.get('base_max_size')!r}; the "
+                            f"desk sizes whole contracts from {v.min_contracts} to {v.max_contracts} "
+                            "(desk/thresholds.py): not trading on it")
+        ses = d.get("fcm_trading_session_details")
+        ses_ok = isinstance(ses, dict) and isinstance(ses.get("is_session_open"), bool)
+        ses = ses if isinstance(ses, dict) else {}
         mt = ses.get("maintenance") or {}
         m0, m1 = _iso_ms(mt.get("start_time")), _iso_ms(mt.get("end_time"))
         im, om = fut.get("intraday_margin_rate") or {}, fut.get("overnight_margin_rate") or {}
-        open_now = bool(ses.get("is_session_open")) and not d.get("trading_disabled") and not d.get("cancel_only") \
-            and not d.get("is_disabled")
+        halted = bool(d.get("trading_disabled") or d.get("cancel_only") or d.get("is_disabled"))
+        # No session block (or no is_session_open in it): None, said as such, never read as "Coinbase says closed"
+        open_now = (ses["is_session_open"] and not halted) if ses_ok else (False if halted else None)
+        # The funding rate: future_product_details', or perpetual_details' if that one's empty
+        perp = fut.get("perpetual_details") if isinstance(fut.get("perpetual_details"), dict) else {}
+        rate, ftime = _num(fut.get("funding_rate")), _iso_ms(fut.get("funding_time"))
+        if rate is None or ftime is None:
+            rate, ftime = _num(perp.get("funding_rate")), _iso_ms(perp.get("funding_time"))
         self.details = {
             "product_id": self.product_id, "display_name": d.get("display_name"), "contract_size": size,
             "price": _num(d.get("price")), "mid": _num(d.get("mid_market_price")),
-            "funding_rate": _num(fut.get("funding_rate")), "funding_time": _iso_ms(fut.get("funding_time")),
+            "funding_rate": rate, "funding_time": ftime,
             "funding_interval": fut.get("funding_interval"),
             "open_interest": _num(fut.get("open_interest")),
             "margin": {"intraday_long": _num(im.get("long_margin_rate")),
                        "intraday_short": _num(im.get("short_margin_rate")),
                        "overnight_long": _num(om.get("long_margin_rate")),
                        "overnight_short": _num(om.get("short_margin_rate"))},
-            "session_open": open_now, "session_state": ses.get("session_state"),
+            "session_open": open_now, "session_state": ses.get("session_state") if ses_ok else None,
+            "session_note": None if ses_ok else (
+                "Coinbase's answer has no session details (fcm_trading_session_details.is_session_open); no entry "
+                "until it does"),
             "session_close": _iso_ms(ses.get("close_time")),
             "maintenance": [m0, m1] if m0 and m1 and m1 > m0 else None,
-            "base_min_size": _num(d.get("base_min_size")), "base_max_size": _num(d.get("base_max_size")),
+            "base_increment": inc, "base_min_size": lo, "base_max_size": hi,
             "price_increment": _num(d.get("price_increment")), "new_at": d.get("new_at"),
         }
         self.log.add(self.details["funding_time"], self.details["funding_rate"])
@@ -188,14 +250,40 @@ class CoinbaseFeed:
     # ---- the book
     def context(self) -> MarketContext:
         """Spread, depth (contracts x 0.01 x price, within 10 bps each side), mid, open interest, the hourly funding
-        rate and whether the session is open: the live-only facts for the HARD gates."""
+        rate and whether the session is open: the live-only facts for the HARD gates.
+
+        While the session reads closed Coinbase may have no book (404 "no pricebook found") or an empty one: that's
+        expected then, and the context has the last trade's price, no spread and no depth (the session gate drops any
+        entry). While it reads open, either raises."""
         if self.details is None:
             self.product()
-        book = self._get("product_book", {"product_id": self.product_id, "limit": 100}).get("pricebook") or {}
+        closed = self.details.get("session_open") is not True
+        try:
+            book = self._get("product_book", {"product_id": self.product_id, "limit": 100}).get("pricebook") or {}
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                raise
+            if not closed:
+                raise FeedError(f"Coinbase has no book for {self.product_id} ({_message(exc)}) while its session reads "
+                                "open") from None
+            book = {}
         bids, asks = book.get("bids") or [], book.get("asks") or []
+        tick = self._get(f"products/{self.product_id}/ticker", {"limit": 1})
+        if (not bids or not asks) and closed:
+            trades = tick.get("trades") if isinstance(tick.get("trades"), list) else []
+            last = _num(trades[0].get("price")) if trades and isinstance(trades[0], dict) else None
+            mid = last or self.details.get("price") or self.details.get("mid")
+            if not mid:
+                raise FeedError(f"Coinbase's session for {self.product_id} reads closed and its answers have no price")
+            oi = self.details.get("open_interest")
+            return MarketContext(
+                mid=mid, spread_bps=None, depth_usd=None,
+                open_interest_usd=oi * self.venue.contract_size * mid if oi is not None else None,
+                funding_rate_now=self.details.get("funding_rate"),
+                funding_period_hours=float(self.venue.funding_interval_hours),
+                session_open=False, session_note=self.details.get("session_note"))
         if not bids or not asks:
             raise FeedError(f"Coinbase's book for {self.product_id} is empty on one side")
-        tick = self._get(f"products/{self.product_id}/ticker", {"limit": 1})
         best_bid = _num(tick.get("best_bid")) or float(bids[0]["price"])
         best_ask = _num(tick.get("best_ask")) or float(asks[0]["price"])
         if not 0 < best_bid < best_ask:
@@ -213,7 +301,9 @@ class CoinbaseFeed:
             open_interest_usd=oi * cs * mid if oi is not None else None,
             funding_rate_now=self.details.get("funding_rate"),
             funding_period_hours=float(self.venue.funding_interval_hours),
-            session_open=self.details.get("session_open"),
+            # no session details: closed for entries, saying why (the session gate's note)
+            session_open=False if self.details.get("session_open") is None else self.details["session_open"],
+            session_note=self.details.get("session_note"),
         )
 
     def mid(self) -> float:
