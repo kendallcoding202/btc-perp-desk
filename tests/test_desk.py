@@ -306,6 +306,37 @@ def test_paper_ledger_stepping_matches_the_backtest(tmp_path, monkeypatch, short
     assert json.loads((tmp_path / "board.json").read_text())["goal"]["target"] == p.sizing.goal_equity
 
 
+def _reported_every_new_event(before: list[dict], after: list[dict], reported: list[dict]) -> bool:
+    """The ledger's events only ever get appended to (the oldest dropped past 200): a run reported all of its new
+    events when the last event from before the run sits right in front of the ones it reported."""
+    n = len(reported)
+    return after[len(after) - n - 1] == before[-1] and after[len(after) - n:] == reported
+
+
+def test_paper_step_reports_every_new_event_once_the_ledger_holds_200(tmp_path, monkeypatch):
+    """The desk keeps its last 200 events. Once that's full, a run still reports every event it adds (the board's
+    new_events, which the phone alerts are sent from): none mistaken for an old one."""
+    monkeypatch.setattr(paper, "LOOKBACK_BARS", 10 ** 6)
+    bars, funding = series(seed=3, drift=0.002, n=700)
+    p = P.with_(hard={"max_data_age_bars": 1e9})
+    feed = FakeFeed(bars, funding, 300)
+    clock = lambda: bars[feed.upto].ts + H4 // 2 if feed.upto < len(bars) else bars[-1].ts + 2 * H4
+    paper.step(p, tmp_path, feed=feed, log=lambda *a: None, now_ms=clock())
+    led = json.loads((tmp_path / "paper.json").read_text())
+    ev = led["desk"]["events"]
+    ev[:0] = [{"ts": 1, "agent": "chief", "text": f"old {k}"} for k in range(200 - len(ev))]
+    (tmp_path / "paper.json").write_text(json.dumps(led))
+    rnd, multi = random.Random(4), 0
+    while feed.upto < len(bars):
+        feed.upto = min(len(bars), feed.upto + rnd.choice([1, 2, 5]))
+        before = json.loads((tmp_path / "paper.json").read_text())["desk"]["events"]
+        s = paper.step(p, tmp_path, feed=feed, log=lambda *a: None, now_ms=clock())
+        after = json.loads((tmp_path / "paper.json").read_text())["desk"]["events"]
+        assert len(after) == 200 and _reported_every_new_event(before, after, s["paper"]["new_events"])
+        multi += len(s["paper"]["new_events"]) >= 2
+    assert multi >= 3
+
+
 # ---------------------------------------------------------------- several coins
 
 def test_each_coin_gets_its_own_symbol_and_risk():
@@ -594,6 +625,88 @@ def test_vt_paper_matches_the_backtest_through_feed_glitches(tmp_path):
     clock["now"] = t0 + 261 * DAY                        # every bar closed
     paper.step_basket(VOLTREND, tmp_path, feeds=feeds, log=lambda *a: None, now_ms=clock["now"])
     assert min(glitches.values()) >= 10
+    _assert_vt_ledger_is_the_backtest(tmp_path, series, funding, t0 + start * DAY)
+
+
+def test_vt_every_new_event_is_reported_once_the_ledger_holds_200(tmp_path):
+    """The VT ledger keeps its last 200 events (a year or so of trading). Once that's full, every run still reports
+    all the events it adds, fills included, so every trade still reaches the board and the phone."""
+    series, funding = _vt_market()
+    clock = {}
+    feeds = {c: FakeDailyFeed(series[c], funding[c], clock) for c in series}
+    t0 = series["BTC"][0].ts
+    clock["now"] = t0 + 60 * DAY + DAY // 2
+    paper.step_basket(VOLTREND, tmp_path, feeds=feeds, log=lambda *a: None, now_ms=clock["now"])
+    led = json.loads((tmp_path / "paper.json").read_text())
+    ev = led["broker"]["events"]
+    ev[:0] = [{"ts": 1, "agent": "size", "text": f"old {k}"} for k in range(200 - len(ev))]
+    (tmp_path / "paper.json").write_text(json.dumps(led))
+    multi = fills = 0
+    for k in range(61, 260):
+        clock["now"] = t0 + k * DAY + 4 * 60_000           # 00:04 every day: the close decided, its orders filled
+        before = json.loads((tmp_path / "paper.json").read_text())["broker"]["events"]
+        s = paper.step_basket(VOLTREND, tmp_path, feeds=feeds, log=lambda *a: None, now_ms=clock["now"])
+        after = json.loads((tmp_path / "paper.json").read_text())["broker"]["events"]
+        assert len(after) == 200 and _reported_every_new_event(before, after, s["paper"]["new_events"])
+        multi += len(s["paper"]["new_events"]) >= 2
+        fills += any(e["agent"] == "fills" for e in s["paper"]["new_events"])
+    assert multi >= 10 and fills >= 10
+
+
+def test_vt_orders_wait_for_their_own_open_when_every_answer_lacks_the_bar_that_closed(tmp_path):
+    """After a day with no run, every coin's answer can lack the bar that just closed while the next one is forming.
+    The orders decided at the close before belong to the missing bar's open, not the forming one's: they wait for the
+    next run, which fills them at the backtest's price."""
+    series, funding = _vt_market()
+    clock = {}
+    feeds = {c: FakeDailyFeed(series[c], funding[c], clock) for c in series}
+    t0, start = series["BTC"][0].ts, 60
+    ref = voltrend.run(series, funding, VOLTREND, start_ms=t0 + start * DAY).book
+    d = next((f["ts"] - t0) // DAY for f in ref.fills if (f["ts"] - t0) // DAY > 120)   # an order fills at day d's open
+    clock["now"] = t0 + start * DAY + DAY // 2
+    paper.step_basket(VOLTREND, tmp_path, feeds=feeds, log=lambda *a: None, now_ms=clock["now"])
+    for k in range(start + 1, d):                        # daily runs up to day d-1
+        clock["now"] = t0 + k * DAY + 4 * 60_000
+        paper.step_basket(VOLTREND, tmp_path, feeds=feeds, log=lambda *a: None, now_ms=clock["now"])
+    n0 = len(json.loads((tmp_path / "paper.json").read_text())["broker"]["fills"])
+    clock["now"] = t0 + (d + 1) * DAY + 4 * 60_000      # no run on day d; at d+1 00:04 no answer has bar d yet
+    for f in feeds.values():
+        f.hide = {t0 + d * DAY}
+    s = paper.step_basket(VOLTREND, tmp_path, feeds=feeds, log=lambda *a: None, now_ms=clock["now"])
+    led = json.loads((tmp_path / "paper.json").read_text())["broker"]
+    assert s["paper"]["bars_processed_this_run"] == 1 and led["pending"] and len(led["fills"]) == n0
+    for f in feeds.values():
+        f.hide = set()
+    paper.step_basket(VOLTREND, tmp_path, feeds=feeds, log=lambda *a: None, now_ms=clock["now"])
+    led = json.loads((tmp_path / "paper.json").read_text())["broker"]
+    assert led["fills"][n0] == ref.fills[n0] and led["fills"][n0]["ts"] == t0 + d * DAY
+    clock["now"] = t0 + 261 * DAY
+    paper.step_basket(VOLTREND, tmp_path, feeds=feeds, log=lambda *a: None, now_ms=clock["now"])
+    _assert_vt_ledger_is_the_backtest(tmp_path, series, funding, t0 + start * DAY)
+
+
+def test_vt_day_one_never_trades_on_closes_from_before_the_account_opened(tmp_path):
+    """The account opens while one coin's answer is a few closes behind. The first decision is still at the next
+    00:00 close, and every fill is dated after the account opened: the same as a backtest from that day."""
+    series, funding = _vt_market()
+    clock = {}
+    feeds = {c: FakeDailyFeed(series[c], funding[c], clock) for c in series}
+    t0, start = series["BTC"][0].ts, 120
+    clock["now"] = t0 + start * DAY + 4 * 60_000         # opens at 00:04 on day 120...
+    feeds["SOL"].lag = 4                                  # ...while SOL's answer ends 3 closes early, with no forming bar
+    paper.step_basket(VOLTREND, tmp_path, feeds=feeds, log=lambda *a: None, now_ms=clock["now"])
+    feeds["SOL"].lag = 0
+    meta = json.loads((tmp_path / "paper.json").read_text())["meta"]
+    assert meta["last_bar_ts"] == t0 + (start - 1) * DAY  # the close that just happened, not SOL's last one
+    clock["now"] += 3600_000                              # the next run, SOL caught up: nothing to decide yet
+    s = paper.step_basket(VOLTREND, tmp_path, feeds=feeds, log=lambda *a: None, now_ms=clock["now"])
+    assert s["paper"]["bars_processed_this_run"] == 0
+    assert not json.loads((tmp_path / "paper.json").read_text())["broker"]["fills"]
+    for k in range(start + 1, 261):
+        clock["now"] = t0 + k * DAY + 4 * 60_000
+        paper.step_basket(VOLTREND, tmp_path, feeds=feeds, log=lambda *a: None, now_ms=clock["now"])
+    led = json.loads((tmp_path / "paper.json").read_text())
+    assert min(f["ts"] for f in led["broker"]["fills"]) >= led["meta"]["started_ts"]
     _assert_vt_ledger_is_the_backtest(tmp_path, series, funding, t0 + start * DAY)
 
 

@@ -34,6 +34,14 @@ FUNDING_WINDOW_MS = 4 * 86400_000
 VT_LOOKBACK_DAYS = 120    # daily candles per VT coin per run: the 50-day average and vol need 50, the rest is margin
 
 
+def _new_events(before: list, events) -> list:
+    """The events appended since `before = list(events)` was taken. The caller holds `before` until now: it keeps the
+    loaded events alive, so once the deque (maxlen 200) drops the oldest, a new Event can't take over a dropped
+    one's id() and be mistaken for an old one (its fill would never reach the board or the phone)."""
+    seen = {id(e) for e in before}
+    return [e for e in events if id(e) not in seen]
+
+
 def _write(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
@@ -72,7 +80,7 @@ def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=
     funding = feed.funding(max(bars[0].ts, since))
     f = ind.compute(bars, funding, p)
     ctx = feed.context()
-    seen = {id(e) for e in desk.events}
+    before = list(desk.events)
 
     def note_fills(n_trades_before: int, had_position: bool, ts: int) -> None:
         """Say what FILLS and RISK just did, so the board and phone notifications show it right away."""
@@ -129,7 +137,7 @@ def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=
         desk.last_decision = evaluate_entry(p, f, len(bars) - 1, equity=eq, kills=desk.kill_gates(now, eq),
                                             ctx=ctx, now_ms=now)
 
-    new_events = [e for e in desk.events if id(e) not in seen]
+    new_events = _new_events(before, desk.events)
 
     meta["runs"] += 1
     meta["last_run_ts"] = now
@@ -180,7 +188,7 @@ def step_basket(vt: VolTrend = VOLTREND, ledger_dir: str | Path = "ledger/VT", f
         if meta.get("strategy") != "voltrend" or meta.get("interval") != vt.interval:
             # an error, not SystemExit: cmd_step reports it and the desk accounts still run
             raise RuntimeError(f"{lpath} isn't a {vt.interval} vol-trend ledger; refusing to continue")
-    seen = {id(e) for e in book.events}
+    before = list(book.events)
 
     # Enough history for the 50-day average at the oldest close still to process (after an outage, fetch more).
     since = now - VT_LOOKBACK_DAYS * day
@@ -200,8 +208,9 @@ def step_basket(vt: VolTrend = VOLTREND, ledger_dir: str | Path = "ledger/VT", f
 
     processed = 0
     if not meta["last_bar_ts"]:
-        # Day one: open flat. The history is for the averages, not for trading.
-        meta["last_bar_ts"] = covered
+        # Day one: open flat. The history is for the averages, not for trading. Start after the newest close any coin
+        # has: a coin whose answer is behind must not make the next run decide (and fill) on closes from before today.
+        meta["last_bar_ts"] = max(closed[c][-1].ts for c in vt.coins)
         book.say(now, "chief", f"${vt.starting_equity:,.0f} paper account opened: {', '.join(vt.coins)}, a third each. "
                                "first decision at the next 00:00 UTC close.")
         log(f"VT paper ledger opened with ${vt.starting_equity:,.2f}; the first decision is at the next 00:00 UTC close")
@@ -223,10 +232,11 @@ def step_basket(vt: VolTrend = VOLTREND, ledger_dir: str | Path = "ledger/VT", f
             processed = len(days)
 
     # The bar that's forming now: orders decided at the last close fill at its open, as in the backtest. Every coin
-    # together and in coin order, as on_day fills them, and only once every closed bar is processed (otherwise an
-    # order belongs to an earlier open). If a coin's forming bar isn't in the answer, they all wait for the next run.
+    # together and in coin order, as on_day fills them, and only when it's the bar right after the last processed
+    # close (otherwise an order belongs to an earlier open: a closed bar missing from every answer after a day with
+    # no run). If a coin's forming bar isn't in the answer, they all wait for the next run.
     last = meta["last_bar_ts"]
-    if all(c in forming and forming[c].ts > last for c in vt.coins) and \
+    if all(c in forming and forming[c].ts == last + day for c in vt.coins) and \
             not any(b.ts > last for c in vt.coins for b in closed[c]):
         for c in vt.coins:
             book.fill_pending(c, forming[c].open, forming[c].ts)
@@ -237,7 +247,7 @@ def step_basket(vt: VolTrend = VOLTREND, ledger_dir: str | Path = "ledger/VT", f
             sig = voltrend.signal([b.close for b in closed[c] if b.ts <= meta["last_bar_ts"]], vt)
             preview[c] = {**sig, "target": sig["raw"], "held": 0.0, "ts": None}
 
-    new_events = [e for e in book.events if id(e) not in seen]
+    new_events = _new_events(before, book.events)
     meta["runs"] += 1
     meta["last_run_ts"] = now
     # Stored under "broker" like the desk's ledgers: the workflow's commit message reads broker.cash from each one.

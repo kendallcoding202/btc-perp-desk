@@ -331,7 +331,7 @@
   function renderAnalysis(s) {
     const st = s.analysis.stats, basket = s.header.kind === "basket", t = s.ticker;
     $("analysis-title").textContent = basket ? "BASKET · ANALYSIS" : "DESK · ANALYSIS";
-    $("scanned").textContent = `${s.analysis.scanned.toLocaleString("en-US")} ${basket ? "DAILY CLOSES" : "BARS SCANNED"}`;
+    $("scanned").textContent = `${s.analysis.scanned.toLocaleString("en-US")} ${basket ? "DAILY CLOSES DECIDED" : "BARS SCANNED"}`;
     const cells = basket ? [
       ["$" + s.header.coin, "basket", "sym"], ["Cash", usd(t.cash)], ["Held", usd(t.notional)],
       ["Exposure", `${num(t.exposure)}x`], ["Unrealised", usd(t.unrealised)], ["Fees", usd(t.fees)], ["Funding", usd(t.funding)],
@@ -409,7 +409,7 @@
     });
     $("holdings").innerHTML = `<div class="h-row h-head">${head.map((x) => `<div>${x}</div>`).join("")}</div>` + rows.join("");
     const caught = b.last_close_ts && b.last_close_ts < Math.floor(now / DAY_MS) * DAY_MS
-      ? " The latest 00:00 close is picked up on the next run (every 15 minutes)." : "";
+      ? " The latest 00:00 close is picked up on the desk's next run." : "";
     $("vt-note").textContent = `Prices live from Hyperliquid; averages, vol and units are from the last close` +
       (b.last_close_ts ? ` (${new Date(b.last_close_ts).toISOString().slice(0, 10)} 00:00 UTC)` : "") + `. ` +
       `${b.orders.filled} fills, ${b.orders.blocked} orders skipped by the $${r.min_order_usd} minimum.${caught}`;
@@ -554,15 +554,24 @@
         `<span class="c-name">${esc(c.coin)}<i>${esc(label)}</i></span><span class="c-bank">${usd(b)}</span>` +
         `<span class="c-sub">${pct(b / c.start - 1)} · ${esc(c.position)} · ${esc(c.record)}${sub}</span></button>`;
     });
+    const left = index.coins.filter((c) => c.error).map((c) => c.coin);   // no bank this run: not in the total
     cards.push(`<div class="coin total"><span class="c-name">ALL</span><span class="c-bank">${usd(bank)}</span>` +
-      `<span class="c-sub">${pct(start ? bank / start - 1 : 0)} on ${usd(start, 0)} paper</span></div>`);
+      `<span class="c-sub">${pct(start ? bank / start - 1 : 0)} on ${usd(start, 0)} paper` +
+      `${left.length ? ` · without ${esc(left.join(", "))}` : ""}</span></div>`);
     nav.style.setProperty("--tabs", cards.length);
     nav.innerHTML = cards.join("");
-    nav.querySelectorAll("[data-coin]").forEach((b) => b.addEventListener("click", () => {
-      coin = b.dataset.coin; storeSet("desk-coin", coin); history.replaceState(null, "", "#" + coin); missing = null;
-      live.candle = null; src = `boards/${coin}.json`; tick().then(pollCandle);   // the candle for the new tab's board
-    }));
+    nav.querySelectorAll("[data-coin]").forEach((b) => b.addEventListener("click", () => show(b.dataset.coin)));
   }
+
+  function show(c) {
+    coin = c; storeSet("desk-coin", coin); history.replaceState(null, "", "#" + coin); missing = null;
+    live.candle = null; src = `boards/${coin}.json`; tick().then(pollCandle);   // the candle for the new tab's board
+  }
+  // A new #COIN typed or linked in an open tab (same page, so no reload) switches to that account too.
+  window.addEventListener("hashchange", () => {
+    const c = location.hash.slice(1).toUpperCase();
+    if (ACCOUNTS.includes(c) && c !== coin) show(c);
+  });
 
   function render() {
     state = withLive(base);

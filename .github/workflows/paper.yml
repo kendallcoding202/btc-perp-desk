@@ -1,10 +1,12 @@
 name: paper desk
 
-# The paper experiments: BTC, ETH and SOL, $150 each, separate accounts. Every 15
-# minutes: load the ledgers from the `paper-ledger` branch, run one desk step per coin
-# on live Hyperliquid prices, save the ledgers if anything happened, and publish the
-# boards to GitHub Pages. A coin whose step fails (say, a rate-limited API call) is
-# retried next run; the other coins are still saved and published.
+# The paper experiments: BTC, ETH and SOL, $150 each, separate accounts, plus VT, a
+# $500 vol-trend basket of the three on daily bars (decided at the 00:00 UTC close;
+# paper only). Every 15 minutes (or when dispatched): load the ledgers from the
+# `paper-ledger` branch, run one step per account on live Hyperliquid prices, save the
+# ledgers if anything happened, and publish the boards to GitHub Pages. An account whose
+# step fails (say, a rate-limited API call) is retried next run; the others are still
+# saved and published.
 # GitHub delays (and under load drops) scheduled runs, worst at the top of the hour,
 # so the schedule avoids :00 and runs at :04/:19/:34/:49 — each 2h bar closes on an
 # even hour and is picked up 4 minutes later. `step` catches up on every bar it
