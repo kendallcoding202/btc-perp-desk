@@ -734,7 +734,8 @@ def test_a_second_live_process_for_the_same_coin_is_refused(tmp_path):
     _run_live(tmp_path, P, bars, funding, 300, [1], ex=ex)                              # and so is BTC, once free
 
 
-def test_a_position_file_written_by_another_coins_desk_is_refused(tmp_path):
+def test_a_position_file_written_by_another_coins_desk_is_refused(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)                 # the default path below is relative: keep it out of the repo
     ex = FakeHyperliquid(PRICES)
     path = tmp_path / "ETH" / "live_position.json"
     path.parent.mkdir()
