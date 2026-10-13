@@ -415,3 +415,76 @@ def test_a_close_leaves_no_stop_behind_to_close_the_next_position(tmp_path):
     assert b.position is None and "BTC/USDC:USDC" not in ex.positions
     b.check_stop_price(82_500.0, T0 + 120_000)               # ...and the next sync cancels it
     assert ex.fetch_open_orders("BTC/USDC:USDC") == []
+
+
+# ---------------------------------------------------------------- bug 3: book what the exchange actually did
+
+@pytest.mark.parametrize("fill_oid", ["the stop's own id", "a fresh id"])
+def test_an_exchange_stop_is_booked_at_its_fill_and_fee_not_at_the_next_mid(tmp_path, fill_oid):
+    """The audit's repro: long 0.002 BTC at 80,000, stop 78,000. The stop fills on the exchange (here through a gap,
+    at 77,850) and the price has bounced to 81,500 by the next poll. That loss used to be booked as a +$2.85 win at
+    81,500; it must be booked at the fill, with the fees and the funding the exchange charged."""
+    ex = FakeHyperliquid({"BTC": 80_000.0}, fee_bps=3.5, slip_bps=0.0)   # a fee tier below the desk's 4.5 bps
+    ex.stop_fill_under_new_oid = fill_oid == "a fresh id"
+    b = _broker("BTC", ex, tmp_path, cap=500.0, sleep=Sleeps())
+    b.submit(Order("open", Side.LONG, 0.002, "breakout", stop=78_000.0))
+    b.execute_now(80_000.0, T0)
+    ex.charge_funding("BTC", 0.0001)                                        # the exchange charges $0.016...
+    b.apply_funding(0.0004, 80_000.0)                                       # ...the desk's estimate was $0.064
+    ex.move("BTC", 77_900.0, fill_at=77_850.0)
+    ex.move("BTC", 81_500.0)
+    b.check_stop_price(81_500.0, ex.now)
+    t = b.trades[-1]
+    assert b.position is None and t.reason == "stop (exchange)"
+    assert t.exit_price == pytest.approx(77_850.0) and t.exit_ts == ex.fills[-1]["timestamp"]
+    assert t.fees == pytest.approx(0.002 * (80_000 + 77_850) * 3.5e-4)
+    assert t.funding == pytest.approx(0.002 * 80_000 * 0.0001)
+    assert t.net_pnl == pytest.approx(0.002 * (77_850 - 80_000) - t.fees - t.funding) and t.net_pnl < -4
+    saved = json.loads(b.state_path.read_text())["trades"][-1]              # and that's what the state file keeps
+    assert saved["exit_price"] == pytest.approx(77_850.0)
+
+
+def test_a_stop_that_filled_while_the_desk_was_down_is_booked_at_its_fill_after_a_restart(tmp_path):
+    ex = FakeHyperliquid({"BTC": 80_000.0}, slip_bps=0.0)
+    b = _broker("BTC", ex, tmp_path, cap=500.0, sleep=Sleeps())
+    b.submit(Order("open", Side.LONG, 0.002, "breakout", stop=78_000.0))
+    b.execute_now(80_000.0, T0)
+    ex.move("BTC", 77_000.0, fill_at=77_400.0)                              # the process is down meanwhile
+    b2 = _broker("BTC", ex, tmp_path, cap=500.0, sleep=Sleeps())            # restarts from its state file
+    assert b2.position is None and b2.trades[-1].exit_price == pytest.approx(77_400.0)
+
+
+@pytest.mark.parametrize("readable", ["the stop order", "nothing"])
+def test_when_the_fills_cant_be_read_the_exit_falls_back_loudly(tmp_path, readable):
+    ex, said = FakeHyperliquid({"BTC": 80_000.0}, slip_bps=0.0), []
+    b = _broker("BTC", ex, tmp_path, cap=500.0, sleep=Sleeps(), on_alert=said.append)
+    b.submit(Order("open", Side.LONG, 0.002, "breakout", stop=78_000.0))
+    b.execute_now(80_000.0, T0)
+    ex.move("BTC", 77_900.0, fill_at=77_850.0)
+    ex.fail["my_trades"] = 99
+    if readable == "nothing":
+        ex.fail["order"] = 99
+    b.check_stop_price(81_500.0, ex.now)
+    t = b.trades[-1]
+    if readable == "the stop order":                                        # ccxt's fetch_order has the average
+        assert t.exit_price == pytest.approx(77_850.0) and t.reason == "stop (exchange)" and not said
+    else:                                                                   # never the next mid: the stop level
+        assert t.exit_price == pytest.approx(78_000.0) and "fill not found" in t.reason
+        assert any("couldn't be read" in a for a in said)
+
+
+def test_a_desk_close_carries_the_exchanges_fees_and_funding(tmp_path):
+    ex = FakeHyperliquid({"ETH": 2_600.0}, fee_bps=2.0)
+    b = _broker("ETH", ex, tmp_path, cap=500.0, sleep=Sleeps())
+    b.submit(Order("open", Side.LONG, 0.1, "breakout", stop=2_500.0))
+    b.execute_now(2_600.0, T0)
+    for _ in range(3):
+        ex.charge_funding("ETH", -0.00002)                                  # shorts paying longs: we receive
+        b.apply_funding(0.0001, 2_600.0)
+    ex.move("ETH", 2_700.0)
+    t = b.close_now(2_700.0, ex.now, "trend_flip")
+    entry, exit_ = ex.fills[0], ex.fills[1]
+    assert t.entry_price == pytest.approx(entry["price"]) and t.exit_price == pytest.approx(exit_["price"])
+    assert t.fees == pytest.approx(entry["fee"]["cost"] + exit_["fee"]["cost"])
+    assert t.funding == pytest.approx(-sum(e["amount"] for e in ex.incomes)) and t.funding < 0
+    assert b.cash == pytest.approx(ex.fetch_balance()["total"]["USDC"])

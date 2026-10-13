@@ -76,6 +76,7 @@ EQUITY_INCLUDES_UPNL = {"hyperliquid"}
 # and the wait before each retry (doubling: 1 s, 2 s, 4 s).
 STOP_ATTEMPTS = 4
 STOP_BACKOFF_S = 1.0
+FILL_LOOKBACK_MS = 60_000   # an order's own fills are looked up from a minute before it was sent (clock skew)
 
 
 def _trigger(o: dict) -> float | None:
@@ -192,6 +193,59 @@ class LiveBroker:
                 return Side(pos["side"]), qty, float(pos.get("entryPrice") or 0.0)
         return None, 0.0, 0.0
 
+    def _fills_since(self, since: int) -> list[dict] | None:
+        """This market's fills (ccxt trade structures) since `since`, oldest first; None if the venue can't say."""
+        if not (getattr(self.ex, "has", None) or {}).get("fetchMyTrades", True):
+            return None
+        try:
+            fills = self.ex.fetch_my_trades(self.symbol, since)
+        except Exception as exc:
+            self.log(f"{self.coin}: could not read fills: {type(exc).__name__}: {exc}")
+            return None
+        fills = [t for t in fills if t.get("symbol") in (None, self.symbol) and (t.get("timestamp") or since) >= since]
+        return sorted(fills, key=lambda t: t.get("timestamp") or 0)
+
+    def _sum_fills(self, fills: list[dict]) -> tuple[float, float, float | None, int | None]:
+        """(coins, average price, fee or None if any fill's fee is unknown or not in the settle currency, last ts)."""
+        amt = sum(float(t["amount"]) for t in fills)
+        px = sum(float(t["price"]) * float(t["amount"]) for t in fills) / amt
+        settle = self.market.get("settle")
+        fees = [t.get("fee") or {} for t in fills]
+        fee = None
+        if all(f.get("cost") is not None and f.get("currency") in (None, settle) for f in fees):
+            fee = sum(float(f["cost"]) for f in fees)
+        return amt * self.contract_size, px, fee, max((t.get("timestamp") or 0) for t in fills) or None
+
+    def _order_fill(self, res: dict, ts: int, ref: float, qty: float) -> tuple[float, float, str]:
+        """(average price, fee, where they came from) of a market order the desk just sent: its fills on the
+        exchange, else what the order's answer says, else the reference price and the configured taker fee."""
+        fills = self._fills_since(ts - FILL_LOOKBACK_MS)
+        mine = [t for t in fills or [] if str(t.get("order")) == str(res["id"])]
+        if mine:
+            _, px, fee, _ = self._sum_fills(mine)
+        else:
+            px, fee = float(res.get("average") or res.get("price") or ref), None
+        if fee is not None:
+            return px, fee, "fills"
+        if (res.get("fee") or {}).get("cost") is not None:
+            return px, float(res["fee"]["cost"]), "order"
+        self.log(f"{self.coin}: order {res['id']}'s fee isn't readable from the exchange; using the "
+                 f"{self.p.costs.taker_fee_bps} bps taker estimate")
+        return px, qty * px * self.p.costs.taker_fee_bps / 1e4, "estimate"
+
+    def _exchange_funding(self, since: int) -> float | None:
+        """Funding the exchange charged this market's position since `since`, in the desk's sign (+ = paid);
+        None if the venue can't say."""
+        if not (getattr(self.ex, "has", None) or {}).get("fetchFundingHistory", True):
+            return None
+        try:
+            rows = self.ex.fetch_funding_history(self.symbol, since)
+        except Exception as exc:
+            self.log(f"{self.coin}: could not read funding: {type(exc).__name__}: {exc}")
+            return None
+        return -sum(float(r.get("amount") or 0.0) for r in rows
+                    if r.get("symbol") in (None, self.symbol) and (r.get("timestamp") or since) >= since)
+
     def _resting_stops(self, side: str | None = None) -> list[dict]:
         """Reduce-only trigger orders resting on this market (on `side`, if given)."""
         out = []
@@ -215,15 +269,7 @@ class LiveBroker:
         side, qty, entry = self._exchange_position()
         if side is None and self.position is not None:
             # the exchange closed us — almost certainly the resting stop
-            pos = self.position
-            px = price or pos.stop
-            gross = pos.side.sign * pos.qty * (px - pos.entry_price)
-            fee = pos.qty * px * self.p.costs.taker_fee_bps / 1e4
-            self.trades.append(Trade(pos.side, pos.qty, pos.entry_ts, pos.entry_price, self.clock(), px,
-                                     "stop (exchange)", gross, pos.fees_paid + fee, pos.funding_paid))
-            self.position = None
-            self.stop_order_id = self.stop_px = None
-            self.stops_to_clean = True
+            self._book_exchange_exit()
         elif side is not None and (self.position is None or side is not self.position.side):
             # a position we don't know about: adopt it. A stop already resting for it is kept; otherwise the
             # runner gives it one straight away.
@@ -264,6 +310,62 @@ class LiveBroker:
         self.alert(f"no stop resting on the exchange for the open {pos.side.value} {pos.qty:g} {self.coin}: "
                    f"placing it at {want:,.2f}")
         self._ensure_stop(pos.stop, self.last_price, self.clock())
+
+    def _book_exchange_exit(self) -> Trade:
+        """The exchange closed the position while the desk wasn't looking (its stop, or a liquidation): book it at
+        the exchange's own fills (price and fee) since the entry, preferring the stop order's. If the venue can't
+        say, ask for the stop order itself; failing that, book it at the stop level with the configured fee and
+        alert, so a human checks the venue's trade history."""
+        pos = self.position
+        closing = [t for t in self._fills_since(pos.entry_ts) or [] if t.get("side") == self._closing_side(pos.side)]
+        by_stop = [t for t in closing if self.stop_order_id and str(t.get("order")) == self.stop_order_id]
+        fills = by_stop or closing
+        est_fee = lambda px: pos.qty * px * self.p.costs.taker_fee_bps / 1e4   # noqa: E731
+        reason, px, fee, ts = "stop (exchange)", None, None, None
+        if fills:
+            qty, px, fee, ts = self._sum_fills(fills)
+            if any((t.get("info") or {}).get("liquidationMarkPx") for t in fills):
+                reason = "liquidation"
+            if not math.isclose(qty, pos.qty, rel_tol=1e-6):
+                self.log(f"{self.coin}: exit fills add up to {qty:g}, the position was {pos.qty:g}")
+            if fee is None:
+                fee = est_fee(px)
+                self.log(f"{self.coin}: exit fee not readable; using the {self.p.costs.taker_fee_bps} bps estimate")
+        elif self.stop_order_id and (getattr(self.ex, "has", None) or {}).get("fetchOrder", True):
+            try:
+                o = self.ex.fetch_order(self.stop_order_id, self.symbol)
+                if o.get("status") == "closed" and o.get("average"):
+                    px = float(o["average"])
+                    fee = float((o.get("fee") or {}).get("cost") or est_fee(px))
+                    ts = o.get("lastTradeTimestamp") or o.get("lastUpdateTimestamp") or o.get("timestamp")
+            except Exception as exc:
+                self.log(f"{self.coin}: could not read stop order {self.stop_order_id}: {type(exc).__name__}: {exc}")
+        if px is None:
+            px = pos.stop or self.last_price or pos.entry_price
+            fee = est_fee(px)
+            reason = "stop (exchange, fill not found)"
+            self.alert(f"the exchange closed the {pos.side.value} {pos.qty:g} {self.coin} but its fill couldn't be "
+                       f"read: booked at the stop {px:,.2f} with an estimated fee. Check the venue's trade history.")
+        return self._book(pos, px, fee, int(ts or self.clock()), reason)
+
+    def _book(self, pos: Position, px: float, fee: float, ts: int, reason: str) -> Trade:
+        """Record the closed trade, with the funding the exchange actually charged when it can say."""
+        funding = self._exchange_funding(pos.entry_ts)
+        if funding is None:
+            funding = pos.funding_paid
+            self.log(f"{self.coin}: funding not readable from the exchange; the trade carries the desk's estimate")
+        self.funding_total += funding - pos.funding_paid
+        self.fees_total += fee
+        gross = pos.side.sign * pos.qty * (px - pos.entry_price)
+        t = Trade(pos.side, pos.qty, pos.entry_ts, pos.entry_price, ts, px, reason, gross, pos.fees_paid + fee,
+                  funding)
+        self.trades.append(t)
+        self.position = None
+        self.stop_order_id = self.stop_px = None
+        self.stops_to_clean = True
+        self.last_fill = {"action": "close", "side": pos.side.value, "qty": pos.qty, "price": px, "fee": fee,
+                          "ts": ts, "reason": reason, "net_pnl": t.net_pnl}
+        return t
 
     # ---- orders ----------------------------------------------------------
     def submit(self, order: Order) -> None:
@@ -310,8 +412,7 @@ class LiveBroker:
         if qty <= 0:
             self.alert(f"entry order {res['id']} for {amount:g} {self.coin} did not fill; no position")
             return
-        fill = float(res.get("average") or res.get("price") or price)
-        fee = float((res.get("fee") or {}).get("cost") or qty * fill * self.p.costs.taker_fee_bps / 1e4)
+        fill, fee, _ = self._order_fill(res, ts, price, qty)
         self.fees_total += fee
         self.position = Position(o.side, qty, fill, ts, stop=o.stop or 0.0, best_close=fill, fees_paid=fee,
                                  setup=o.reason)
@@ -345,18 +446,10 @@ class LiveBroker:
             pos.qty = after_qty
             self._save_local()
             raise RuntimeError(f"close ({reason}) left {after_qty:g} {self.coin} open; its stop stays in place")
+        fill, fee, _ = self._order_fill(res, ts, ref, pos.qty)
+        t = self._book(pos, fill, fee, ts, reason)
         self._cancel_stops(keep=None)
-        fill = float(res.get("average") or res.get("price") or ref)
-        fee = float((res.get("fee") or {}).get("cost") or pos.qty * fill * self.p.costs.taker_fee_bps / 1e4)
-        gross = pos.side.sign * pos.qty * (fill - pos.entry_price)
-        self.fees_total += fee
-        t = Trade(pos.side, pos.qty, pos.entry_ts, pos.entry_price, ts, fill, reason, gross,
-                  pos.fees_paid + fee, pos.funding_paid)
-        self.trades.append(t)
-        self.position = None
         self.orders_filled += 1
-        self.last_fill = {"action": "close", "side": pos.side.value, "qty": pos.qty, "price": fill, "fee": fee,
-                          "ts": ts, "reason": reason, "net_pnl": t.net_pnl}
         self.cash = self._balance()
         self._save_local()
         return t
