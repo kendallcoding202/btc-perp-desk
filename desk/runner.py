@@ -24,6 +24,9 @@ from .server import Board, serve
 from .thresholds import Params, report_name
 
 LOOKBACK_BARS = 1500
+# A close counts as fresh only this soon after it: paper fills its entry at the next bar's open, the moment the bar
+# closes. Normally live sees each close within ~20 s (polls every 15 s, candles read 5 s after the close).
+FRESH_MS = 5 * 60_000
 
 # Live state lives in state/<COIN>/: one coin's position, desk and kill switches can't clobber another's.
 # These are the files the desk kept before that, shared by every coin.
@@ -132,13 +135,17 @@ def process_closed_bars(desk: Desk, broker, f, new: list[int], *, ctx, now: int,
         one went through it, paper is out at that bar, so live gets out now. The final trail is sent once;
       * an entry decided at a missed bar is NOT taken: paper filled it at an open that has passed, and live would
         be acting on a stale signal at today's price. It is said on the board and logged.
-    The newest close is the only fresh one: its orders go to the exchange now, as when no bar was missed."""
+    The newest close is fresh only if it closed less than FRESH_MS ago: then its orders go to the exchange now, as when
+    no bar was missed. If it closed longer ago (waking from a gap late in the bar, a restart), it is handled like a
+    missed bar: its exits and trail go, its entry is not taken."""
     newest = new[-1]
+    age_ms = now - (f.bars[newest].ts + f.bar_ms)
+    fresh = age_ms <= FRESH_MS
     broker.defer_stops = True
     try:
         for i in new:
             bar = f.bars[i]
-            stale = i != newest
+            stale = i != newest or not fresh
             # 1. orders decided at the previous (missed) close: paper fills them at this bar's open
             pending, broker.pending = broker.pending, []
             for o in pending:
@@ -162,11 +169,18 @@ def process_closed_bars(desk: Desk, broker, f, new: list[int], *, ctx, now: int,
             meta["last_bar_ts"] = bar.ts
             blocked = desk.last_decision.blocked_by if desk.last_decision else None
             log(f"[{_utc(bar.ts + f.bar_ms)}] close {bar.close:,.2f} eq ${broker.equity(mid):,.2f} "
-                + ("(missed bar) " if stale else "")
+                + (("(missed bar) " if i != newest else f"(closed {age_ms / 60_000:.0f} min ago) ") if stale else "")
                 + (f"orders {[o.action + ' ' + o.side.value for o in orders]}" if orders else
                    f"no trade ({blocked.name if blocked else 'holding'})"))
     finally:
         broker.defer_stops = False
+    if not fresh:
+        for o in [o for o in broker.pending if o.action == "open"]:
+            broker.pending.remove(o)
+            desk.say(now, "chief", f"the {o.side.value} entry decided at the {_utc(f.bars[newest].ts + f.bar_ms)} close "
+                                   f"was not taken: that close was {age_ms / 60_000:.0f} min ago, too late to act on at "
+                                   f"today's price. Paper filled it at the next bar's open.")
+            log(f"late entry not taken: {o.side.value} {o.qty:.5f} from the close {age_ms / 60_000:.0f} min ago")
     broker.execute_now(mid, now)
     broker.flush_stop()
 

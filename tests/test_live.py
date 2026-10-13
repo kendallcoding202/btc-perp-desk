@@ -596,17 +596,18 @@ def _run_paper(tmp_path, p, bars, funding, start, end, monkeypatch):
         paper.step(p, led, feed=feed, log=lambda *a: None, now_ms=bars[upto].ts + H4 // 2)
 
 
-def _run_live(tmp_path, p, bars, funding, start, script, ex=None, desk_meta=None, kills=None):
+def _run_live(tmp_path, p, bars, funding, start, script, ex=None, desk_meta=None, kills=None, wake_ms=None):
     """runner.run against the fake exchange. The first poll is a minute after bar start-1 closes; then each entry of
     `script` sleeps through that many bar closes (1 = a normal poll each bar, 5 = the laptop slept through 5, 0 = the
     next 15 s check inside the same bar),
-    with the exchange's price walking through each bar's low, high and close meanwhile (resting stops trigger)."""
+    with the exchange's price walking through each bar's low, high and close meanwhile (resting stops trigger).
+    `wake_ms` {step number: ms}: that wake-up comes this long after the forming bar's open, not a minute after."""
     coin = p.market.symbol
     feed = LiveFeed(bars, funding, start)
     ex = ex or FakeHyperliquid({coin: bars[start - 1].close}, usdc=10_000.0)
     clock = {"now": bars[start].ts + 60_000}
     ex.now = clock["now"]
-    logs, steps = [], list(script)
+    logs, steps, wakes, n_step = [], list(script), dict(wake_ms or {}), {"k": 0}
     paths = runner.live_paths(tmp_path / "live", coin)
     broker = LiveBroker(p, exchange=ex, state_path=paths["position"], log=logs.append, sleep=Sleeps(),
                         clock=lambda: clock["now"])
@@ -615,6 +616,7 @@ def _run_live(tmp_path, p, bars, funding, start, script, ex=None, desk_meta=None
         if not steps:
             raise StopLoop
         n = steps.pop(0)
+        step, n_step["k"] = n_step["k"], n_step["k"] + 1
         if n == 0:                      # the next 15 s check, inside the same bar
             clock["now"] = ex.now = clock["now"] + 15_000
             return
@@ -624,7 +626,7 @@ def _run_live(tmp_path, p, bars, funding, start, script, ex=None, desk_meta=None
                 ex.now = bar.ts + (k + 1) * 1000
                 ex.move(coin, px, dt_ms=0)
             feed.upto += 1
-        clock["now"] = ex.now = bars[feed.upto].ts + 60_000
+        clock["now"] = ex.now = bars[feed.upto].ts + wakes.get(step, 60_000)
 
     if desk_meta is not None:
         paths["desk"].write_text(json.dumps({"meta": desk_meta}))
@@ -1075,3 +1077,25 @@ def test_a_close_the_exchange_filled_but_whose_answer_was_lost_is_booked_as_the_
     t = b.trades[-1]
     assert t.reason == "trend_flip" and t.exit_price == pytest.approx(83_000.0)
     assert len([o for o in ex.orders if o["kind"] == "close"]) == 1 and ex.fetch_open_orders() == []
+
+
+# ---------------------------------------------------------------- review: a close long gone isn't fresh
+
+@pytest.mark.parametrize("wake", ["a minute after the close", "3h59m after the close"])
+def test_an_entry_from_a_close_that_isnt_fresh_is_not_taken(tmp_path, monkeypatch, wake):
+    """Same gap as test_an_entry_from_the_newest_close_after_a_gap_is_taken_as_paper_takes_it, with the shipped
+    stale-data gate (1.5 bars). Waking 3h59m after the 251 close, the newest close used to count as fresh: its entry
+    went out ~4 h after the signal, at a price paper never saw, sized and stopped for the old close."""
+    bars, funding = series(seed=3, drift=0.002, n=700)
+    p = P.with_(hard={"max_data_age_bars": 1.5})
+    rows = _spy_decisions(monkeypatch)
+    late = wake.startswith("3h59m")
+    broker, ex, logs = _run_live(tmp_path, p, bars, funding, 240, [1] * 9 + [3],
+                                 wake_ms={9: H4 - 60_000} if late else None)       # through 248, then 249-251
+    assert rows["live"][bars[251].ts][3] == ["open"]                                # the desk still decides it
+    entries = [o for o in ex.orders if o["kind"] == "entry"]
+    if late:
+        assert entries == [] and broker.position is None
+        assert any("too late to act on" in e.text for e in _desk_events(tmp_path))
+    else:
+        assert len(entries) == 1 and entries[0]["ts"] - (bars[251].ts + H4) == 60_000
