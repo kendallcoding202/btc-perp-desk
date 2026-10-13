@@ -227,6 +227,33 @@ class LiveBroker:
         except Exception:   # ccxt raises when a positive amount rounds to zero
             return 0.0
 
+    def smallest_cap(self, price: float) -> float:
+        """The smallest --max-notional with which an entry can go out at `price`. _open caps the size at
+        cap / (price x (1 + slippage)), cuts it down to the size step, and doesn't send it if it is under the venue's
+        minimum after slippage: so the cap must buy the first whole step above that minimum, cushion included."""
+        s = self.p.costs.slippage_bps / 1e4
+        unit = (self.amount_step or 0.0) * self.contract_size
+        coins = max(self.min_cost / ((1 - s) * price), self.min_amount * self.contract_size)
+        if unit:
+            n = max(1, math.ceil(coins / unit - 1e-9))
+            while n * unit * price * (1 - s) < self.min_cost:
+                n += 1
+            coins = n * unit
+        return math.ceil(coins * price * (1 + s) * 100) / 100      # to the cent, up
+
+    def check_cap(self, price: float | None) -> None:
+        """At startup, with the market's price: refuse a --max-notional that can't buy a single ticket (at or just
+        above the venue's minimum, every entry would be skipped)."""
+        if self.max_notional_usd is None or not price:
+            return
+        need = self.smallest_cap(price)
+        if self.max_notional_usd < need:
+            raise LiveSetupError(f"--max-notional ${self.max_notional_usd:,.2f} can't buy the smallest ticket "
+                                 f"{self.symbol} takes at {price:,.2f}: ${need:,.2f} ({self.venue}'s "
+                                 f"${self.min_cost:,.2f} minimum after the size step {self.amount_step or 0:g} and the "
+                                 f"{self.p.costs.slippage_bps:g} bps slippage cushion). Every entry would be skipped; "
+                                 f"use a cap a little above that, as the minimum moves with the price")
+
     def _px(self, price: float) -> float:
         return float(self.ex.price_to_precision(self.symbol, price))
 
@@ -631,8 +658,13 @@ class LiveBroker:
         if qty <= 0 or qty * price * (1 - self.p.costs.slippage_bps / 1e4) < self.min_cost or amount < self.min_amount:
             self.skipped = {"ts": ts, "reason": o.reason, "qty": qty, "notional": qty * price,
                             "min_cost": self.min_cost, "step": self.amount_step}
-            self.log(f"entry not sent: {qty:g} {self.coin} (${qty * price:,.2f}) after the size step "
-                     f"{self.amount_step or 0:g} and the cap is under {self.venue}'s ${self.min_cost:,.2f} minimum")
+            text = (f"entry not sent: {qty:g} {self.coin} (${qty * price:,.2f}) after the size step "
+                    f"{self.amount_step or 0:g} and the cap is under {self.venue}'s ${self.min_cost:,.2f} minimum")
+            if self.max_notional_usd is not None and self.max_notional_usd < self.smallest_cap(price):
+                self.alert(f"{text}: --max-notional ${self.max_notional_usd:,.2f} is below the smallest ticket at "
+                           f"{price:,.2f} (${self.smallest_cap(price):,.2f}), so no entry can go out")
+            else:
+                self.log(text)
             return
         side = "buy" if o.side is Side.LONG else "sell"
         res = self._accepted(self.ex.create_order(self.symbol, "market", side, amount, price), "entry order")

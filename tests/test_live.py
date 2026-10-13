@@ -1229,3 +1229,34 @@ def test_reset_halt_for_live_refuses_while_that_coins_live_process_runs(tmp_path
     assert cli.cmd_reset_halt(argparse.Namespace(mode="live", coin="BTC")) == 0
     assert json.loads(paths["desk"].read_text())["risk"]["halted"] is False
     runner._lock(paths["lock"]).close()                    # and reset-halt let go of the lock
+
+
+# ---------------------------------------------------------------- review: a cap that can't buy one ticket
+
+def test_a_cap_too_small_for_any_ticket_at_the_current_price_refuses_to_start(tmp_path, monkeypatch):
+    """BTC at 83,000, 3 bps slippage, size step 0.00001: a $10.00-$10.75 cap passed the start check (it isn't below
+    the $10 minimum) and then skipped every entry, 0.00012 BTC = $9.96 after the cut. The smallest that trades is
+    $10.80 at this price (0.00013 BTC, with the 3 bps cushion)."""
+    p = params_for("BTC")
+    ex = FakeHyperliquid({"BTC": 83_000.0}, usdc=1_000.0)
+    need = _broker("BTC", ex, tmp_path).smallest_cap(83_000.0)
+    assert need == pytest.approx(10.80)
+    for cap in (10.0, 10.5, 10.75, need - 0.01):
+        with pytest.raises(LiveSetupError, match="smallest ticket"):
+            _broker("BTC", ex, tmp_path, cap=cap).check_cap(83_000.0)
+    b = _broker("BTC", ex, tmp_path, cap=need)
+    b.check_cap(83_000.0)
+    b.submit(Order("open", Side.LONG, 0.01, "breakout", stop=80_000.0))
+    b.execute_now(83_000.0, ex.now)
+    assert [o["kind"] for o in ex.orders][:1] == ["entry"] and b.position is not None      # exactly enough: it trades
+    assert ex.orders[0]["amount"] * 83_000.0 <= need and p.costs.slippage_bps == 3.0
+    # and through the runner: `live` refuses at startup with the market's price
+    bars, funding = series(seed=3, drift=0.002, n=700)
+    ex2 = FakeHyperliquid({"BTC": bars[299].close}, usdc=10_000.0)
+    paths = runner.live_paths(tmp_path / "live", "BTC")
+    small = LiveBroker(P, exchange=ex2, state_path=paths["position"], max_notional_usd=10.0, log=lambda *a: None)
+    with pytest.raises(LiveSetupError, match="smallest ticket"):
+        runner.run(P, "live", state_dir=str(tmp_path / "live"), dashboard=False, log=lambda *a: None,
+                   feed=LiveFeed(bars, funding, 300), broker=small, clock=lambda: bars[300].ts + 60_000,
+                   sleep=lambda s: None)
+    assert ex2.orders == []

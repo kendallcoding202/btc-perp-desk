@@ -261,6 +261,8 @@ def run(p: Params, mode: str, *, state_dir: str = "state", poll_s: float = 15.0,
 
     bars, funding, ctx = _keep_trying("reading the market's candles", first_read, **retrying)
     f = ind.compute(bars, funding, p)
+    if hasattr(broker, "check_cap"):
+        broker.check_cap(ctx.mid or bars[-1].close)    # a cap too small for any ticket refuses here, not silently later
     if not meta["last_bar_ts"]:
         # Don't act on a bar that closed before we started: show it, trade from the next one.
         meta["last_bar_ts"] = bars[-1].ts
