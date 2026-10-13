@@ -37,9 +37,20 @@
   const phaseOf = (g) => PHASE[g.name] || OWNER_PHASE[g.owner] || "HARD";
   const TRADE = /\b(BOUGHT|SOLD|SHORTED|COVERED|ADDED|TRIMMED|HALT|flattened)\b/;
   const NO_TICK = 20000;          // no live price for this long: say so
+  const NO_READ_STATIC = 130000, NO_READ_LIVE = 15000;   // app.js re-reads every 60 s (a live server: 2 s)
+  const NO_FIRST = 15000;         // no board this long after load: say the page can't load one
   const DAY = 86400000;
   const reduced = matchMedia("(prefers-reduced-motion: reduce)");
   const wide = matchMedia("(min-width: 980px)");
+  const narrow = matchMedia("(max-width: 420px)");
+  // filter.py's KILLS: a brake that holds every new entry, whatever the price does (desk/engine.py kill_gates)
+  const BRAKE = {
+    drawdown_halt: ["drawdown halt", "until a human resets it"],
+    daily_loss: ["daily loss lock", "until the next UTC day"],
+    cooldown: ["losing-streak cooldown", "until it ends"],
+    flat_kill: ["flat kill switch on", "until it is switched off"],
+    entry_kill: ["entry kill switch on", "until it is switched off"],
+  };
 
   // ---- formatting ----------------------------------------------------------------------------------------
   const fix = (x, dp) => Number(x).toLocaleString("en-US", { minimumFractionDigits: dp, maximumFractionDigits: dp });
@@ -61,12 +72,13 @@
   const word = (v, g) => (v === "SKIP" ? (g && g.value != null ? "info" : "skip") : v);
 
   // ---- the two panels, with room kept for them before any data, so nothing below shifts -------------------
-  const mon = document.createElement("section");
+  // index.html holds their empty shells, so their room is there from the first paint; made here if it doesn't
+  const mon = $("monitor") || document.createElement("section");
   mon.className = "panel act-monitor act-wait";      // act-wait: no board yet, nothing to show but that
   mon.id = "monitor";
   mon.setAttribute("aria-label", "desk monitor: the last desk run, replayed, and live prices");
   mon.innerHTML = `
-    <div class="act-status"><span class="act-pill" data-k="mode">—</span><span class="act-dot act-stale" data-k="dot"></span><span class="act-st"><span data-k="st">waiting for the first board…</span><span class="act-xp" data-k="exp"></span></span><button type="button" class="act-jump" data-k="jump">DESK LOG ↓</button></div>
+    <div class="act-status"><span class="act-pill" data-k="mode">—</span><span class="act-dot act-stale" data-k="dot"></span><span class="act-st"><span data-k="st">waiting for the first board…</span><span class="act-xp" data-k="exp"></span></span><button type="button" class="act-jump" data-k="jump" aria-label="jump to the desk log"><span class="act-jw">DESK </span>LOG ↓</button></div>
     <div class="act-err" data-k="err" hidden></div>
     <div class="act-meter desk-only" data-k="meter">
       <div class="act-big"><b data-k="pct">—</b> <span data-k="to"></span></div>
@@ -81,9 +93,9 @@
         <button type="button" class="act-play" data-k="play" aria-label="replay the last run's checks" title="replay the last run's checks">▶</button></div>
     </div>
     <div class="act-next"><span data-k="next1"></span> <span data-k="next2"></span></div>`;
-  nav.after(mon);
+  if (!mon.isConnected) nav.after(mon);
 
-  const log = document.createElement("section");
+  const log = $("desklog") || document.createElement("section");
   log.className = "panel act-log act-wait";
   log.id = "desklog";
   log.setAttribute("aria-label", "desk log: the last desk run, step by step, and what is live");
@@ -104,7 +116,7 @@
       </div>
     </div>
     <div class="act-foot" data-k="foot">PAPER · no real money · the rules are fixed in desk/thresholds.py and the desk does not change them · backtests are not promises</div>`;
-  basketEl.after(log);
+  if (!log.isConnected) basketEl.after(log);
 
   const M = {}, L = {};
   mon.querySelectorAll("[data-k]").forEach((e) => { M[e.dataset.k] = e; });
@@ -116,9 +128,21 @@
   let mids = null, midsAt = 0;               // the newest allMids answer, and when it came
   const modes = {};                           // each account's header.mode, as seen
   let research = null;
+  let lastRead = 0, visibleSince = Date.now(), unreadSaid = false;   // when a board last came in; the tab last shown
   const basket = () => !!(B && B.header && B.header.kind === "basket");
   const agentOf = (k) => (B.agents || []).find((a) => a.key === k) || null;
   const stale = (now) => !!B && now - B.updated > (staticBoard ? STALE_STATIC : STALE_LIVE);
+  // this page has read no board for a while (a re-read failing, or the site down): it can't say the desk is idle
+  const unread = (now) => !!B && now - Math.max(lastRead, visibleSince) > (staticBoard ? NO_READ_STATIC : NO_READ_LIVE);
+  const modeWord = () => (B.header.mode || "paper").toLowerCase();
+  // the brake holding new entries as of the last run, if any: [what, until]
+  function brake() {
+    const g = (B.analysis.gates || []).find((x) => phaseOf(x) === "KILLS" && x.verdict === "DROP");
+    if (g) return BRAKE[g.name === "manual_kill" ? (g.note === "flat_kill" ? "flat_kill" : "entry_kill") : g.name] || [g.name.replace(/_/g, " "), "for now"];
+    const k = B.kills || {};
+    const key = k.flat_kill ? "flat_kill" : k.entry_kill ? "entry_kill" : k.halted ? "drawdown_halt" : k.daily_locked ? "daily_loss" : k.cooldown ? "cooldown" : null;
+    return key ? BRAKE[key] : null;
+  }
   const newestClose = () => basket() ? B.basket.last_close_ts
     : B.chart.candles.length ? last(B.chart.candles)[0] + B.chart.bar_ms : null;
   // the closes since the board's newest one (the next desk run decides each, in order), and the next to come
@@ -153,13 +177,14 @@
     const mid = isLive ? lv : t.price, cl = last(ch.candles), c = closes(now);
     const atrUsd = st.atr_pct != null && cl ? st.atr_pct / 100 * cl[4] : null;   // the ATR the run used, in $
     const o = { coin, mid, isLive, cl, atrUsd, c, pos: t.pos, rules: b.rules || null };
+    o.brake = t.pos ? null : brake();     // flat and braked: no line is in play, whatever the price does
     if (t.pos) {
       const p = t.pos, sg = p.side === "long" ? 1 : -1;
       o.stopPct = p.stop / mid - 1;
       o.stopAtr = atrUsd ? Math.abs(mid - p.stop) / atrUsd : null;
       o.pnl = sg * p.qty * (mid - p.entry);
       o.through = sg * (mid - p.stop) <= 0;
-    } else {
+    } else if (!o.brake) {
       const ln = lineAt(c.next);
       if (ln) {
         Object.assign(o, { side: ln.side, level: ln.level, bound: ln.bound });
@@ -174,7 +199,7 @@
     // the EMAs if the forming bar closed at the live price: emaNext = prev + 2/(n+1) x (price - prev), as
     // desk/indicators.py ema() steps. Only for the close right after the run's newest one
     const ef = last(ch.ema_fast), es = last(ch.ema_slow), r = o.rules;
-    if (r && isLive && !c.missed && ef != null && es != null) {
+    if (r && isLive && !c.missed && !o.brake && ef != null && es != null) {
       o.ef = ef + 2 / (r.ema_fast + 1) * (mid - ef);
       o.es = es + 2 / (r.ema_slow + 1) * (mid - es);
     }
@@ -196,12 +221,18 @@
   }
   const runs = { strip: null, log: null };
   function stopRun(k) { if (runs[k]) { runs[k].cancel(); runs[k] = null; } }
-  function flash(el, cls = "act-flash") {
-    if (!el || reduced.matches || document.hidden) return;
-    el.classList.remove(cls);
-    void el.offsetWidth;                 // restart the CSS animation (one forced style pass, on a real event only)
-    el.classList.add(cls);
-    setTimeout(() => el.classList.remove(cls), 650);
+  // a one-shot flash on a real change: a value that changed, a board read, a fill. The Web Animations API runs it
+  // on its own, so no class juggling (a later className write can't cut it off) and no forced layout
+  const FLASH = {
+    value: [[{ filter: "brightness(1.9)" }, { filter: "none" }], 600],
+    read: [[{ transform: "scale(1.7)", filter: "brightness(1.5)" }, { transform: "none", filter: "none" }], 600],
+    fill: () => { const y = getComputedStyle(document.documentElement).getPropertyValue("--yellow").trim();
+      return [[{ backgroundColor: y, transform: "scale(1.9)" }, { backgroundColor: y, transform: "none" }], 900]; },
+  };
+  function flash(el, kind = "value") {
+    if (!el || !el.animate || reduced.matches || document.hidden) return;
+    const [frames, ms] = typeof FLASH[kind] === "function" ? FLASH[kind]() : FLASH[kind];
+    try { el.animate(frames, { duration: ms, easing: "ease-out" }); } catch { /* no flash: the value is still right */ }
   }
 
   let monOn = false, logOn = false, logPending = false, stripPending = false, sec = 0, secN = 0;
@@ -217,33 +248,45 @@
         if (e.target === mon) { monOn = e.isIntersecting; mon.classList.toggle("act-off", !monOn); }
         else { logOn = e.isIntersecting; log.classList.toggle("act-off", !logOn); }
       });
+      if (logOn) loadResearch();          // the research lines sit at the log's end: read them when it's in view
       if (monOn && stripPending) replayStrip();
       if (logOn && logPending) playLog();
       if (!monOn && runs.strip) finishStrip();
       clockRun();
     });
     io.observe(mon); io.observe(log);
-  } else { monOn = logOn = true; }
+  } else { monOn = logOn = true; setTimeout(loadResearch, 0); }
 
   // ---- monitor row 1: status ------------------------------------------------------------------------------
+  // What the page knows: when the board it shows was built, and whether it can still read one. It can't know whether
+  // the desk ran (a failed deploy or fetch looks the same), so a stale board says "no new board", not "no desk run".
   function status(now) {
-    const b = B, old = stale(now);
+    const b = B, old = stale(now), lost = unread(now), age = ago(now - b.updated).toUpperCase();
     const mode = b.header.mode || "PAPER";
     set(M.mode, mode); M.mode.classList.toggle("act-livemode", mode !== "PAPER");
     set(L.lmode, mode); L.lmode.classList.toggle("act-livemode", mode !== "PAPER");
-    M.dot.classList.toggle("act-stale", old);
-    set(M.st, old ? `STALE · NO DESK RUN FOR ${ago(now - b.updated).toUpperCase()}`     // its board's time: the REPLAY label
-      : `LAST RUN ${hhmm(b.updated)} UTC · ${ago(now - b.updated).toUpperCase()} AGO`);
-    M.st.classList.toggle("act-warn", old);
+    M.dot.classList.toggle("act-stale", old || lost);
+    set(M.st, lost ? (narrow.matches ? `CAN'T READ THE BOARD SINCE ${hhmm(lastRead)}` : `CAN'T READ THE BOARD SINCE ${hhmm(lastRead)} UTC · SHOWING THE ONE BUILT ${hhmm(b.updated)} UTC`)
+      : old ? `STALE · NO NEW BOARD FOR ${age}`      // the run's time is in the REPLAY label
+      : `LAST RUN ${hhmm(b.updated)} UTC · ${age} AGO`);
+    M.st.classList.toggle("act-warn", old || lost);
     set(M.exp, b.header.shorts && b.header.experiment ? "SHORTS: PAPER EXPERIMENT" : "");
-    set(L.lrun, `${old ? "STALE · " : ""}LAST RUN ${hhmm(b.updated)} UTC`);
-    L.lrun.classList.toggle("act-warn", old);
+    set(L.lrun, `${lost ? "CAN'T READ · " : old ? "STALE · " : ""}LAST RUN ${hhmm(b.updated)} UTC`);
+    L.lrun.classList.toggle("act-warn", old || lost);
+    if (lost && !unreadSaid) { unreadSaid = true; tapeAdd(`${hms(now)} no board read since ${hms(lastRead)} · showing the one built ${hms(b.updated)} UTC`, "act-warn"); beat(now); }
     // a step that failed this run: the asked-for tab (app.js shows BTC's board when one is missing), or this one
     const asked = location.hash.slice(1).toUpperCase();
     const bad = IDX && IDX.coins ? IDX.coins.find((c) => c.error && (c.coin === asked || c.coin === shown)) : null;
-    M.err.hidden = !bad;
+    const notice = $("acct-err");       // app.js's own notice for an account with no board says it in full, just above
+    M.err.hidden = !bad || !!(notice && !notice.hidden && notice.textContent.startsWith(bad.coin + ":"));
     if (bad) set(M.err, `${bad.coin}: its step failed this run (${bad.error.slice(0, 60)})${bad.coin !== shown ? ` · showing ${shown}` : ""}`);
   }
+  // no board at all yet, a while after load: say the page can't load one, rather than wait forever
+  setTimeout(() => {
+    if (B) return;
+    set(M.st, "CAN'T LOAD THE BOARD · NOTHING TO SHOW YET");
+    M.st.classList.add("act-warn");
+  }, NO_FIRST);
 
   // ---- monitor row 2: the trigger meter (desk tabs) --------------------------------------------------------
   function priceCap(o, now) {
@@ -256,24 +299,38 @@
   function meter(now) {
     if (!B || basket()) return;
     const o = calc(now), r = o.rules, word2 = o.side === "short" ? "short line" : "buy line";
-    let big = "—", to = "", cap = priceCap(o, now), f = null, ticks = "LINE", tone = "";
+    const trend = (o.side || "").toUpperCase(), at = `at the ${hhmm(o.c.next)} close`;
+    let big = "—", to = "", cap = priceCap(o, now), f = null, ticks = "LINE", hot = false;
     if (o.pos) {
       ticks = "STOP";
       big = pct(o.stopPct);
       f = o.stopAtr;
-      to = o.through ? `price is through the stop ${usd(o.pos.stop)}` : `to the stop ${usd(o.pos.stop)}${o.stopAtr != null ? ` · ${o.stopAtr.toFixed(1)} ATR` : ""}`;
-      cap = `P&L ${o.pnl >= 0 ? "+" : ""}${usd(o.pnl)} at ${mid$(o.mid)}, paper, before exit fees · ` +
-        (o.isLive ? `Hyperliquid, ${Math.round((now - midsAt) / 1000)}s ago` : "at the last run") +
-        (o.c.missed ? " · the next desk run checks every bar since against the stop" : " · the stop as of the last run");
-      tone = o.through ? "act-hot" : "";
+      to = o.through ? `price is through the run's stop ${usd(o.pos.stop)}` : `to the run's stop ${usd(o.pos.stop)}${o.stopAtr != null ? ` · ${o.stopAtr.toFixed(1)} ATR` : ""}`;
+      // the position's price move only: the entry fee and funding are already out of the cash, the exit fee to come
+      // (the mode is the pill beside it; the closes since the run are in the countdown)
+      cap = `move since entry ${o.pnl >= 0 ? "+" : ""}${usd(o.pnl)}, before fees and funding · ` + priceCap(o, now);
+      hot = o.through;
+    } else if (o.brake) {
+      // a brake holds every entry: no line is in play, so no distance to one, and the price doesn't matter to it
+      big = "NO NEW ENTRIES";
+      to = o.brake[0];
+      cap = `${o.brake[1]} · as of the last run, ${hhmm(B.updated)} UTC`;
+    } else if (o.side && o.level != null && o.bound && o.past) {
+      // closes since the run can only move the line away (up for a buy line): the board's level is a bound the price
+      // is already past, so where the line is now is not known here (the next desk run knows)
+      big = (o.side === "short" ? "≤" : "≥") + usd(o.level);
+      to = `${word2} ${at}, if still ${trend}: the price is past this bound; the real line may be ${o.side === "short" ? "lower" : "higher"}`;
     } else if (o.side && o.level != null) {
-      big = (o.bound && !o.past ? (o.side === "short" ? "≤" : "≥") : "") + pct(o.pct);   // a bound: at least this far
+      big = (o.bound ? (o.side === "short" ? "≤" : "≥") : "") + pct(o.pct);   // a bound: at least this far
       f = o.past ? 0 : o.atr;
-      to = o.past ? `past the ${word2} ${usd(o.level)}` : `to the ${word2}${o.bound ? ", at " + (o.side === "short" ? "most" : "least") : ""} ${usd(o.level)}` +
+      // the strip's readout shows the line at the run's close; when this one (the next close's) differs, name its close
+      const sg = (B.analysis.gates || []).find((g) => g.name === "setup");
+      const w = !o.bound && sg && sg.threshold != null && usd(sg.threshold) !== usd(o.level) ? `${hhmm(o.c.next)} ${word2}` : word2;
+      to = o.past ? `past the ${w} ${usd(o.level)}` : `to the ${w}${o.bound ? ", at " + (o.side === "short" ? "most" : "least") : ""} ${usd(o.level)}` +
         (o.atr != null && !o.bound ? ` · ${o.atr.toFixed(1)} ATR` : "");
       if (o.past) cap = `past the line now · only a ${(B.header.interval || "").toLowerCase()} close decides, at the next desk run · ` + cap;
-      if (o.bound) cap = `closes since the last run can only ${o.side === "short" ? "lower" : "raise"} it · ` + cap;
-      tone = o.past ? "act-hot" : "";
+      if (o.bound) cap = `if still ${trend}, later closes can only ${o.side === "short" ? "lower" : "raise"} it · ` + cap;
+      hot = o.past;
     } else if (o.side) {
       to = `the ${word2} is unknown until the next desk run: the run's bars have aged out of the window`;
     } else {
@@ -281,12 +338,15 @@
       to = dir ? `no buy line: the trend says ${dir}` : "no line on this board";
       if (dir === "SHORT") cap = `long only: it waits for the ${r ? r.ema_fast + "-EMA" : "fast EMA"} to be back above the ${r ? r.ema_slow + "-EMA" : "slow EMA"} · ` + cap;
     }
-    if (big !== M.pct.textContent && lastPct !== null) flash(M.pct);
+    const changed = lastPct !== null && big !== lastPct;
     lastPct = big;
     set(M.pct, big); set(M.to, to); set(M.cap, cap);
-    M.pct.className = tone;
+    M.pct.classList.toggle("act-hot", hot);
+    M.pct.classList.toggle("act-word", /[A-Z]{3}/.test(big));
+    if (changed) flash(M.pct);
     set(M.ticks.firstElementChild, ticks); set(M.end0, ticks);
     M.mk.hidden = f == null;
+    M.meter.classList.toggle("act-noscale", f == null && !o.pos);   // no distance to show: no scale
     if (f != null) M.mk.style.transform = `translateX(${(Math.min(5, Math.max(0, f)) / 5 * 100).toFixed(2)}%)`;
     M.mk.classList.toggle("act-past", !!o.past || !!o.through);
   }
@@ -324,10 +384,14 @@
   function restText() {
     const chief = agentOf("chief"), cl = last(B.chart.candles);
     if (blocker < 0) return `every check passed at the ${cl ? hhmm(cl[0] + B.chart.bar_ms) + " " : ""}close · CHIEF ${chief ? chief.value : "—"}`;
-    const g = gates[blocker];
+    const g = gates[blocker], when = cl ? ` ${hhmm(cl[0] + B.chart.bar_ms)}` : "";
     if (g.name === "flat") return `${g.note}: no new entries while it is open`;
+    if (g.verdict === "DROP" && phaseOf(g) === "KILLS") {
+      const k = BRAKE[g.name === "manual_kill" ? (g.note === "flat_kill" ? "flat_kill" : "entry_kill") : g.name];
+      if (k) return g.name === "manual_kill" ? `DROP at manual kill: ${k[0]}` : `DROP at ${k[0]} · no new entries`;
+    }
     if (g.name === "setup" && g.value != null && g.threshold != null)
-      return `setup WAIT: close ${usd(g.value)} ${g.op === "min" ? "<" : ">"} line ${usd(g.threshold)}`;
+      return `setup WAIT ·${when} close ${usd(g.value)} ${g.op === "min" ? "<" : ">"} line ${usd(g.threshold)}`;
     return `${g.verdict} at ${g.name.replace(/_/g, " ")}: ${g.value == null ? g.note || "" : n2(g.value)}${g.threshold == null ? "" : ` (${g.op} ${n2(g.threshold)})`}`;
   }
   function buildStrip() {
@@ -382,7 +446,7 @@
       const t = h.sma50 == null ? `${h.coin} warming up` : h.above_sma ? `${h.coin} → ${fix(h.target_units || 0, 2)} units` : `${h.coin} → 0 units`;
       return `<span class="act-chip ${h.sma50 == null ? "" : h.above_sma ? "c-pass" : "c-drop"}" title="${esc(`${h.coin} ${h.above_sma ? "above" : "below"} its average at that close: target ${fix(h.target_units || 0, 2)} units`)}">${esc(t)}</span>`;
     }).join("");
-    const orders = hs.filter((h) => h.pending).map((h) => `${h.coin} ${h.pending.kind === "exit" ? "close all" : `${h.pending.usd >= 0 ? "+" : "−"}$${fix(Math.abs(h.pending.usd), 2)}`} paper order, fills at the next open`);
+    const orders = hs.filter((h) => h.pending).map((h) => `${h.coin} ${h.pending.kind === "exit" ? "close all" : `${h.pending.usd >= 0 ? "+" : "−"}$${fix(Math.abs(h.pending.usd), 2)}`} ${modeWord()} order, fills at the next open`);
     const dts = hs.map((h) => h.decided_ts).filter((x) => x != null);
     set(M.read, !decided ? "PREVIEW · first decision at the next 00:00 close"
       : `decided at the ${ymd(Math.max(...dts)).slice(5)} close · ${orders.length ? orders.join(" · ") : "no order waiting"}`);
@@ -398,10 +462,16 @@
   function countdown(now) {
     const c = closes(now), vt = basket();
     set(M.next1, `NEXT ${vt ? "DECISION" : (B.header.interval || "").toUpperCase() + " CLOSE"} ${hhmm(c.next)} UTC IN ${clock(c.next - now)}`);
-    if (!c.missed) { set(M.next2, vt ? "the close re-computes the averages and vol" : "the first desk run after it decides it"); return; }
+    const braked = !vt && !B.ticker.pos && brake();
+    if (!c.missed) { if (M.next2.title) M.next2.title = ""; set(M.next2, vt ?"the close re-computes the averages and vol" : braked ? "the first desk run after it checks again" : "the first desk run after it decides it"); return; }
     const when = c.list.map((t) => (vt ? ymd(t).slice(5) + " " : "") + hhmm(t)).join(", ");
-    set(M.next2, c.missed <= 2 ? `${when} closed since the run · the next run decides`
-      : `${c.missed} closes since the run (${when}, …) · the next desk run decides each`);
+    const verb = braked ? "checks" : "decides";
+    // a narrow phone: one line (the times are in the title); otherwise the closes by name
+    const tip = `closed since the run: ${when}${c.missed > c.list.length ? ", …" : ""}`;
+    if (M.next2.title !== tip) M.next2.title = tip;
+    set(M.next2, narrow.matches && c.missed > 1 ? `${c.missed} closes since the run wait for the next desk run`
+      : c.missed <= c.list.length ? `${when} closed since the run · the next run ${verb} ${c.missed > 1 ? "each" : "it"}`
+      : `${c.missed} closes since the run (${when}, …) · the next desk run ${verb} each`);
   }
 
   // ---- the desk log: the last run's steps, as numbered lines ----------------------------------------------
@@ -410,6 +480,12 @@
     const cr = (agentOf("crawler") || {}).stats || {}, cl = last(ch.candles), bar = ch.bar_ms;
     const iv = h.interval || "", out = [];
     const L1 = (tag, text, v, cls, w) => out.push({ tag, text, v, cls, w });
+    // this run's events, in the order the desk ran them (desk/paper.py step): everything before the newest close's
+    // checks (fills at earlier bars' opens, earlier closes' decisions, the brakes and stop changes at the newest close),
+    // then that close's checks, then its decision and what filled after it (the forming bar)
+    const ev = pp.new_events || [], closeAt = cl ? cl[0] + bar : null;
+    const before = (e) => closeAt != null && (e.ts < closeAt || (e.ts === closeAt && e.agent !== "chief"));
+    const evLine = (e) => L1((e.agent || "").toUpperCase(), `${hhmm(e.ts)} ${e.text}`, null, "act-ev");
     L1("RUN", `#${pp.runs ?? "—"} on this ledger · ${h.coin} · ${(h.mode || "").toLowerCase()} · board built ${hms(b.updated)} UTC`);
     L1("CRAWL", `${(cr.bars ?? ch.candles.length).toLocaleString("en-US")} ${iv} candles + ${cr.funding ?? 0} funding prints · ${cr.requests ?? "—"} requests to Hyperliquid`);
     if (cl) {
@@ -420,7 +496,12 @@
       else if (!n) L1("CRAWL", `0 new closes this run: ${hhmm(closeTs)} was decided by an earlier run; the gates were re-checked against it`);
       else {
         const ts = []; for (let k = n - 1; k >= 0 && ts.length < 4; k--) ts.push(hhmm(closeTs - k * bar));
-        L1("CRAWL", `${n} new close${n > 1 ? "s" : ""} this run (${n > 4 ? "…, " : ""}${ts.join(", ")}), each decided in turn`);
+        L1("CRAWL", n > 1 ? `${n} new closes this run (${n > 4 ? "…, " : ""}${ts.join(", ")}), each decided in turn` : `1 new close this run (${ts[0]}), decided by this run`);
+      }
+      const early = ev.filter(before);
+      if (early.length) {
+        L1("", `── THIS RUN, BEFORE THE ${hhmm(closeAt)} CLOSE'S CHECKS`, null, "act-ph"); early.forEach(evLine);
+        L1("", `── THE ${hhmm(closeAt)} CLOSE`, null, "act-ph");
       }
       const ef = last(ch.ema_fast), es = last(ch.ema_slow);
       const fe = r ? `${r.ema_fast}-EMA` : "fast EMA", se = r ? `${r.ema_slow}-EMA` : "slow EMA";
@@ -453,9 +534,9 @@
       L1("SIZE", pos ? `on now: ${q}` : /^GO/.test(chief && chief.value) ? `${q} · order placed, fills at the next open`
         : `had it entered at that close: ${q} · not traded`);
     }
-    const ev = pp.new_events || [];
-    if (ev.length) ev.forEach((e) => L1((e.agent || "").toUpperCase(), `${hhmm(e.ts)} ${e.text}`, null, "act-ev"));
-    else L1("FILLS", "no new orders or fills this run");
+    const late = ev.filter((e) => !before(e));
+    if (late.length) late.forEach(evLine);
+    else if (!ev.length) L1("FILLS", "no new orders or fills this run");
     return out;
   }
   function vtLines() {
@@ -469,6 +550,15 @@
       : n ? `${n} new daily close${n > 1 ? "s" : ""} this run, each decided in turn`
       : decided ? "0 new daily closes this run: the last close was decided by an earlier run"
       : "0 new daily closes this run · PREVIEW: what the rule sees at the last close; the first decision is at the next 00:00 close");
+    // this run's events in the desk's order (desk/paper.py step_basket): fills at earlier opens and earlier closes'
+    // decisions first, then the newest close's decision, then the fills at the forming bar's open
+    const ev = pp.new_events || [], T = bk.last_close_ts;
+    const evLine = (e) => L1((e.agent || "").toUpperCase(), `${ymd(e.ts).slice(5)} ${hhmm(e.ts)} ${e.text}`, null, "act-ev");
+    const early = T ? ev.filter((e) => e.ts < T) : [];
+    if (early.length) {
+      L1("", `── THIS RUN, BEFORE THE ${ymd(T).slice(5)} CLOSE`, null, "act-ph"); early.forEach(evLine);
+      L1("", `── THE ${ymd(T).slice(5)} CLOSE`, null, "act-ph");
+    }
     bk.holdings.forEach((h) => {
       L1("CALC", h.sma50 == null ? `${h.coin} warming up the ${r.sma_bars}-day average` :
         `${h.coin} close ${usd(h.close)} vs ${r.sma_bars}-day avg ${usd(h.sma50)}`, h.sma50 == null ? null : h.above_sma ? "ABOVE" : "BELOW");
@@ -480,9 +570,9 @@
         : h.qty > 0 ? `HOLD ${fix(h.held_units, 2)} units` : "FLAT"), null, o ? "act-ev" : "");
     });
     L1("CHIEF", `${bk.orders.filled} fills so far · ${bk.orders.blocked} orders skipped by the $${r.min_order_usd} minimum`);
-    const ev = pp.new_events || [];
-    if (ev.length) ev.forEach((e) => L1((e.agent || "").toUpperCase(), `${ymd(e.ts).slice(5)} ${hhmm(e.ts)} ${e.text}`, null, "act-ev"));
-    else L1("FILLS", "no new orders or fills this run");
+    const late = ev.filter((e) => !early.includes(e));
+    if (late.length) late.forEach(evLine);
+    else if (!ev.length) L1("FILLS", "no new orders or fills this run");
     return out;
   }
   const SHORT_SHOW = 12;
@@ -550,16 +640,22 @@
       const exp = B.header.shorts && B.header.experiment && o.side === "short" ? " · shorts: paper experiment" : "";
       if (o.pos) {
         rows.push(["STOP", `${usd(o.pos.stop)} from the last run · ${pct(o.stopPct)} away${o.stopAtr != null ? ` · ${o.stopAtr.toFixed(1)} ATR` : ""}`, o.through ? "act-hot" : ""]);
-        rows.push(["P&L", `${o.pnl >= 0 ? "+" : ""}${usd(o.pnl)} at ${mid$(o.mid)} · ${o.pos.side} ${o.pos.qty} from ${usd(o.pos.entry)} · paper, before exit fees`, o.pnl >= 0 ? "act-up" : "act-dn"]);
+        // the price move only: the entry fee and funding are already out of the account's cash, the exit fee to come
+        rows.push(["POSITION", `${o.pos.side} ${o.pos.qty} from ${usd(o.pos.entry)} · price move ${o.pnl >= 0 ? "+" : ""}${usd(o.pnl)} at ${mid$(o.mid)}, before fees and funding · ${modeWord()}`, ""]);
+      } else if (o.brake) {
+        rows.push(["ENTRIES", `none: ${o.brake[0]}, ${o.brake[1]} · as of the last run, ${hhmm(B.updated)} UTC`, ""]);
       } else if (o.side) {
-        const head = o.side === "short" ? "SHORT LINE" : "BUY LINE";
+        const head = o.side === "short" ? "SHORT LINE" : "BUY LINE", way = o.side === "short" ? "lower" : "higher";
+        const cond = o.bound ? `if the trend still says ${o.side.toUpperCase()} · ` : "";
         if (o.level == null) rows.push([head, `unknown until the next desk run: the run's bars have aged out of the window`, ""]);
-        else if (o.bound) rows.push([head, `at ${o.side === "short" ? "most" : "least"} ${usd(o.level)} · ${pct(o.pct)} or more away · the closes since the last run can only ${o.side === "short" ? "lower" : "raise"} it${exp}`, ""]);
+        else if (o.bound && o.past) rows.push([head, `${cond}at ${o.side === "short" ? "most" : "least"} ${usd(o.level)} · the price is past that bound; the real line could be ${way} · known at the next desk run${exp}`, ""]);
+        else if (o.bound) rows.push([head, `${cond}at ${o.side === "short" ? "most" : "least"} ${usd(o.level)} · ${pct(o.pct)} or more away · the closes since the last run can only move it ${way}${exp}`, ""]);
         else if (o.past) rows.push([head, `${usd(o.level)} · a ${iv} close past it would clear the setup check; every check re-runs at the close${exp}`, "act-hot"]);
         else rows.push([head, `${usd(o.level)} · ${pct(o.pct)} away (${usd(o.gap, 2)}) · a close here: setup WAIT${exp}`, ""]);
       } else rows.push(["LINE", `none: the trend says ${(B.analysis.direction || "—").toUpperCase()} and this account takes longs only`, ""]);
       if (o.ef != null) {
-        const side = o.ef >= o.es ? "LONG" : "SHORT", near = Math.abs(o.ef - o.es) < 1 || usd(o.ef) === usd(o.es);
+        // the board's EMAs are rounded to cents: "≈" only when the gap is inside that rounding, or too small to show
+        const side = o.ef >= o.es ? "LONG" : "SHORT", near = Math.abs(o.ef - o.es) < 0.02 || usd(o.ef) === usd(o.es);
         const was = (B.analysis.direction || "").toUpperCase(), r = o.rules;
         rows.push(["TREND IF IT CLOSED HERE", `${side}${near ? " ≈" : ""} · ${r.ema_fast}-EMA ${usd(o.ef)} ${near ? "≈" : o.ef >= o.es ? "≥" : "<"} ${r.ema_slow}-EMA ${usd(o.es)}${was && was !== side ? ` · flips from ${was}` : ""}`, ""]);
       }
@@ -572,10 +668,11 @@
     const els = L.live.querySelectorAll(".act-lr");
     rows.forEach(([k, v, cls], j) => {
       const e = els[j], s = e.lastElementChild;
+      const changed = !!s.textContent && s.textContent !== v && k !== "PRICE" && k !== "PRICES";
       set(e.firstElementChild, k);
-      if (s.textContent && s.textContent !== v && k !== "PRICE" && k !== "PRICES") flash(s);
       set(s, v);
-      s.className = cls;
+      if (s.className !== cls) s.className = cls;
+      if (changed) flash(s);
     });
   }
 
@@ -626,12 +723,12 @@
     const kb = e && e.decodedBodySize ? ` · ${(e.decodedBodySize / 1024).toFixed(1)} KB` : "";
     if (kind === "new") tapeAdd(`${hms(now)} NEW RUN · board built ${hms(B.updated)} UTC${kb}`, "act-ev");
     else if (kind === "first") tapeAdd(`${hms(now)} board read${kb} · last run ${hms(B.updated)} UTC`, "act-bd");
-    else tapeAdd(`${hms(now)} board re-read${kb} · no new run since ${hms(B.updated)}`, "act-bd");
+    else tapeAdd(`${hms(now)} board re-read${kb} · no new board since ${hms(B.updated)} UTC`, "act-bd");
   }
 
   // ---- the desk runs heartbeat: the last run's boards, account by account -------------------------------------
   function beat(now) {
-    const old = stale(now), mins = CRON.split(" ")[0].split(",").map((m) => ":" + m.padStart(2, "0")).join(" ");
+    const old = stale(now), lost = unread(now), mins = CRON.split(" ")[0].split(",").map((m) => ":" + m.padStart(2, "0")).join(" ");
     const pp = B.paper || {};
     let chips = "", built = "";
     if (IDX && IDX.coins) {
@@ -641,9 +738,10 @@
     } else chips = `<span class="act-hb me">${esc(shown)} ${hms(B.updated)}</span><i>live server</i>`;
     const bad = IDX && IDX.coins ? IDX.coins.filter((c) => c.error) : [];
     L.beat.innerHTML = `<div class="act-hbs">${chips}</div>` +
-      `<div class="${old ? "act-warn" : ""}">${old ? `no desk run for ${ago(now - B.updated)}` : `last run ${ago(now - B.updated)} ago`}${built} · run #${pp.runs ?? "—"} on this ledger</div>` +
+      (lost ? `<div class="act-warn">can't read the board since ${hms(lastRead)} · the one shown was built ${hms(B.updated)} UTC</div>` : "") +
+      `<div class="${old ? "act-warn" : ""}">${old ? `no new board for ${ago(now - B.updated)}` : `last run ${ago(now - B.updated)} ago`}${built} · run #${pp.runs ?? "—"} on this ledger</div>` +
       bad.map((c) => `<div class="act-warn">${esc(c.coin)} step failed: ${esc(c.error.slice(0, 60))}</div>`).join("") +
-      (staticBoard ? `<div class="act-dim">scheduled ${mins} UTC · GitHub skips many; an hourly backup run makes sure each 2h close is picked up</div>` : "");
+      (staticBoard ? `<div class="act-dim">scheduled ${mins} UTC · GitHub skips many runs · a late run catches up on every close it missed</div>` : "");
   }
 
   // ---- research: backtests and audits, from research.json (verbatim quotes, pinned by a test) ------------------
@@ -667,14 +765,21 @@
         text = text.replace("{next}", nx ? ymd(nx) : "—").replace("{days}", nx ? Math.round((nx - today) / DAY) : "—")
           .replace("{from}", s.new_data_from).replace("{have}", Math.max(0, Math.floor((now - from) / DAY))).replace("{need}", s.need_days);
       }
-      const src = [x.src, x.src2].filter(Boolean).map((p) => p.split("/").pop()).join(" · ");
-      const q = (Array.isArray(x.quote) ? x.quote : [x.quote]).join(" … ").replace(/\*\*|`/g, "");
+      const qs = Array.isArray(x.quote) ? x.quote : [x.quote];   // a quote is from src, or {src, text} from its own file
+      const src = [...new Set([x.src, x.src2, ...qs.map((q) => q && q.src)].filter(Boolean).map((p) => p.split("/").pop()))].join(" · ");
+      const q = qs.map((q) => (typeof q === "string" ? q : q.text)).join(" … ").replace(/\*\*|`/g, "");
       return `<div class="act-rs" title="${esc(q)}"><b>${esc(x.tag)}</b> ${esc(text)} <i>${esc(src)}</i></div>`;
     }).join("");
   }
-  fetch("research.json", { cache: "no-cache" }).then((r) => (r.ok ? r.json() : null)).then((d) => {
-    if (d && Array.isArray(d.items)) { research = d; rschKey = ""; drawResearch(Date.now()); }
-  }).catch(() => { /* the block stays empty: nothing is shown that the repo's files don't say */ });
+  // read once, when the log first comes into view (its last block): not in the first screen's loading
+  let rschAsked = false;
+  function loadResearch() {
+    if (rschAsked) return;
+    rschAsked = true;
+    fetch("research.json", { cache: "no-cache" }).then((r) => (r.ok ? r.json() : null)).then((d) => {
+      if (d && Array.isArray(d.items)) { research = d; rschKey = ""; drawResearch(Date.now()); }
+    }).catch(() => { /* the block stays empty: nothing is shown that the repo's files don't say */ });
+  }
 
   function footer() {
     const bad = Object.entries(modes).filter(([, m]) => m && m !== "PAPER");
@@ -706,6 +811,7 @@
     if (!d.board || !d.board.header) return;
     const now = Date.now(), first = !B, switched = d.coin !== shown, fresh = !first && !switched && d.updated !== shownUpdated;
     if (switched || first) cancelAll();
+    lastRead = now; unreadSaid = false;
     B = d.board; IDX = d.index || null; staticBoard = d.static !== false;
     mon.classList.remove("act-wait"); log.classList.remove("act-wait");
     modes[d.coin] = B.header.mode;
@@ -724,10 +830,11 @@
         if (logOn) playLog(); else logPending = true;
       }
       const fills = (B.paper && B.paper.new_events || []).some((x) => TRADE.test(x.text));
-      if (fills) flash(M.dot, "act-fill");
+      if (!stale(now)) flash(M.dot, fills ? "fill" : "read");
       tapeBoard(now, first || switched ? "first" : "new");
     } else {
       beat(now);
+      if (!stale(now)) flash(M.dot, "read");      // the dot blinks when a board is read: a real event, not a timer
       tapeBoard(now, "same");
     }
     clockRun();
@@ -736,7 +843,7 @@
     const d = e.detail || {};
     if (!d.mids) return;
     mids = d.mids; midsAt = d.at || Date.now();
-    if (!B) return;
+    if (!B || document.hidden) return;     // hidden: keep the price; the clock redraws it when the page is back
     const now = Date.now();
     if (basket()) vtLive(now); else meter(now);
     liveRows(now);
@@ -747,7 +854,7 @@
     if (document.hidden) {           // hidden: finish what was playing, at its final state
       if (runs.strip) finishStrip();
       if (runs.log) playLog();
-    }
+    } else visibleSince = Date.now();   // a hidden tab's re-reads may have been held back: give them time to land
     clockRun();
   });
   if (reduced.addEventListener) reduced.addEventListener("change", () => { if (reduced.matches) { if (runs.strip) finishStrip(); if (runs.log) playLog(); } });

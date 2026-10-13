@@ -384,7 +384,7 @@
     }
     const edges = [];
     const mine = Array.isArray(board.agents) ? board.agents : null;   // a card left over from another tab is not a perch
-    document.querySelectorAll(".panel, .card").forEach((el) => {
+    document.querySelectorAll(".panel:not(.act-monitor), .card").forEach((el) => {   // not on the monitor's live numbers
       if (mine && el.classList.contains("card") && !mine.includes(el.id.replace(/^card-/, ""))) return;
       const b = box(el);
       if (!b || b.w < S * 3) return;

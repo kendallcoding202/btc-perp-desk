@@ -18,9 +18,14 @@ def _flat(text: str) -> str:
     return re.sub(r"\s+", " ", text)
 
 
+def _sourced(item) -> list[tuple[str, str]]:
+    """(source file, quote) pairs: a plain quote is from the item's src, a {src, text} one from the file it names."""
+    q = item["quote"] if isinstance(item["quote"], list) else [item["quote"]]
+    return [(x["src"], x["text"]) if isinstance(x, dict) else (item["src"], x) for x in q]
+
+
 def _quotes(item) -> list[str]:
-    q = item["quote"]
-    return q if isinstance(q, list) else [q]
+    return [t for _, t in _sourced(item)]
 
 
 def test_every_item_is_well_formed():
@@ -31,13 +36,13 @@ def test_every_item_is_well_formed():
         assert x["tag"] in {"RE-AUDIT", "HUNT", "BACKTEST", "CHECK"}, x["id"]
         assert x["text"] and _quotes(x) and all(_quotes(x)), x["id"]
         assert (ROOT / x["src"]).is_file(), x["src"]
+        assert all((ROOT / src).is_file() for src, _ in _sourced(x)), x["id"]
 
 
 def test_every_quote_is_verbatim_from_its_source():
     for x in ITEMS:
-        src = _flat((ROOT / x["src"]).read_text())
-        for q in _quotes(x):
-            assert _flat(q) in src, f"{x['id']}: not in {x['src']}: {q!r}"
+        for path, q in _sourced(x):
+            assert _flat(q) in _flat((ROOT / path).read_text()), f"{x['id']}: not in {path}: {q!r}"
 
 
 def test_every_number_shown_is_in_its_quote():
@@ -72,6 +77,18 @@ def test_each_account_gets_its_own_backtest_and_check_and_no_one_elses():
     assert "no demonstrated edge" in sol
     assert "switched on after missing their own bar" in " ".join(x["text"] for x in ITEMS if x["tab"] == "ETH")
     assert "0.5–0.7" in " ".join(x["text"] for x in ITEMS if x["tab"] == "VT")
+
+
+def test_desk_backtests_say_which_years_were_seen():
+    """A desk account's 2020–23 Sharpe is the years its rules were picked on; ETH's and SOL's 2024–26 is only partly
+    unseen (their 2% risk was picked after ETH's 2024). VT's best backtest comes with its Hyperliquid figure."""
+    text = {x["id"]: x["text"] for x in ITEMS}
+    for k in ("btc", "eth", "sol"):
+        assert "picked on" in text[f"{k}-backtest"], k
+    for k in ("eth", "sol"):
+        assert "only partly unseen" in text[f"{k}-backtest"], k
+    vt = " ".join(x["text"] for x in ITEMS if x["tab"] == "VT")
+    assert "0.18–0.44" in vt and "many-trials luck test" in vt
 
 
 def test_no_return_percentages_or_promises():

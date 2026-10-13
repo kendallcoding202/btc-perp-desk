@@ -1,17 +1,18 @@
 /* The desk monitor and the desk log (activity.js). Built on style.css's tokens. Only opacity, transform and
-   filter move, and only on a real event; reduced motion holds everything still. REPLAY is blue, LIVE is green. */
+   filter move, and only on a real event; reduced motion holds everything still. REPLAY is blue, LIVE is green.
+   Text is --muted at the least (WCAG AA on the panel); --dim is for decoration only: line numbers and arrows. */
 
 /* ---- the desk monitor: under the account tabs ---------------------------------------------------------- */
-.act-monitor { padding: 7px 8px; display: grid; gap: 4px; align-content: start; min-height: 176px; font-size: 10.5px;
+.act-monitor { padding: 7px 8px 12px; display: grid; gap: 4px; align-content: start; min-height: 182px; font-size: 10.5px;
   line-height: 13px; color: var(--muted); min-width: 0; }
 .act-monitor > * { min-width: 0; }
-.act-status { display: flex; align-items: center; gap: 6px; min-height: 32px; }
+.act-status { display: flex; align-items: center; gap: 6px; min-height: 24px; }
 .act-pill { font-family: var(--pixel); font-size: 10px; letter-spacing: .12em; color: var(--yellow); border: 1px solid currentColor;
   padding: 0 4px; border-radius: 2px; line-height: 12px; flex: none; }
 .act-pill.act-livemode { color: var(--red); }
-.act-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); flex: none; animation: act-pulse 1.6s infinite; }
-.act-dot.act-stale { background: transparent; border: 1px solid var(--muted); animation: none; }
-.act-dot.act-fill { animation: act-fill .6s 1; }
+/* steady: it blinks only when a board is read (activity.js), since the desk isn't running between its runs */
+.act-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); flex: none; }
+.act-dot.act-stale { background: transparent; border: 1px solid var(--muted); }
 .act-st { color: var(--text); font-size: 10px; letter-spacing: .02em; flex: 1; min-width: 0; }
 .act-st.act-warn, .act-warn { color: var(--orange); }
 .act-err { color: var(--red); font-size: 10px; }
@@ -24,10 +25,11 @@
 .act-big b { font-size: 18px; color: var(--white); font-variant-numeric: tabular-nums; flex: none; }
 .act-big span { line-height: 14px; min-width: 0; }
 .act-big b.act-hot { color: var(--yellow); }
+.act-big b.act-word { font-size: 15px; letter-spacing: .02em; }
 .act-up { color: var(--green) !important; }
 .act-dn { color: var(--red) !important; }
 .act-scale { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; grid-template-areas: "e0 tr e1"; column-gap: 6px; row-gap: 2px; align-items: center; }
-.act-end { font-size: 10px; line-height: 12px; color: var(--dim); }
+.act-end { font-size: 10px; line-height: 12px; color: var(--muted); }
 .act-end:first-child { grid-area: e0; } .act-end:nth-child(3) { grid-area: e1; }
 .act-track { grid-area: tr; position: relative; height: 10px; overflow: hidden;
   background: linear-gradient(var(--line), var(--line)) center / 100% 4px no-repeat,
@@ -37,8 +39,10 @@
 .act-mk::before { content: ""; position: absolute; left: 0; top: 0; width: 4px; height: 10px; background: var(--white); border-radius: 1px; }
 .act-mk.act-past::before { background: var(--yellow); }
 .act-mk[hidden] { display: none; }
-.act-ticks { grid-area: tk; display: none; justify-content: space-between; font-size: 10px; line-height: 12px; color: var(--dim); }
-.act-xp { display: block; font-family: var(--pixel); font-size: 10px; line-height: 13px; letter-spacing: .04em; color: var(--orange); }
+.act-off .act-mk, .act-hidden .act-mk { transition: none; }   /* off screen or a hidden tab: it jumps, nothing glides */
+.act-noscale .act-scale { display: none; }
+.act-ticks { grid-area: tk; display: none; justify-content: space-between; font-size: 10px; line-height: 12px; color: var(--muted); }
+.act-xp { display: block; font-size: 10px; line-height: 13px; letter-spacing: .02em; color: var(--orange); }
 .act-xp:empty { display: none; }
 .act-cap { font-size: 10px; color: var(--muted); }
 
@@ -87,7 +91,8 @@
 .act-next { font-size: 10px; color: var(--text); }
 .act-next > span { display: block; }
 .act-next > span + span { color: var(--muted); }
-.act-jump { flex: none; align-self: center; min-height: 32px; margin-left: auto; font-family: var(--pixel); font-size: 10px; letter-spacing: .06em;
+/* a 32 px tap target that overhangs its 24 px row by 4 px at each end (into the padding and the gap), so the row stays short */
+.act-jump { flex: none; align-self: center; min-height: 32px; margin: -4px 0 -4px auto; font-family: var(--pixel); font-size: 10px; letter-spacing: .06em;
   color: var(--pink); background: transparent; border: 1px solid var(--line); padding: 0 8px; border-radius: 2px; cursor: pointer; }
 
 /* ---- the desk log -------------------------------------------------------------------------------------- */
@@ -110,12 +115,12 @@
 .act-v.v-MARK { color: var(--yellow); } .act-v.v-SKIP { color: var(--muted); }
 .act-lines .act-ph { color: var(--pink); font-size: 10px; margin-top: 3px; }
 .act-lines .act-note { color: var(--muted); }
-.act-lines .act-dim { color: var(--dim); }
-.act-lines .act-after { opacity: .7; }
+.act-lines .act-dim { color: var(--muted); }
+.act-lines .act-after { opacity: .9; }
 .act-lines .act-ev { color: var(--yellow); }
 .act-lines.act-rp li { opacity: 0; transition: opacity .2s; }
 .act-lines.act-rp li.on { opacity: 1; }
-.act-lines.act-rp li.on.act-after { opacity: .7; }
+.act-lines.act-rp li.on.act-after { opacity: .9; }
 .act-lines.act-rp li.cur .act-t::before { content: "▌"; position: absolute; left: 0; color: var(--green); animation: act-caret .5s steps(2) infinite; }
 .act-short li:nth-last-child(n+13) { display: none; }
 
@@ -126,9 +131,10 @@
 .act-lr b { color: var(--muted); font-weight: 600; font-size: 10px; }
 .act-lr .act-hot { color: var(--yellow); }
 .act-tape { display: grid; border-top: 1px dotted var(--line); padding-top: 4px; }
-.act-tape > div { font-size: 10px; line-height: 14px; height: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--dim); }
+.act-tape > div { font-size: 10px; line-height: 14px; height: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--muted); }
 .act-tape > div.act-new { color: var(--text); }
 .act-tape > div.act-ev { color: var(--yellow); }
+.act-tape > div.act-warn { color: var(--orange); }
 .act-tape > b { font-family: var(--pixel); font-size: 10px; font-weight: 400; letter-spacing: .04em; color: var(--muted); line-height: 14px; }
 .act-tape > div:nth-of-type(-n+3) { display: none; }   /* a phone: the newest 3 */
 .act-beat { display: grid; gap: 3px; font-size: 10px; line-height: 14px; color: var(--muted); border-top: 1px dotted var(--line); padding-top: 6px; }
@@ -137,29 +143,36 @@
 .act-hb { border: 1px solid var(--line); border-radius: 2px; padding: 0 4px; color: var(--text); }
 .act-hb.me { border-color: var(--pink); }
 .act-hb.bad { border-color: var(--red); color: var(--red); }
-.act-dim { color: var(--dim); }
+.act-dim { color: var(--muted); }
 .act-rsch { display: grid; gap: 4px; font-size: 10.5px; line-height: 14px; color: var(--text); border-top: 1px dotted var(--line); padding-top: 6px; }
 .act-rsch:empty { display: none; }
 .act-rsh { font-family: var(--pixel); font-size: 10px; letter-spacing: .04em; color: var(--orange); }
 .act-rs b { font-family: var(--pixel); font-size: 10px; font-weight: 400; color: var(--orange); margin-right: 4px; }
-.act-rs i { font-style: normal; color: var(--dim); font-size: 10px; margin-left: 4px; }
+.act-rs i { font-style: normal; color: var(--muted); font-size: 10px; margin-left: 4px; }
 .act-foot { font-size: 10px; line-height: 14px; color: var(--muted); padding: 6px 10px 8px; border-top: 1px solid var(--line); }
 .act-foot.act-livemode { color: var(--red); }
 
-/* motion: one-shot, on real events only */
-.act-flash { animation: act-flash .6s 1; }
-@keyframes act-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
-@keyframes act-fill { 0%, 100% { background: var(--yellow); transform: scale(1.6); } }
+/* motion: one-shot, on real events only (the value flashes run in activity.js, with the Web Animations API) */
 @keyframes act-blink { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
 @keyframes act-caret { 0% { opacity: 1; } 100% { opacity: 0; } }
-@keyframes act-flash { from { filter: brightness(1.9); } to { filter: none; } }
-.act-off .act-dot, .act-hidden .act-dot, .act-off .act-flash, .act-hidden .act-flash { animation-play-state: paused; }
 
 /* a phone: the monitor straight under the tabs, the log after the chart (style.css orders the rest) */
 @media (max-width: 560px) {
   .act-monitor { order: 1; }
   .act-log { order: 3; }
   .act-lines li { padding-left: 9px; grid-template-columns: 46px minmax(0, 1fr) auto; }
+  .act-st > span:first-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; }
+  .act-st.act-warn > span:first-child { white-space: normal; }     /* a warning wraps rather than lose its end */
+}
+/* a narrow phone: one status line, and the basket tab's title on one line, so the monitor's moving rows stay in the
+   first screen; a short one (an iPhone SE in Safari shows ~548 px) drops the countdown's second, explaining line */
+@media (max-width: 420px) {
+  .act-jw { display: none; }
+  .kind-basket .brand h1 { font-size: 16px; }
+}
+@media (max-width: 560px) and (max-height: 600px) {
+  .act-monitor { min-height: 168px; }
+  .act-next > span + span { display: none; }
 }
 /* desktop: the monitor is one band in three columns; the log is two columns, its steps in a scroll box */
 @media (min-width: 980px) {
@@ -168,7 +181,7 @@
     grid-template-areas: "st me sp" "er me sp" "nx me sp"; }
   .act-status { grid-area: st; flex-wrap: wrap; row-gap: 3px; min-height: 0; }
   .act-st { flex: 1 1 100%; order: 3; }
-  .act-status .act-jump { margin-left: auto; min-height: 28px; }
+  .act-status .act-jump { margin: 0 0 0 auto; }
   .act-scale { grid-template-columns: minmax(0, 1fr); grid-template-areas: "tr" "tk"; }
   .act-end { display: none; }
   .act-ticks { display: flex; }
@@ -176,14 +189,11 @@
   .act-meter, .act-vtl { grid-area: me; }
   .act-strip { grid-area: sp; }
   .act-next { grid-area: nx; align-self: end; }
-  .act-nodes { margin-bottom: 13px; }
-  .kind-basket .act-nodes { margin-bottom: 0; }
   .act-wd, .act-cnt .c-info, .act-cnt .c-skip { display: inline; }
-  .act-grp { min-width: 34px; }
-  .act-grp::after { content: attr(data-g); position: absolute; left: 0; top: 16px; font-size: 10px; line-height: 12px; color: var(--dim); white-space: nowrap; }
+  .act-grp::after { content: attr(data-g); position: absolute; left: 0; top: 16px; font-size: 10px; line-height: 12px; color: var(--muted); white-space: nowrap; }
   .act-log { min-height: 400px; }
   .act-lbody { grid-template-columns: minmax(0, 55fr) minmax(0, 45fr); gap: 18px; padding: 10px 14px; }
-  .act-lines { max-height: 300px; overflow-y: auto; overscroll-behavior: contain; padding-right: 4px; }
+  .act-lines { max-height: 300px; overflow-y: auto; padding-right: 4px; }   /* at its ends the wheel scrolls the page */
   .act-lines li { grid-template-columns: 44px 54px minmax(0, 1fr) auto; }
   .act-lines li::before { display: block; }
   .act-short li:nth-last-child(n+13) { display: grid; }
@@ -192,7 +202,14 @@
   .act-tape > div:nth-of-type(-n+3) { display: block; }
   .act-foot { padding: 6px 14px 8px; }
 }
+/* the gate strip's group labels need room: from 1100 px; between 980 and 1099 the strip is too narrow for them */
+@media (min-width: 980px) and (max-width: 1099px) { .act-grp::after { display: none; } }
+@media (min-width: 1100px) {
+  .act-grp { min-width: 34px; }
+  .act-nodes { margin-bottom: 13px; }
+  .kind-basket .act-nodes { margin-bottom: 0; }
+}
 @media (prefers-reduced-motion: reduce) {
-  .act-dot, .act-dot.act-fill, .act-node.act-hold, .act-flash, .act-lines.act-rp li.cur .act-t::before { animation: none !important; }
+  .act-node.act-hold, .act-lines.act-rp li.cur .act-t::before { animation: none !important; }
   .act-mk, .act-nodes.act-rp .act-node, .act-nodes.act-rp .act-chip, .act-lines.act-rp li { transition: none !important; }
 }

@@ -57,6 +57,9 @@ def test_schedule_is_the_workflows():
     wf = (ROOT / ".github/workflows/paper.yml").read_text()
     cron = re.search(r'cron: "([^"]+)"', wf).group(1)
     assert re.search(r'const CRON = "([^"]+)";', JS).group(1) == cron
+    # the heartbeat's promise is only what the workflow says: a late run catches up; nothing about a backup run
+    assert "catches up on every bar it\n# missed" in wf and "a late run catches up on every close it missed" in JS
+    assert "backup" not in JS
 
 
 def _bars(n=900, seed=3, start=30_000.0, ms=None):
@@ -123,3 +126,34 @@ def test_the_board_is_read_only_here():
     assert not re.search(r"\bB\.[\w.\[\]]+\s*(=[^=]|\+=|-=)", JS)
     assert not re.search(r"\bB\.[\w.]+\.(push|splice|sort|reverse|pop|shift|unshift)\(", JS)
     assert "Object.assign(B" not in JS
+
+
+def test_every_brake_the_engine_can_pull_is_named():
+    """A KILLS gate that drops holds every new entry: the monitor names it (and shows no buy line). Each gate the engine's
+    kill_gates can drop, and each note manual_kill carries, has its name and its "until" from the engine's own words."""
+    m = re.search(r"const BRAKE = \{(.*?)\n  \};", JS, re.S)
+    brake = {k: (what, until) for k, what, until in re.findall(r'(\w+): \["([^"]+)", "([^"]+)"\]', m.group(1))}
+    p = params_for("BTC")
+    desk = Desk(p, SimBroker(p))
+    names = {g.name for g in desk.kill_gates(0, 150.0)}
+    assert names - {"manual_kill"} <= set(brake), names
+    assert {"flat_kill", "entry_kill"} <= set(brake)
+    engine = (ROOT / "desk/engine.py").read_text()
+    assert "until a human resets it" in engine and brake["drawdown_halt"][1] == "until a human resets it"
+    assert "no entries until tomorrow UTC" in engine and brake["daily_loss"][1] == "until the next UTC day"
+    assert "sitting out" in engine and brake["cooldown"][0] == "losing-streak cooldown"
+    assert 'note="flat_kill" if k.flat_kill else ("entry_kill"' in engine
+    # braked and flat: no distance to a line, in the monitor or the live rows
+    assert "NO NEW ENTRIES" in _function("meter") and "o.brake" in _function("liveRows")
+
+
+def test_it_says_only_what_the_page_can_know():
+    """A board that stops changing may be a desk that didn't run, or a deploy or a fetch that failed: the page says "no
+    new board", and says when it can't read one. The position's figure is the price move, before fees and funding,
+    and the mode word comes from the board, never a hard-coded "paper"."""
+    code = re.sub(r"(?m)^\s*//.*$", "", JS)            # what it prints, not the comments that explain why
+    assert not re.search(r"no desk run", code, re.I)
+    assert "NO NEW BOARD FOR" in JS and "CAN'T READ THE BOARD SINCE" in JS and "CAN'T LOAD THE BOARD" in JS
+    assert "before exit fees" not in JS and JS.count("before fees and funding") == 2
+    for name in ("meter", "liveRows", "vtStrip"):
+        assert not re.search(r"\bpaper\b", _function(name).replace("paper experiment", "")), name

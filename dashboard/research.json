@@ -1,16 +1,12 @@
 {
-  "about": "The research lines in the dashboard's desk log. Hand-written from the repo's research files: every item's quote is copied verbatim from its src, and every number in its text appears in its quote (tests/test_research_digest.py checks both). Backtests and audits only, never live results.",
+  "about": "The research lines in the dashboard's desk log. Hand-written from the repo's research files: every item's quote is copied verbatim from its src (or from the file a quote names), and every number in its text appears in its quotes (tests/test_research_digest.py checks both). Backtests and audits only, never live results.",
   "items": [
     {
       "id": "reaudit", "tab": "all", "tag": "RE-AUDIT",
       "text": "next {next} · in {days} days · new data since {from}: {have} of the {need} days a new idea needs · changes no settings by itself",
       "schedule": {"months": [1, 4, 7, 10], "day": 3, "new_data_from": "2026-10-01", "need_days": 365},
       "src": "research/edge-hunt-2026-10/REAUDIT.md",
-      "quote": [
-        "The re-audit runs on the 3rd of January, April, July and October. It **never changes anything**: no settings, no ledgers, no code on `main`.",
-        "Everything from **2026-10-01** on is new",
-        "**N1** At least **12 months** of new data."
-      ]
+      "quote": ["The re-audit runs on the 3rd of January, April, July and October. It **never changes anything**: no settings, no ledgers, no code on `main`.", "Everything from **2026-10-01** on is new", "**N1** At least **12 months** of new data."]
     },
     {
       "id": "hunt", "tab": "all", "tag": "HUNT",
@@ -18,17 +14,13 @@
       "voted": 11,
       "src": "reports/edge-hunt-2026-10.md",
       "src2": "research/edge-hunt-2026-10/ALL_RESULTS.json",
-      "quote": [
-        "# Edge hunt, October 2026",
-        "About 3,600 rule variations across 9 families, chosen on 2020–23 data only. Then 24 finalists were each scored once on January 2024 to September 2026.",
-        "**One idea passed the pre-set bar, and both checkers called it real but modest:** the vol-trend basket (VT)."
-      ]
+      "quote": ["# Edge hunt, October 2026", "About 3,600 rule variations across 9 families, chosen on 2020–23 data only. Then 24 finalists were each scored once on January 2024 to September 2026.", "**One idea passed the pre-set bar, and both checkers called it real but modest:** the vol-trend basket (VT)."]
     },
     {
       "id": "btc-backtest", "tab": "BTC", "tag": "BACKTEST",
-      "text": "BTC desk, the report's $150 run: Sharpe 1.41 in 2020–23, 0.87 in 2024–26",
+      "text": "BTC desk, the report's $150 run: Sharpe 1.41 in 2020–23, the years its settings were picked on; 0.87 in 2024–26, out of sample",
       "src": "reports/edge-hunt-2026-10.md",
-      "quote": ["## The current desk, at $150", "| | 2020–23 Sharpe | 2024–26 Sharpe | Whole period |", "| BTC | 1.41 | 0.87 |"]
+      "quote": ["## The current desk, at $150", "| | 2020–23 Sharpe | 2024–26 Sharpe | Whole period |", "| BTC | 1.41 | 0.87 |", {"src": "README.md", "text": "Out-of-sample (2024-01 → 2026-09; settings were picked on 2020–23)"}]
     },
     {
       "id": "btc-check", "tab": "BTC", "tag": "CHECK",
@@ -38,9 +30,9 @@
     },
     {
       "id": "eth-backtest", "tab": "ETH", "tag": "BACKTEST",
-      "text": "ETH desk at $150: Sharpe 0.68 in 2020–23, 0.52 in 2024–26 · ETH's shorts were switched on after missing their own bar",
+      "text": "ETH desk at $150: Sharpe 0.68 in 2020–23, the years its rules were picked on; 0.52 in 2024–26, only partly unseen: its 2% risk was picked after seeing ETH's 2024, and ETH's shorts were switched on after missing their own bar",
       "src": "reports/edge-hunt-2026-10.md",
-      "quote": ["## The current desk, at $150", "| | 2020–23 Sharpe | 2024–26 Sharpe | Whole period |", "| ETH | 0.68 | 0.52 |", "ETH's shorts were switched on after missing their own bar."]
+      "quote": ["## The current desk, at $150", "| | 2020–23 Sharpe | 2024–26 Sharpe | Whole period |", "| ETH | 0.68 | 0.52 |", {"src": "README.md", "text": "Out-of-sample (2024-01 → 2026-09; settings were picked on 2020–23)"}, {"src": "README.md", "text": "For ETH and SOL that period is only partly unseen: their 2% risk was picked after seeing ETH's 2024, and ETH's shorts were switched on after missing their own bar"}]
     },
     {
       "id": "eth-check", "tab": "ETH", "tag": "CHECK",
@@ -50,9 +42,9 @@
     },
     {
       "id": "sol-backtest", "tab": "SOL", "tag": "BACKTEST",
-      "text": "SOL desk at $150: Sharpe 0.27 in 2020–23, 0.24 in 2024–26",
+      "text": "SOL desk at $150: Sharpe 0.27 in 2020–23, the years its rules were picked on; 0.24 in 2024–26, only partly unseen: its 2% risk was chosen after seeing a 2024 halt on another account",
       "src": "reports/edge-hunt-2026-10.md",
-      "quote": ["## The current desk, at $150", "| | 2020–23 Sharpe | 2024–26 Sharpe | Whole period |", "| SOL | 0.27 | 0.24 |"]
+      "quote": ["## The current desk, at $150", "| | 2020–23 Sharpe | 2024–26 Sharpe | Whole period |", "| SOL | 0.27 | 0.24 |", "ETH and SOL's 2% risk was chosen after seeing ETH hit the 40% halt in 2024 at 5% risk.", {"src": "README.md", "text": "Out-of-sample (2024-01 → 2026-09; settings were picked on 2020–23)"}]
     },
     {
       "id": "sol-check", "tab": "SOL", "tag": "CHECK",
@@ -62,15 +54,21 @@
     },
     {
       "id": "vt-backtest", "tab": "VT", "tag": "BACKTEST",
-      "text": "VT, fresh $500 start on 2024-01-01 with the $10 minimum order: Sharpe 0.87, worst drop 22%",
+      "text": "VT, fresh $500 start on 2024-01-01 with the $10 minimum order: Sharpe 0.87, worst drop 22% · its rules were chosen on 2020–23 data only",
       "src": "reports/edge-hunt-2026-10.md",
-      "quote": ["3. **Fresh $500 start on 2024-01-01, with the $10 minimum order:** Sharpe 0.87, +62%, worst drop 22%, 4 orders blocked."]
+      "quote": ["3. **Fresh $500 start on 2024-01-01, with the $10 minimum order:** Sharpe 0.87, +62%, worst drop 22%, 4 orders blocked.", "About 3,600 rule variations across 9 families, chosen on 2020–23 data only."]
     },
     {
       "id": "vt-check", "tab": "VT", "tag": "CHECK",
       "text": "VT: both checkers called it real but modest · expect a Sharpe nearer 0.5–0.7 than the backtest's 0.9 · its edge over simply holding the coins is not proven",
       "src": "reports/edge-hunt-2026-10.md",
       "quote": ["both checkers called it real but modest", "its edge over simply holding the coins is not proven. Expect a Sharpe nearer 0.5–0.7 than the backtest's 0.9."]
+    },
+    {
+      "id": "vt-hl", "tab": "VT", "tag": "CHECK",
+      "text": "VT on Hyperliquid's own last ~400 days: Sharpe 0.18–0.44 · it still fails the stricter many-trials luck test",
+      "src": "reports/edge-hunt-2026-10.md",
+      "quote": ["On Hyperliquid over the last ~400 days it scored 0.18–0.44", "It still fails the stricter many-trials luck test"]
     }
   ]
 }
