@@ -97,6 +97,19 @@ class HyperliquidFeed:
     def mid(self) -> float:
         return float(self._post({"type": "allMids"})[self.coin])
 
+    def price_at(self, ts: int) -> float | None:
+        """The coin's price at `ts` (ms): the open of the 1-minute candle it falls in, or of the hour's once the
+        minute is too old (Hyperliquid serves the last 5,000 candles of each interval: about 3.5 days of minutes, 208
+        days of hours). None if neither has it. Live prices a deposit it reads late with this (brokers/live.py)."""
+        for interval, ms in (("1m", 60_000), ("1h", 3600_000)):
+            t0 = ts - ts % ms
+            rows = self._post({"type": "candleSnapshot", "req": {
+                "coin": self.coin, "interval": interval, "startTime": t0, "endTime": t0 + ms - 1}})
+            for r in rows or []:
+                if int(r["t"]) <= ts <= int(r["T"]):
+                    return float(r["o"])
+        return None
+
     @property
     def bar_ms(self) -> int:
         return INTERVAL_SECONDS[self.interval] * 1000

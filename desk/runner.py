@@ -233,7 +233,8 @@ def run(p: Params, mode: str, *, state_dir: str = "state", poll_s: float = 15.0,
     if broker is None:
         from .brokers.live import LiveBroker
         broker = _keep_trying("connecting to the exchange", lambda: LiveBroker(
-            p, state_path=paths["position"], max_notional_usd=max_notional, log=log, clock=clock), **retrying)
+            p, state_path=paths["position"], max_notional_usd=max_notional, log=log, clock=clock,
+            price_at=getattr(feed, "price_at", None)), **retrying)
     elif Path(broker.state_path) != paths["position"]:
         from .brokers.live import LiveSetupError
         raise LiveSetupError(f"the broker keeps its position in {broker.state_path}, not {paths['position']}")
@@ -258,10 +259,12 @@ def run(p: Params, mode: str, *, state_dir: str = "state", poll_s: float = 15.0,
     def on_flow(fl: dict) -> None:
         """A deposit, withdrawal or transfer the broker read from the exchange: money in or out, never profit or loss.
         The brakes are scaled so they read the same percentage, and the units bought or sold at the NAV keep the
-        performance figure unchanged. Once per flow (by id), and never one from before this desk's start."""
-        if fl["id"] in {r["id"] for r in recorded} or fl["ts"] < meta["started_ts"]:
+        performance figure unchanged, both at the account's value when it happened (the broker prices it). Once per
+        flow (by id), and never one the broker read before this desk started: that money is in its start_equity (by
+        the desk's own clock, which the exchange's may not match)."""
+        if fl["id"] in {r["id"] for r in recorded} or fl.get("read_ts", fl["ts"]) < meta["started_ts"]:
             return
-        before = fl["equity_after"] - fl["amount"]
+        before = fl.get("equity_before", fl["equity_after"] - fl["amount"])
         when = time.strftime("%Y-%m-%d", time.gmtime(fl["ts"] / 1000))
         try:
             rec = flows_mod.record(flows_mod.Flow(fl["id"], when, fl["ts"], fl["amount"], "exchange", fl["what"]),
@@ -278,6 +281,8 @@ def run(p: Params, mode: str, *, state_dir: str = "state", poll_s: float = 15.0,
         # still holds the flow (with the value it was read at) and the restart applies it to the desk it saved.
 
     broker.on_flow = on_flow
+    if getattr(broker, "price_at", False) is None and hasattr(feed, "price_at"):
+        broker.price_at = feed.price_at
     for fl in list(broker.flows):       # read while the broker started up (or before a crash), not yet applied
         on_flow(fl)
 
@@ -338,7 +343,13 @@ def run(p: Params, mode: str, *, state_dir: str = "state", poll_s: float = 15.0,
                 if broker.position is not None:
                     desk.say(now, "risk", f"position had no stop. placed one at {broker.position.stop:,.0f}.")
 
-            if now >= meta["last_bar_ts"] + 2 * feed.bar_ms + 5_000:
+            if not getattr(broker, "balance_confirmed", True):
+                # the balance can't be trusted yet (the ledger couldn't be read, or a move isn't explained yet): no
+                # decision on it, so a deposit can't raise the peak or a withdrawal trip the halt. The exchange-side
+                # stop still protects any position; the candles that close meanwhile are caught up once it's confirmed.
+                if now >= meta["last_bar_ts"] + 2 * feed.bar_ms + 5_000:
+                    log(f"bar close waits: the balance isn't confirmed ({broker.unconfirmed_why})")
+            elif now >= meta["last_bar_ts"] + 2 * feed.bar_ms + 5_000:
                 fresh = feed.candles(start_ms=bars[-1].ts - 5 * feed.bar_ms)
                 merged = {b.ts: b for b in bars}
                 merged.update({b.ts: b for b in fresh})

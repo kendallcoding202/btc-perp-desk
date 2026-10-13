@@ -93,6 +93,7 @@ class FakeHyperliquid:
         self.ledger: list[dict] = []              # userNonFundingLedgerUpdates entries, as Hyperliquid returns them
         self.stop_fill_under_new_oid = False      # True: a triggered stop's fill carries a fresh order id
         self.liquidity: dict[str, float] = {}     # symbol -> the most one market (IOC) order finds inside its band
+        self.history = {s: [(0, px)] for s, px in self.marks.items()}   # (ms, mark) at every move: price_at()
 
     # ---- plumbing ---------------------------------------------------------
     def _maybe_fail(self, kind: str) -> None:
@@ -287,6 +288,11 @@ class FakeHyperliquid:
         if on_ledger:
             self.ledger.append({"time": self.now, "hash": "0x%064x" % (len(self.ledger) + 1), "delta": delta})
 
+    def price_at(self, coin: str):
+        """The feed's price_at(ts), in process (Hyperliquid's 1-minute candles): the mark at `ts`."""
+        rows = self.history[f"{coin}/USDC:USDC"]
+        return lambda ts: next((px for t, px in reversed(rows) if t <= ts), None)
+
     def deposit(self, usd: float, **kw):
         self.money(usd, {"type": "deposit", "usdc": f"{usd}"}, **kw)
 
@@ -299,6 +305,7 @@ class FakeHyperliquid:
         symbol = f"{coin}/USDC:USDC"
         self.now += dt_ms
         self.marks[symbol] = price
+        self.history.setdefault(symbol, []).append((self.now, price))
         for oid, o in list(self.resting.items()):
             if o["symbol"] != symbol:
                 continue
@@ -645,7 +652,7 @@ def _run_live(tmp_path, p, bars, funding, start, script, ex=None, desk_meta=None
     logs, steps, wakes, n_step = [], list(script), dict(wake_ms or {}), {"k": 0}
     paths = runner.live_paths(tmp_path / "live", coin)
     broker = LiveBroker(p, exchange=ex, state_path=paths["position"], log=logs.append, sleep=Sleeps(),
-                        clock=lambda: clock["now"])
+                        clock=lambda: clock["now"], price_at=ex.price_at(coin))
 
     def sleep(_):
         if not steps:
@@ -1348,8 +1355,12 @@ def test_money_moved_on_the_exchange_is_read_once_with_its_sign_never_as_pnl(tmp
     ex.money(50.0, {"type": "send", "usdcValue": "50.0", "user": OTHER, "destination": ME, "sourceDex": "spot",
                     "destinationDex": ""})                           # a kind this desk doesn't know: never guessed at
     b.check_stop_price(PRICES["BTC"], ex.now)
-    assert len(b.flows) == 8 and "unknown ledger entry type 'send'" in said[0]
-    assert "+50.00 of it isn't explained" in said[1] and b.flow_gap == said[1]   # and the $50 it moved is alerted
+    assert len(b.flows) == 8 and "unknown ledger entry type 'send'" in said[0] and len(said) == 1
+    assert not b.balance_confirmed and b.cash == pytest.approx(1_131.0)         # the $50 waits for an explanation...
+    ex.now += 130_000
+    b.check_stop_price(PRICES["BTC"], ex.now)
+    assert "+50.00 of it isn't explained" in said[1] and b.flow_gap == said[1]   # ...and then it's alerted
+    assert b.balance_confirmed and b.cash == pytest.approx(1_181.0) and len(said) == 2
 
 
 def test_a_move_in_the_account_nothing_explains_is_alerted_never_guessed(tmp_path):
@@ -1364,7 +1375,13 @@ def test_a_move_in_the_account_nothing_explains_is_alerted_never_guessed(tmp_pat
     assert said == [] and b.flow_gap is None
     ex.money(100.0, {"type": "deposit", "usdc": "100.0"}, on_ledger=False)
     b.check_stop_price(83_400.0, ex.now)
-    assert got == [] and b.flows == [] and len(said) == 1
+    assert said == [] and not b.balance_confirmed          # read the ledger again, and wait for an entry to show up
+    ex.now += 60_000
+    b.check_stop_price(83_400.0, ex.now)
+    assert said == [] and not b.balance_confirmed
+    ex.now += 70_000
+    b.check_stop_price(83_400.0, ex.now)
+    assert got == [] and b.flows == [] and len(said) == 1 and b.balance_confirmed
     assert "+100.00 of it isn't explained" in said[0] and "entry_kill is on" in said[0] and b.flow_gap == said[0]
 
 
@@ -1488,3 +1505,277 @@ def test_live_money_with_no_ledger_entry_is_alerted_and_stops_entries(tmp_path, 
         5_000.0, {"type": "deposit", "usdc": "5000.0"}, on_ledger=False))
     assert "flows" not in saved and kills.get("entry_kill") is True
     assert any("isn't explained" in e["text"] and e["text"].startswith("ALERT") for e in saved["events"])
+
+
+# ---------------------------------------------------------------- money read late, ledger outages, races, restarts
+
+def _down_then_restart(tmp_path, monkeypatch, flow, px_after):
+    """A 2x long on a flat market; the process stops; money moves, then the price; the process restarts. Returns the
+    flows the desk recorded, the last board, the saved risk, and the account's value just before the money moved."""
+    monkeypatch.setattr(Desk, "_manage", lambda self, f, i: [])        # no trailing on the flat test bars
+    p = P.with_(hard={"max_data_age_bars": 1e9})
+    bars, funding = series(n=540, vol=0.0, drift=0.0, start=80_000.0)
+    start = 500
+    ex = FakeHyperliquid({"BTC": 80_000.0}, usdc=10_000.0, slip_bps=0.0)
+    ex.now = bars[start].ts
+    paths = runner.live_paths(tmp_path / "live", "BTC")
+    paths["dir"].mkdir(parents=True)
+    b0 = LiveBroker(p, exchange=ex, state_path=paths["position"], log=lambda *a: None, sleep=Sleeps(),
+                    clock=lambda: ex.now)
+    b0.submit(Order("open", Side.LONG, 0.25, "breakout", stop=40_000.0))
+    b0.execute_now(80_000.0, ex.now)
+    states = []
+
+    class Recorder:
+        def __init__(self, path):
+            pass
+
+        def set(self, state):
+            states.append(state)
+
+    monkeypatch.setattr(runner, "Board", Recorder)
+    _run_live(tmp_path, p, bars, funding, start, [1] * 3, ex=ex,
+              desk_meta={"started_ts": bars[start].ts - 1, "start_equity": 10_000.0})
+    at_flow = ex.cash + ex._upnl()
+    ex.now = bars[start + 4].ts + 1_000                                  # down from here
+    flow(ex)
+    after = ex.cash + ex._upnl()
+    ex.move("BTC", px_after, dt_ms=3_600_000)
+    bars2, funding2 = series(n=540, vol=0.0, drift=0.0, start=px_after)
+    _run_live(tmp_path, p, bars2, funding2, start + 6, [1] * 2, ex=ex)     # the restart
+    saved = json.loads(paths["desk"].read_text())
+    return saved["flows"], states[-1], saved["risk"], at_flow, after, ex.cash + ex._upnl()
+
+
+def test_live_a_flow_read_after_a_restart_is_priced_at_its_own_time(tmp_path, monkeypatch):
+    """The reviewer's case: $10,000 in while the process is down, then BTC -24% on a 2x long. Priced at the restart's
+    balance, the deposit bought units at 0.519 (the fall booked on the old capital): -48% shown, a false halt. At its
+    own time it's 0.999: -24%, no halt. And $5,000 out, then -13.75%: the real 55% drawdown halts."""
+    recs, board, risk, at_flow, after, now = _down_then_restart(tmp_path / "in", monkeypatch,
+                                                                lambda ex: ex.deposit(10_000.0), 60_800.0)
+    assert recs[0]["equity_before"] == pytest.approx(at_flow) and recs[0]["nav"] == pytest.approx(at_flow / 10_000)
+    assert board["ticker"]["pnl_pct"] == pytest.approx(now / after * at_flow / 10_000 - 1, abs=1e-3)   # -24%
+    assert not risk["halted"]
+    recs, board, risk, at_flow, after, now = _down_then_restart(tmp_path / "out", monkeypatch,
+                                                                lambda ex: ex.withdraw(5_000.0), 69_000.0)
+    assert recs[0]["equity_before"] == pytest.approx(at_flow)
+    assert board["ticker"]["pnl_pct"] == pytest.approx(now / after * at_flow / 10_000 - 1, abs=0.005)  # -55%
+    assert risk["halted"] and "55% below peak" in risk["halt_reason"]
+
+
+@pytest.mark.parametrize("readable", [True, False])
+def test_a_flow_read_after_a_sleep_is_priced_at_its_own_time_or_alerted(tmp_path, readable):
+    """The laptop sleeps 8 h with a 2x long open; $10,000 goes in, then BTC falls 24%. With the price at the deposit's
+    minute readable, it's priced at the account's value then. Without it, it's priced now and alerted (entry_kill)."""
+    ex, said, got = FakeHyperliquid(PRICES, usdc=10_000.0, slip_bps=0.0), [], []
+    b = _broker("BTC", ex, tmp_path, sleep=Sleeps(), on_alert=said.append, clock=lambda: ex.now,
+                price_at=ex.price_at("BTC") if readable else None)
+    b.on_flow = got.append
+    b.submit(Order("open", Side.LONG, 0.25, "breakout", stop=40_000.0))
+    b.execute_now(PRICES["BTC"], ex.now)
+    b.check_stop_price(PRICES["BTC"], ex.now)
+    at_flow = ex.cash + ex._upnl()
+    ex.deposit(10_000.0)
+    ex.move("BTC", 62_320.0, dt_ms=8 * 3_600_000)
+    b.check_stop_price(62_320.0, ex.now)
+    if readable:
+        assert got[0]["equity_before"] == pytest.approx(at_flow) and got[0]["priced"] == "at its time"
+        assert said == [] and b.flow_gap is None
+    else:
+        assert got[0]["priced"] == "approximately" and got[0]["equity_before"] == pytest.approx(
+            ex.cash + ex._upnl() - 10_000.0)
+        assert "read 480 min after it happened" in said[0] and "entry_kill is on" in said[0] and b.flow_gap == said[0]
+
+
+class Outage(FakeHyperliquid):
+    """fetch_ledger fails while the exchange's clock is inside `down` (from, to)."""
+    down = None
+
+    def fetch_ledger(self, *a, **k):
+        if self.down and self.down[0] <= self.now < self.down[1]:
+            self.calls.append("ledger")
+            raise ExchangeDown("ledger: 500 Internal Server Error")
+        return super().fetch_ledger(*a, **k)
+
+
+def _flat_with(tmp_path, monkeypatch, ex, money_at, money, n=8, usdc=500.0, first_start=False):
+    bars, funding = series(n=520, vol=0.0, drift=0.0, start=80_000.0)
+    p = P.with_(hard={"max_data_age_bars": 1e9})
+    start = 500
+    when = bars[start + money_at].ts
+    orig = ex.move
+
+    def move(coin, price, fill_at=None, dt_ms=60_000):
+        orig(coin, price, fill_at, dt_ms)
+        if ex.now >= when + 2_000 and not getattr(ex, "done", False):
+            ex.done = True
+            money(ex)
+
+    ex.move = move
+    states = []
+
+    class Recorder:
+        def __init__(self, path):
+            pass
+
+        def set(self, state):
+            states.append(state)
+
+    monkeypatch.setattr(runner, "Board", Recorder)
+    broker, ex, logs = _run_live(tmp_path, p, bars, funding, start, [1] * n, ex=ex,
+                                 desk_meta=None if first_start else {"started_ts": bars[start].ts, "start_equity": usdc},
+                                 desk_state={"risk": {"peak_equity": usdc}})
+    paths = runner.live_paths(tmp_path / "live", "BTC")
+    saved = json.loads(paths["desk"].read_text())
+    kills = json.loads(paths["kills"].read_text()) if paths["kills"].exists() else {}
+    dd = next(g["value"] for g in states[-1]["analysis"]["gates"] if g["name"] == "drawdown_halt")
+    return states, saved, kills, logs, dd, bars, start
+
+
+def test_live_a_ledger_that_cant_be_read_holds_the_bars_and_the_peak_takes_no_deposit(tmp_path, monkeypatch):
+    """The owner's plan ($100 into $500) while the ledger errors for 8 h: before, the bar close raised the peak with
+    the deposit in it and the flow then scaled it again (peak $720, a 16.7% drawdown from nothing). Now the balance
+    isn't trusted until the ledger reads: the bars wait, then are caught up, and the peak is $600."""
+    ex = Outage({"BTC": 80_000.0}, usdc=500.0)
+    bars, _ = series(n=520, vol=0.0, drift=0.0, start=80_000.0)
+    ex.down = (bars[503].ts, bars[505].ts)
+    states, saved, kills, logs, dd, bars, start = _flat_with(tmp_path, monkeypatch, ex, 3, lambda e: e.deposit(100.0))
+    r = saved["risk"]
+    assert [f["amount"] for f in saved["flows"]] == [100.0] and r["peak_equity"] == pytest.approx(600.0)
+    assert dd == pytest.approx(0.0) and not r["halted"] and r["day_start_equity"] == pytest.approx(600.0)
+    assert any("bar close waits: the balance isn't confirmed (the ledger can't be read)" in x for x in logs)
+    assert saved["meta"]["last_bar_ts"] == bars[start + 7].ts                       # and every bar caught up after
+    big = Outage({"BTC": 80_000.0}, usdc=10_000.0)
+    big.down = (bars[503].ts, bars[505].ts)
+    _, saved, _, _, dd, _, _ = _flat_with(tmp_path / "big", monkeypatch, big, 3, lambda e: e.deposit(10_000.0),
+                                          usdc=10_000.0)
+    assert saved["risk"]["peak_equity"] == pytest.approx(20_000.0) and not saved["risk"]["halted"] and dd == 0.0
+    out = Outage({"BTC": 80_000.0}, usdc=7_000.0)
+    out.down = (bars[503].ts, bars[505].ts)
+    _, saved, _, _, dd, _, _ = _flat_with(tmp_path / "out", monkeypatch, out, 3, lambda e: e.withdraw(3_000.0),
+                                          usdc=7_000.0)
+    assert not saved["risk"]["halted"] and dd == pytest.approx(0.0)       # peak $7,000 x 4,000 / 7,000
+
+
+class Racy(FakeHyperliquid):
+    """A deposit credited, and put on the ledger, just after the desk read the ledger and before it reads the
+    balance (from `at` on, once)."""
+    at = None
+
+    def fetch_balance(self, params=None):
+        if self.at is not None and self.now >= self.at and self.calls and self.calls[-1] == "ledger":
+            self.at = None
+            self.deposit(self.racy_usd, dt_ms=1)
+        return super().fetch_balance(params)
+
+
+def test_a_deposit_between_the_ledger_read_and_the_balance_read_is_found_by_reading_again(tmp_path, monkeypatch):
+    ex, said, got = Racy(PRICES, usdc=1_000.0, slip_bps=0.0), [], []
+    b = _broker("BTC", ex, tmp_path, sleep=Sleeps(), on_alert=said.append, clock=lambda: ex.now)
+    b.on_flow = got.append
+    b.check_stop_price(PRICES["BTC"], ex.now)
+    ex.at, ex.racy_usd = ex.now, 1_000.0
+    b.check_stop_price(PRICES["BTC"], ex.now)
+    b.check_stop_price(PRICES["BTC"], ex.now)
+    assert said == [] and b.flow_gap is None and [(f["amount"], f["equity_after"]) for f in got] == [(1_000.0, 2_000.0)]
+    # the runner, the deposit landing that way at a check that also closes a bar: no phantom drawdown, no halt
+    bars, _ = series(n=520, vol=0.0, drift=0.0, start=80_000.0)
+    rx = Racy({"BTC": 80_000.0}, usdc=10_000.0)
+    rx.racy_usd = 10_000.0
+    _, saved, kills, logs, dd, _, _ = _flat_with(tmp_path / "run", monkeypatch, rx, 3,
+                                                 lambda e: setattr(e, "at", e.now), usdc=10_000.0)
+    assert [f["amount"] for f in saved["flows"]] == [10_000.0] and saved["risk"]["peak_equity"] == pytest.approx(20_000.0)
+    assert dd == 0.0 and not saved["risk"]["halted"] and not kills.get("entry_kill")
+    assert not any("isn't explained" in e["text"] for e in saved["events"])
+
+
+def test_money_that_moved_while_the_process_was_down_is_alerted_after_the_restart(tmp_path):
+    """The last confirmed balance is saved: after a restart the first checks explain the move from it, so $500 that
+    arrived with no ledger entry while the process was down is held back from the brakes, then alerted."""
+    ex, said = FakeHyperliquid(PRICES, usdc=1_000.0, slip_bps=0.0), []
+    b = _broker("BTC", ex, tmp_path, sleep=Sleeps(), on_alert=said.append, clock=lambda: ex.now)
+    b.check_stop_price(PRICES["BTC"], ex.now)
+    del b
+    ex.money(500.0, {"type": "deposit", "usdc": "500"}, on_ledger=False)
+    ex.now += 3600_000
+    again = _broker("BTC", ex, tmp_path, sleep=Sleeps(), on_alert=said.append, clock=lambda: ex.now)
+    again.check_stop_price(PRICES["BTC"], ex.now)
+    assert said == [] and not again.balance_confirmed and again.cash == 1_000.0     # not counted as profit meanwhile
+    ex.now += 130_000
+    again.check_stop_price(PRICES["BTC"], ex.now)
+    assert len(said) == 1 and "+500.00 of it isn't explained" in said[0] and again.flow_gap == said[0]
+    assert again.balance_confirmed and again.cash == 1_500.0
+
+
+def test_a_ledger_read_that_fails_part_way_is_read_again_whole(tmp_path):
+    """Five entries, three a page, and the second page's call fails: before, the first page was kept as seen without
+    moving the cursor, and nothing after it was ever read again. Now the read is dropped whole and done again."""
+    class Paged(FakeHyperliquid):
+        LEDGER_PAGE = 3
+        fail_second = False
+
+        def fetch_ledger(self, code=None, since=None, limit=None, params=None):
+            if self.fail_second and self.calls.count("ledger_ok") == 1:
+                self.fail_second = False
+                self.calls.append("ledger")
+                raise ExchangeDown("ledger: read timed out")
+            out = super().fetch_ledger(code, since, limit, params)
+            self.calls.append("ledger_ok")
+            return out
+
+    ex, said, got = Paged(PRICES, usdc=1_000.0, slip_bps=0.0), [], []
+    b = _broker("BTC", ex, tmp_path, sleep=Sleeps(), on_alert=said.append, clock=lambda: ex.now)
+    b.on_flow = got.append
+    b.check_stop_price(PRICES["BTC"], ex.now)
+    for _ in range(5):
+        ex.deposit(10.0)
+    ex.calls.clear()
+    ex.fail_second = True
+    b.check_stop_price(PRICES["BTC"], ex.now)
+    assert got == [] and not b.balance_confirmed and b.cash == 1_000.0
+    for _ in range(3):
+        ex.deposit(100.0)
+        b.check_stop_price(PRICES["BTC"], ex.now)
+    assert [f["amount"] for f in got] == [10.0] * 5 + [100.0] * 3 and b.cash == 1_350.0
+    assert len(said) == 1 and "could not read deposits and withdrawals" in said[0]
+
+
+@pytest.mark.parametrize("skew_ms", [5_000, -5_000])
+def test_a_first_start_counts_what_funded_the_account_once_whatever_the_clocks(tmp_path, monkeypatch, skew_ms):
+    """The exchange's clock 5 s ahead of the desk's (or behind): the deposit that funded the account just before the
+    start is the start, never a flow; one made just after the start is a flow."""
+    bars, funding = series(n=520, vol=0.0, drift=0.0, start=80_000.0)
+    p = P.with_(hard={"max_data_age_bars": 1e9})
+    start = 500
+    ex = FakeHyperliquid({"BTC": 80_000.0}, usdc=400.0)
+    t_local = bars[start].ts + 60_000
+    ex.cash += 100.0
+    ex.ledger.append({"time": t_local - 2_000 + skew_ms, "hash": "0x" + "01" * 32,
+                      "delta": {"type": "deposit", "usdc": "100.0"}})
+    _, saved, kills, logs, dd, _, _ = _flat_with(tmp_path, monkeypatch, ex, 2, lambda e: e.ledger.append(
+        {"time": e.now + skew_ms, "hash": "0x" + "02" * 32, "delta": {"type": "deposit", "usdc": "50.0"}}) or
+        setattr(e, "cash", e.cash + 50.0), n=4, first_start=True)
+    assert saved["meta"]["start_equity"] == 500.0
+    assert [(f["amount"], f["equity_before"]) for f in saved["flows"]] == [(50.0, 500.0)]
+    assert dd == 0.0 and not kills.get("entry_kill") and not any("isn't explained" in x for x in logs)
+
+
+def test_the_feed_prices_a_moment_from_the_minute_candle_and_falls_back_to_the_hour(monkeypatch):
+    """HyperliquidFeed.price_at, no network: the minute's open, else the hour's, else None."""
+    from desk.feeds.hyperliquid import HyperliquidFeed
+
+    feed, asked = HyperliquidFeed("BTC", "2h"), []
+    ts = T0 + 90_123
+    book = {"1m": [{"t": ts - ts % 60_000, "T": ts - ts % 60_000 + 59_999, "o": "81000.5"}],
+            "1h": [{"t": ts - ts % 3600_000, "T": ts - ts % 3600_000 + 3599_999, "o": "80500"}]}
+
+    def post(body, retries=4):
+        asked.append((body["req"]["interval"], body["req"]["startTime"]))
+        return list(book[body["req"]["interval"]])
+
+    monkeypatch.setattr(feed, "_post", post)
+    assert feed.price_at(ts) == 81_000.5 and asked == [("1m", ts - ts % 60_000)]
+    book["1m"] = []                                       # older than the minutes Hyperliquid keeps
+    assert feed.price_at(ts) == 80_500.0
+    book["1h"] = []
+    assert feed.price_at(ts) is None

@@ -32,11 +32,13 @@ Design rules:
   * each coin's state is its own file (state/<COIN>/live_position.json);
   * any exception while placing an order leaves the desk in entry_kill;
   * money moved in or out of the account (a deposit, a withdrawal, a transfer between accounts, spot <-> perp) is
-    read from the exchange's ledger before every balance read and handed to the runner as a flow, never as profit or
+    read from the exchange's ledger with every balance read and handed to the runner as a flow, never as profit or
     loss (desk/flows.py): on Hyperliquid, userNonFundingLedgerUpdates through ccxt's fetch_ledger, the only one of
     ccxt's calls that sees every kind (fetch_deposits and fetch_withdrawals return bridge deposits and withdrawals
-    only). A move in the account's value that P&L, fees, funding and the recorded flows don't explain raises an
-    alert (and entry_kill) instead of a guess.
+    only). Each flow is priced at the account's value when it happened, even when it's read later. A balance is used
+    only once it's confirmed: read with a readable ledger, its move from the last confirmed one (saved, so across a
+    restart too) explained by P&L, fees, funding and the flows. Until then the last confirmed one stands and the
+    runner holds new candles; a move nothing explains is alerted (and entry_kill set) instead of a guess.
 """
 
 from __future__ import annotations
@@ -46,6 +48,7 @@ import json
 import math
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from ..models import Order, Position, Side, Trade
@@ -152,6 +155,19 @@ LEDGER_PAGES = 20           # deposit/withdrawal history pages read per check (m
 RECONCILE_MIN_USD = 1.0     # a move in the account's value that nothing explains, beyond the larger of $1...
 RECONCILE_FRACTION = 0.02   # ...and 2% of the account, is alerted (price marks, fees and funding stay well inside)
 LEDGER_ALERT_EVERY = 40     # a ledger that can't be read alerts at the first failure and every 40th after (~10 min)
+UNEXPLAINED_WAIT_MS = 120_000   # a move nothing explains waits this long for its ledger entry before it's alerted
+FLOW_FRESH_MS = 120_000     # a flow read within this of when it happened is priced at the balance it was read with
+FUNDING_GAP_MS = 3600_000   # explaining a longer stretch with a position held (a restart): the exchange's funding too
+LEDGER_SKEW_MS = 10 * 60_000        # on a first start, the ledger is read from this long before now (clock skew)
+FIRST_LOOKBACK_MS = 86400_000       # ...after marking everything on it from the last day as the start
+
+
+@dataclass
+class _Read:
+    """A ledger read not committed yet: the new flows, and the cursor and seen ids it would leave."""
+    flows: list
+    cursor: int
+    seen: list
 
 
 class UnknownLedgerEntry(ValueError):
@@ -216,7 +232,7 @@ class LiveBroker:
 
     def __init__(self, p: Params, venue: str | None = None, state_path: str | Path | None = None,
                  max_notional_usd: float | None = None, exchange=None, log=print, on_alert=None, sleep=time.sleep,
-                 clock=None):
+                 clock=None, price_at=None):
         self.p = p
         self.log = log
         self.on_alert = on_alert              # the runner puts alerts on the board and the phone
@@ -260,23 +276,32 @@ class LiveBroker:
         self.flows_cursor: int | None = None
         self.flows_seen: list[str] = []
         self.on_flow = None
+        self.price_at = price_at              # ts -> the coin's price then (the runner's feed): a flow read late
         self.flow_gap: str | None = None      # an unexplained move in the account's value, for the runner (entry_kill)
-        self._recon: dict | None = None       # the last check's account value, price and position, to explain the next
+        self.balance_confirmed = True         # False: the last balance read isn't explained yet; the runner waits
+        self.unconfirmed_why: str | None = None
+        self._recon: dict | None = None       # the last confirmed balance, price and position (saved), to explain the next
+        self._unexplained_since: int | None = None
+        self._alerted: set[str] = set()
         self._ledger_failures = 0
-        self._ledger_ok = True
         self.account = str((getattr(self.ex, "options", None) or {}).get("subAccountAddress")
                            or getattr(self.ex, "walletAddress", "") or "").lower()
         self.flows_readable = bool((getattr(self.ex, "has", None) or {}).get("fetchLedger")) and \
             callable(getattr(self.ex, "fetch_ledger", None))
-        self.cash = self._balance()
         self._load_local()
         if self.flows_cursor is None:         # first start: what funded the account so far is the start, not a flow
-            self.flows_cursor = self.clock() + 1
+            self._first_ledger_read()
+        bal = self._balance()
+        # a restart starts from the balance it last confirmed (the first check confirms the new one, or not yet); a
+        # first start from this one, read just after the ledger
+        self.cash = bal if self._recon is None else self._recon["av"]
+        if self._recon is None:
+            self._recon = self._snapshot(None)
         if not self.flows_readable:
             self.alert(f"{self.venue}'s deposits and withdrawals can't be read here (no fetch_ledger): one would count as "
                        f"profit or loss, brakes included. A move nothing explains is still alerted")
-        if self.cash <= 0 and self.position is None:
-            raise LiveSetupError(f"the {self.venue} account reads ${self.cash:,.2f}: nothing to trade with. On "
+        if bal <= 0 and self.position is None:
+            raise LiveSetupError(f"the {self.venue} account reads ${bal:,.2f}: nothing to trade with. On "
                                  f"Hyperliquid, HL_WALLET_ADDRESS (and HL_SUBACCOUNT_ADDRESS for a sub-account) must "
                                  f"name the account that holds the money, not the API wallet's own address")
         self.sync()
@@ -502,35 +527,58 @@ class LiveBroker:
         if self.provisional:
             self._resolve_provisional()
         self.cash = self._refresh_cash()
-        self.reconcile()
         self._save_local()
 
     # ---- money in and out ----------------------------------------------------
-    def _read_flows(self) -> list[dict] | None:
-        """New deposits, withdrawals and transfers on the exchange's ledger since the last read, oldest first; None if
-        it couldn't be read this time (the next check reads from the same point again)."""
+    #
+    # Every balance the desk acts on is a confirmed one: read together with the exchange's ledger, every move in it
+    # explained by the position's P&L, the trades, funding and the deposits, withdrawals and transfers on that ledger.
+    # Until then the last confirmed balance stands (balance_confirmed is False and the runner holds new candles), so a
+    # deposit is never mistaken for profit, or a withdrawal for a loss, by the brakes. Each flow is priced at the
+    # account's value at its own time, not when it was read.
+
+    def _first_ledger_read(self) -> None:
+        """First start (no state file yet): everything on the ledger so far funded the account, so it's the start, not
+        a flow. Read it before the starting balance and mark it seen; read again from a little before now, so a clock
+        behind the exchange's can't skip an entry made after the start. Raises if it can't be read: starting without
+        knowing which money is the start would count a deposit twice (the runner retries the startup)."""
         if not self.flows_readable:
-            return []
-        seen, out, since = set(self.flows_seen), [], self.flows_cursor
+            self.flows_cursor = self.clock()
+            return
+        got = self._read_flows(_Read([], self.clock() - FIRST_LOOKBACK_MS, []), alert=False)
+        if got is None:
+            raise RuntimeError("the exchange's deposit and withdrawal history can't be read yet")
+        self.flows_seen = got.seen
+        self.flows_cursor = max(got.cursor, self.clock() - LEDGER_SKEW_MS)
+
+    def _read_flows(self, base: "_Read | None" = None, alert: bool = True) -> "_Read | None":
+        """The deposits, withdrawals and transfers on the exchange's ledger since `base` (default: what's committed),
+        oldest first, as a _Read that commits nothing: the caller commits it once the balance it goes with is
+        confirmed. None if the ledger couldn't be read, all of it: a read that fails part way through is dropped
+        whole, so the next one starts again from the same point."""
+        base = base or _Read([], self.flows_cursor, list(self.flows_seen))
+        if not self.flows_readable:
+            return base
+        seen, seen_list, out, since = set(base.seen), list(base.seen), list(base.flows), base.cursor
         for _ in range(LEDGER_PAGES):
             try:
                 page = self.ex.fetch_ledger(None, since)
             except Exception as exc:
                 self._ledger_failures += 1
-                text = (f"could not read deposits and withdrawals ({type(exc).__name__}: {exc}); reading again at the "
-                        f"next check")
-                if self._ledger_failures == 1 or self._ledger_failures % LEDGER_ALERT_EVERY == 0:
+                text = (f"could not read deposits and withdrawals ({type(exc).__name__}: {exc}); the brakes keep the "
+                        f"last confirmed balance and new candles wait until it reads again")
+                if alert and (self._ledger_failures == 1 or self._ledger_failures % LEDGER_ALERT_EVERY == 0):
                     self.alert(text)
                 else:
                     self.log(f"{self.coin}: {text}")
-                return out or None
+                return None
             fresh = []
             for e in sorted(page, key=lambda e: e.get("timestamp") or 0):
                 info = e.get("info") or {}
                 fid = "exchange-" + hashlib.sha1(json.dumps(info, sort_keys=True, default=str).encode()).hexdigest()[:16]
                 if fid not in seen:
                     seen.add(fid)
-                    self.flows_seen.append(fid)
+                    seen_list.append(fid)
                     fresh.append((fid, int(e.get("timestamp") or info.get("time") or since), info))
             if not fresh:
                 break
@@ -538,79 +586,187 @@ class LiveBroker:
                 try:
                     got = hl_flow(info, self.account)
                 except UnknownLedgerEntry as exc:
-                    self.alert(f"{exc}. Not recorded as a deposit or withdrawal: check it on the exchange; if it moved "
-                               f"the account, the brakes count it as profit or loss")
+                    if alert and fid not in self._alerted:
+                        self._alerted.add(fid)
+                        self.alert(f"{exc}. Not recorded as a deposit or withdrawal: check it on the exchange; if "
+                                   f"it moved the account, it's alerted as a move nothing explains")
                     continue
                 if got is not None:
                     out.append({"id": fid, "ts": ts, "amount": round(got[0], 6), "what": got[1],
                                 "type": (info.get("delta") or {}).get("type")})
             since = max(since, max(ts for _, ts, _ in fresh))
         self._ledger_failures = 0
-        self.flows_cursor = since
-        self.flows_seen = self.flows_seen[-1000:]
-        return out
+        return _Read(out, since, seen_list[-1000:])
 
-    def _refresh_cash(self) -> float:
-        """The account's value, after reading the money moved in or out since the last read. Each flow is handed to the
-        runner (on_flow) before the new value is used, so the brakes are scaled before anything sees it. Several flows
-        in one read: the k-th one's equity_after is the value less the flows after it."""
-        new = self._read_flows()
-        bal = self._balance()
-        self._ledger_ok = new is not None
-        after = bal
-        for fl in reversed(new or []):
-            fl["equity_after"] = after
-            after -= fl["amount"]
-        for fl in new or []:
-            self.flows = (self.flows + [fl])[-500:]
-            self.log(f"{self.coin}: {'deposit' if fl['amount'] > 0 else 'withdrawal'} of ${abs(fl['amount']):,.2f} "
-                     f"({fl['what']}) read from the exchange")
-            if self.on_flow is not None:
-                self.on_flow(fl)
-        if new:
-            self._save_local()
-        return bal
+    def _px_now(self) -> float | None:
+        if self.last_price is not None:
+            return self.last_price
+        if self.price_at is not None:
+            try:
+                return self.price_at(self.clock())
+            except Exception as exc:
+                self.log(f"{self.coin}: could not read the price: {type(exc).__name__}: {exc}")
+        return None
 
-    def _snapshot(self) -> dict:
-        pos = self.position
-        return {"av": self.cash, "px": self.last_price, "flows": sum(f["amount"] for f in self.flows),
-                "trades": len(self.trades), "ts": self.clock(),
-                "pos": None if pos is None else [pos.side.sign, pos.qty, pos.entry_price, pos.entry_ts]}
+    def _trades_since(self, snap: dict) -> list:
+        k = snap.get("last_entry")
+        if k is None:
+            return list(self.trades)
+        idx = next((i for i in range(len(self.trades) - 1, -1, -1) if self.trades[i].entry_ts == k), None)
+        return self.trades[idx + 1:] if idx is not None else list(self.trades)
 
-    def reconcile(self) -> float | None:
-        """Explain the move in the account's value since the last check: the price on the position held, the trades
-        booked, the flows recorded. What's left beyond RECONCILE_MIN_USD / RECONCILE_FRACTION (fees, funding and the
-        mark against the mid stay well inside) is alerted and handed to the runner, which sets entry_kill: a deposit
-        the ledger doesn't show would read as profit, a withdrawal as a loss. Returns the unexplained dollars."""
-        if not getattr(self, "_ledger_ok", True):
-            return None                       # the flows couldn't be read: explain this stretch with the next check's
-        prev, now = self._recon, self._snapshot()
-        self._recon = now
-        if prev is None or prev["px"] is None or now["px"] is None:
+    def _unexplained(self, bal: float, flows: list[dict], px: float | None) -> float | None:
+        """How much of the move in the account's value since the last confirmed balance (the saved one, across a
+        restart) the price on the position held, the trades booked, funding and `flows` don't explain. None when
+        there is nothing to compare with (the first check), or it needs a price that can't be read."""
+        prev = self._recon
+        if prev is None:
             return None
-        new_trades = self.trades[prev["trades"]:]
-        pos, held = self.position, prev["pos"]
+        pos, held, new_trades = self.position, prev.get("pos"), self._trades_since(prev)
         expected = 0.0
         if held is not None:
             sign, qty, _, ets = held
             if pos is not None and pos.entry_ts == ets and pos.side.sign == sign:
-                expected += sign * qty * (now["px"] - prev["px"])        # the move on what was held
+                if px is None or prev.get("px") is None:
+                    return None
+                expected += sign * qty * (px - prev["px"])                   # the move on what was held
             else:
                 t = next((t for t in new_trades if t.entry_ts == ets), None)
                 if t is not None:
+                    if prev.get("px") is None:
+                        return None
                     expected += sign * t.qty * (t.exit_price - prev["px"])
+            if self.clock() - prev["ts"] > FUNDING_GAP_MS:      # a long gap (a restart): the funding charged meanwhile
+                expected -= self._exchange_funding(prev["ts"]) or 0.0
         expected += sum(t.net_pnl for t in new_trades if held is None or t.entry_ts != held[3])
         if pos is not None and (held is None or pos.entry_ts != held[3]):
-            expected += pos.unrealized(now["px"]) - pos.fees_paid
-        left = (now["av"] - prev["av"]) - (now["flows"] - prev["flows"]) - expected
-        tol = max(RECONCILE_MIN_USD, RECONCILE_FRACTION * max(abs(prev["av"]), abs(now["av"])))
-        if abs(left) > tol:
-            self.flow_gap = (f"the account's value moved {now['av'] - prev['av']:+,.2f} (to ${now['av']:,.2f}) and "
-                             f"{left:+,.2f} of it isn't explained by the position's P&L, fees, funding or a recorded "
-                             f"deposit or withdrawal. Not guessed at: the brakes now count it as "
+            if px is None:
+                return None
+            expected += pos.unrealized(px) - pos.fees_paid
+        return (bal - prev["av"]) - sum(f["amount"] for f in flows) - expected
+
+    def _tolerance(self, bal: float) -> float:
+        prev = (self._recon or {}).get("av", bal)
+        return max(RECONCILE_MIN_USD, RECONCILE_FRACTION * max(abs(prev), abs(bal)))
+
+    def _unconfirmed(self, why: str) -> float:
+        if self.balance_confirmed:
+            self.log(f"{self.coin}: balance not confirmed ({why}); the brakes keep ${self.cash:,.2f}")
+        self.balance_confirmed, self.unconfirmed_why = False, why
+        return self.cash
+
+    def _refresh_cash(self) -> float:
+        """The account's value, confirmed against the exchange's ledger (see above), or else the last confirmed one.
+
+        Ledger, balance, and the move between this balance and the last confirmed one explained. Not explained: the
+        ledger is read once more (a deposit that landed between the two reads), and if that's still not it, the
+        balance waits UNEXPLAINED_WAIT_MS for an entry to show up before it's alerted (flow_gap: the runner sets
+        entry_kill) and taken as it is. Each new flow is priced at its own time and handed to the runner (on_flow)
+        before anything uses the new balance."""
+        read = self._read_flows()
+        if read is None:
+            return self._unconfirmed("the ledger can't be read")
+        bal, px = self._balance(), self._px_now()
+        left = self._unexplained(bal, read.flows, px)
+        if left is not None and abs(left) > self._tolerance(bal):
+            more = self._read_flows(read)
+            if more is None:
+                return self._unconfirmed("the ledger can't be read")
+            if len(more.flows) > len(read.flows):
+                read, bal = more, self._balance()
+                left = self._unexplained(bal, read.flows, px)
+        if left is not None and abs(left) > self._tolerance(bal):
+            self._unexplained_since = self._unexplained_since or self.clock()
+            if self.clock() - self._unexplained_since < UNEXPLAINED_WAIT_MS:
+                return self._unconfirmed(f"{left:+,.2f} of a move to ${bal:,.2f} isn't explained yet; reading the "
+                                         f"ledger again")
+            prev_av = self._recon["av"]
+            self.flow_gap = (f"the account's value moved {bal - prev_av:+,.2f} (to ${bal:,.2f}) and {left:+,.2f} of "
+                             f"it isn't explained by the position's P&L, fees, funding or a recorded deposit or "
+                             f"withdrawal. Not guessed at: the brakes now count it as "
                              f"{'profit' if left > 0 else 'a loss'}. Check the exchange's history; entry_kill is on")
             self.alert(self.flow_gap)
-        return left
+        self._unexplained_since = None
+        self.flows_cursor, self.flows_seen = read.cursor, read.seen
+        self.cash, self.balance_confirmed, self.unconfirmed_why = bal, True, None
+        self._take_flows(read.flows, bal, px)
+        self._recon = self._snapshot(px)
+        return bal
+
+    def _pnl_since(self, ts: int, px: float | None) -> float | None:
+        """What the account's trading made from `ts` until now; None if it needs a price that can't be read."""
+        then: list[float | None] = []
+
+        def at_ts() -> float | None:
+            if not then:
+                try:
+                    then.append(self.price_at(ts) if self.price_at is not None else None)
+                except Exception as exc:
+                    self.log(f"{self.coin}: could not read the price at {ts}: {type(exc).__name__}: {exc}")
+                    then.append(None)
+            return then[0]
+
+        out = 0.0
+        for t in self.trades:
+            if t.exit_ts <= ts:
+                continue
+            if t.entry_ts > ts:
+                out += t.net_pnl
+            elif at_ts() is None:
+                return None
+            else:   # held across it: the move from then to its exit, less the exit's fee
+                out += t.side.sign * t.qty * (t.exit_price - at_ts()) - \
+                    t.qty * t.exit_price * self.p.costs.taker_fee_bps / 1e4
+        pos = self.position
+        if pos is not None:
+            if px is None:
+                return None
+            if pos.entry_ts > ts:
+                out += pos.unrealized(px) - pos.fees_paid
+            elif at_ts() is None:
+                return None
+            else:
+                out += pos.side.sign * pos.qty * (px - at_ts())
+        return out
+
+    def _take_flows(self, flows: list[dict], bal: float, px: float | None) -> None:
+        """Price each new flow at the account's value just before it happened, keep it, and hand it to the runner.
+        Read soon after it happened, that's the balance now less it and the flows after it; read later (a restart,
+        a sleep, a ledger that couldn't be read), what the trading made since is taken out too, at the price at its
+        minute. When that can't be worked out it's priced now, alerted, and the runner sets entry_kill."""
+        now, after = self.clock(), sum(f["amount"] for f in flows)
+        for fl in flows:
+            before = bal - after
+            after -= fl["amount"]
+            fl["read_ts"], fl["priced"] = now, "when read"
+            if now - fl["ts"] > FLOW_FRESH_MS:
+                made = self._pnl_since(fl["ts"], px)
+                if made is None:
+                    fl["priced"] = "approximately"
+                    self.flow_gap = (f"a {fl['what']} of ${abs(fl['amount']):,.2f} was read "
+                                     f"{(now - fl['ts']) / 60_000:,.0f} min after it happened, with a position open, "
+                                     f"and its price then can't be read: it's booked at the account's value now, so "
+                                     f"the performance figure and the brakes are off by the position's move since. "
+                                     f"Check it; entry_kill is on")
+                    self.alert(self.flow_gap)
+                else:
+                    before -= made
+                    fl["priced"] = "at its time"
+            fl["equity_before"], fl["equity_after"] = before, before + fl["amount"]
+            self.flows = (self.flows + [fl])[-500:]
+            self.log(f"{self.coin}: {'deposit' if fl['amount'] > 0 else 'withdrawal'} of ${abs(fl['amount']):,.2f} "
+                     f"({fl['what']}) read from the exchange, priced {fl['priced']}")
+        if flows:
+            self._save_local()
+        for fl in flows:
+            if self.on_flow is not None:
+                self.on_flow(fl)
+
+    def _snapshot(self, px: float | None) -> dict:
+        pos = self.position
+        return {"av": self.cash, "px": px, "ts": self.clock(),
+                "last_entry": self.trades[-1].entry_ts if self.trades else None,
+                "pos": None if pos is None else [pos.side.sign, pos.qty, pos.entry_price, pos.entry_ts]}
 
     def _follow_size(self, qty: float, entry: float) -> None:
         """The exchange holds the desk's side at another size: something closed part of it (by hand, or a close
@@ -1120,6 +1276,7 @@ class LiveBroker:
             "entry_order_id": self.entry_order_id, "close_wanted": self.close_wanted, "provisional": self.provisional,
             "bar_ts": self.bar_ts,
             "flows": self.flows, "flows_cursor": self.flows_cursor, "flows_seen": self.flows_seen,
+            "recon": self._recon,
             "position": None if pos is None else {
                 "side": pos.side.value, "qty": pos.qty, "entry_price": pos.entry_price, "entry_ts": pos.entry_ts,
                 "stop": pos.stop, "best_close": pos.best_close, "fees_paid": pos.fees_paid,
@@ -1143,6 +1300,7 @@ class LiveBroker:
         self.flows = list(d.get("flows") or [])
         self.flows_cursor = d.get("flows_cursor")
         self.flows_seen = list(d.get("flows_seen") or [])
+        self._recon = d.get("recon")
         pd = d.get("position")
         if pd:
             self.position = Position(Side(pd["side"]), pd["qty"], pd["entry_price"], pd["entry_ts"], pd["stop"],
