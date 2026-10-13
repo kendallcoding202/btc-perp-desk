@@ -160,6 +160,38 @@ class Params:
 
 DEFAULT = Params()
 
+
+@dataclass(frozen=True)
+class VolTrend:
+    """VT — the vol-trend basket, a 4th paper account (desk/voltrend.py). PAPER ONLY: it has no live mode.
+
+    One account, three sleeves (BTC, ETH, SOL), a third of the book each. At every 00:00 UTC daily close, each coin
+    gets a size in "units": 0.40 / its 10-day realised vol (capped at 2) while the close is above its 50-day
+    average, else 0. Orders fill at the next day's open. Frozen: these exact numbers passed the October 2026 edge
+    hunt's pre-set bar and then two independent checks (research/edge-hunt-2026-10/candidates/voltgt/). Don't tune them.
+    """
+    coins: tuple[str, ...] = ("BTC", "ETH", "SOL")   # one sleeve each; a coin with no history yet is a cash sleeve
+    interval: str = "1d"                # decided at the 00:00 UTC close, filled at the next daily bar's open
+    vol_lookback: int = 10              # realised vol = sample std of the last 10 daily returns x sqrt(365)
+    target_vol: float = 0.40            # units = 0.40 / realised vol: a sleeve at 1 unit runs about 40%/yr vol...
+    max_units: float = 2.0              # ...capped at 2 units, so a very quiet coin can't take an outsized position
+    sma_bars: int = 50                  # trend gate: hold a coin only while its close is above its 50-day average
+                                        # (the mean of the last 50 closes, today's included). The gate carries the
+                                        # edge: without it the same sizing made OOS Sharpe 0.61 with a 40% drop
+    band: float = 0.25                  # no-trade band: keep the held units unless the new size is >25% away
+                                        # (entries and exits always go through)
+    book_leverage: float = 0.65         # notional per sleeve = equity x 0.65 / 3 x units: 2020-23 max drawdown 26%
+    min_order_usd: float = 10.0         # Hyperliquid's minimum order: smaller entries and resizes are skipped
+                                        # (a skipped entry is retried at the next close; exits always go through)
+    starting_equity: float = 500.0      # entries are ~0.14x equity and resizes ~0.06x, so below ~$250 the $10
+                                        # minimum blocks most ETH/SOL orders (fresh starts since 2024: $50 has 351
+                                        # orders blocked, $250 28, $500 3). Yours to change: the backtest's minimum-
+                                        # capital table (reports/backtest-VT.md) shows what each size costs
+    goal_equity: float = 100_000.0      # the board tracks progress toward this, like the desk accounts
+
+
+VOLTREND = VolTrend()
+
 # The paper accounts the desk runs, $150 each. Same strategy for every coin; only what's listed here differs.
 COINS = ("BTC", "ETH", "SOL")
 COIN_OVERRIDES: dict[str, dict] = {
@@ -175,6 +207,8 @@ COIN_OVERRIDES: dict[str, dict] = {
 # Shown on the board so an experiment never passes for a validated setting.
 EXPERIMENTS: dict[str, str] = {
     "ETH": "breakdown shorts on: paper experiment, missed the pre-set bar",
+    "VT": "paper experiment from the Oct 2026 edge hunt: passed the pre-set bar and two independent checks; "
+          "expect a Sharpe nearer 0.5-0.7 than the backtest's",
 }
 
 

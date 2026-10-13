@@ -1,6 +1,7 @@
 """python -m desk <command>
 
     backtest     replay history with every cost charged, write reports/backtest[-COIN].md  (--coin BTC|ETH|SOL)
+    vt-backtest  the VT vol-trend basket's backtest (BTC+ETH+SOL, daily), write reports/backtest-VT.md
     replay       watch the desk trade history on the board (http://127.0.0.1:8787)
     paper        one coin's $150 paper account on live Hyperliquid prices, with a live local board
     step         process newly closed bars for every paper account (BTC, ETH, SOL) once, then exit (cron / Actions)
@@ -19,7 +20,7 @@ import sys
 from pathlib import Path
 
 from . import backtest as bt
-from .thresholds import COINS, DEFAULT, Params, params_for, report_name
+from .thresholds import COINS, DEFAULT, VOLTREND, Params, params_for, report_name
 
 
 def _load_env(path: str = ".env") -> None:
@@ -98,6 +99,33 @@ def cmd_backtest(args) -> int:
     print(f"  buy & hold: {f['buy_hold_return']:+.1%} (max drawdown {f['buy_hold_drawdown']:.0%})")
     for label, ok, val in bt.promotion_check(s, p):
         print(f"  {'PASS' if ok else 'FAIL'}  {label} — {val}")
+    print(f"\n  report: {path}")
+    return 0
+
+
+def cmd_vt_backtest(args) -> int:
+    """The VT basket (desk/voltrend.py) over Binance daily history for each of its coins."""
+    from . import voltrend
+    from .feeds import binance_vision
+
+    series, funding = {}, {}
+    for coin in VOLTREND.coins:
+        series[coin], funding[coin] = binance_vision.load(symbol=f"{coin}USDT", interval=VOLTREND.interval,
+                                                          start=args.start, end=args.end)
+    rep = voltrend.report(series, funding)
+    path = voltrend.write_report(rep, name=report_name("VT"))
+    f, i, o = rep["full"], rep["in_sample"], rep["out_of_sample"]
+    print(f"\n  {f['from']} → {f['to']}: {f['return']:+.1%} total ({bt._pct(f['cagr'])}/yr), Sharpe {f['sharpe']:.2f}, "
+          f"max drawdown {f['max_drawdown']:.1%}, {f['orders']} orders ({f['blocked']} blocked by the "
+          f"${VOLTREND.min_order_usd:,.0f} minimum)")
+    print(f"  in-sample {i['from']} → {i['to']}: Sharpe {i['sharpe']:.2f}, {i['return']:+.1%} · "
+          f"out-of-sample {o['from']} → {o['to']}: Sharpe {o['sharpe']:.2f}, {o['return']:+.1%}")
+    print(f"  buy & hold, equal weight: {f['buy_hold_return']:+.1%} (Sharpe {f['buy_hold_sharpe']:.2f}, "
+          f"max drawdown {f['buy_hold_drawdown']:.0%})")
+    for label, rows in rep["fresh_starts"].items():
+        print(f"  fresh start, {label.replace('_', '-')}: " + " · ".join(
+            f"{'$' + format(r['start'], ',') if r['start'] else 'no minimum'} {r['sharpe']:.2f}/{r['return']:+.0%}/"
+            f"{r['blocked']} blocked" for r in rows))
     print(f"\n  report: {path}")
     return 0
 
@@ -308,6 +336,11 @@ def main(argv=None) -> int:
     sp.add_argument("--research", action="store_true", help="add sensitivity/ablation/sizing/cost/Jev sections")
     sp.add_argument("--name", default=None, help="report file name under reports/ (default per coin)")
     sp.set_defaults(fn=cmd_backtest)
+
+    sp = sub.add_parser("vt-backtest")
+    sp.add_argument("--start", default="2020-01")
+    sp.add_argument("--end", default=None)
+    sp.set_defaults(fn=cmd_vt_backtest)
 
     sp = sub.add_parser("replay")
     common(sp, history=True, server=True)

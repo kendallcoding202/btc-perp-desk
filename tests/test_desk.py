@@ -11,11 +11,12 @@ from desk import backtest as bt
 from desk import indicators as ind
 from desk import jev as jev_mod
 from desk import paper
+from desk import voltrend
 from desk.brokers.sim import SimBroker
 from desk.engine import Desk, Kills
 from desk.filter import evaluate_entry
 from desk.models import Bar, FundingEvent, MarketContext, Order, Side, Verdict
-from desk.thresholds import DEFAULT, INTERVAL_SECONDS
+from desk.thresholds import DEFAULT, INTERVAL_SECONDS, VOLTREND
 
 H4 = INTERVAL_SECONDS["4h"] * 1000
 # Tests run a 4h desk on synthetic 4h bars, independent of whatever thresholds.py currently defaults to.
@@ -362,6 +363,116 @@ def test_step_runs_every_coin_moves_the_old_ledger_and_survives_one_failing(tmp_
     assert [c["coin"] for c in idx] == ["BTC", "ETH", "SOL"]  # ...but BTC and SOL still ran and are listed
     assert "rate limited" in idx[1]["error"] and idx[2]["bank"] == 50.0
     assert cli.migrate_ledger(tmp_path) is False          # only moves once
+
+
+# ---------------------------------------------------------------- VT: the vol-trend basket
+
+DAY = voltrend.DAY_MS
+
+
+def daily(n=260, seed=1, drift=0.002, vol=0.035, start=100.0, skip=()):
+    """Synthetic daily bars with overnight gaps (open != last close); `skip` = day indexes with no bar."""
+    rnd = random.Random(seed)
+    t0 = 1_700_000_000_000 - 1_700_000_000_000 % DAY
+    bars, px = [], start
+    for k in range(n):
+        o = px * math.exp(rnd.gauss(0, vol / 5))
+        c = o * math.exp(rnd.gauss(drift, vol))
+        if k not in skip:
+            bars.append(Bar(t0 + k * DAY, o, max(o, c) * 1.01, min(o, c) * 0.99, c, 1.0))
+        px = c
+    return bars
+
+
+def test_vt_units_match_a_plain_computation():
+    import statistics
+
+    closes = [b.close for b in daily(n=220, seed=4)]
+    above = below = 0
+    for i in range(len(closes)):
+        got = voltrend.signal(closes[: i + 1])["raw"]
+        if i < 49:                                    # fewer than 50 closes: not warmed up
+            assert got == 0.0
+            continue
+        sma = statistics.fmean(closes[i - 49: i + 1])     # today's close included
+        rv = statistics.stdev([closes[j] / closes[j - 1] - 1 for j in range(i - 9, i + 1)]) * math.sqrt(365)
+        want = min(2.0, 0.40 / rv) if closes[i] > sma else 0.0
+        assert got == pytest.approx(want, rel=1e-12, abs=0)
+        above, below = above + (want > 0), below + (want == 0)
+    assert above > 20 and below > 20
+    assert voltrend.signal([100.0] * 45 + [110.0] * 11)["raw"] == 2.0    # no vol at all: capped at 2 units
+    assert voltrend.signal([100.0 + k for k in range(49)])["raw"] == 0.0  # 49 closes: no 50-day average yet
+
+
+def test_vt_band_keeps_the_held_units_unless_more_than_25pct_away():
+    s = voltrend.sticky
+    assert s(1.3, 0.0, 0.25) == 1.3                       # entries always go through
+    assert s(0.0, 1.0, 0.25) == 0.0                       # so do exits
+    assert s(1.2, 1.0, 0.25) == 1.0 and s(0.76, 1.0, 0.25) == 1.0
+    assert s(1.25, 1.0, 0.25) == 1.0                      # exactly 25%: held ("more than")
+    assert s(1.26, 1.0, 0.25) == 1.26 and s(0.74, 1.0, 0.25) == 0.74
+
+
+def _sig(raw, close=100.0):
+    return {"close": close, "sma": close * 0.95, "vol": 0.3, "raw": raw, "warm": True}
+
+
+def test_vt_ten_dollar_minimum_skips_entries_and_resizes_never_exits():
+    book = voltrend.Book(VOLTREND, start_equity=40.0)
+    eth = book.sleeves["ETH"]
+    book.decide("ETH", _sig(1.0), 40.0, DAY)              # $40 x 0.65 / 3 = $8.67: under $10
+    assert eth.units == 0.0 and "ETH" not in book.pending and book.orders_blocked == 1
+    book.decide("ETH", _sig(1.0), 60.0, 2 * DAY)          # still flat, so checked again: $13 goes through
+    assert eth.units == 1.0 and book.pending["ETH"]["kind"] == "entry"
+    book.fill_pending("ETH", 100.0, 2 * DAY)
+    qty = eth.qty
+    book.decide("ETH", _sig(1.3), 60.0, 3 * DAY)          # 1.0 -> 1.3 units is a $3.90 resize: no order...
+    assert "ETH" not in book.pending and eth.qty == qty and book.orders_blocked == 2
+    assert eth.units == 1.3                               # ...but the band now measures from 1.3
+    book.decide("ETH", _sig(1.5), 60.0, 4 * DAY)
+    assert eth.units == 1.3 and book.orders_blocked == 2  # 15% away: inside the band, nothing to block
+    book.decide("ETH", _sig(0.0), 60.0, 5 * DAY)          # a $13 exit, or any size: always
+    assert book.pending["ETH"]["kind"] == "exit"
+    book.fill_pending("ETH", 101.0, 5 * DAY)
+    assert eth.qty == 0.0 and eth.units == 0.0 and len(book.trades) == 1 and book.orders_filled == 2
+
+
+def _long(qty=2.0, cash=1000.0):
+    book = voltrend.Book(VOLTREND, start_equity=cash)
+    book.pending["BTC"] = {"kind": "entry", "qty": qty, "usd": qty * 100, "units": 1.0, "ts": 0}
+    book.fill_pending("BTC", 100.0, 0)
+    return book
+
+
+def test_vt_longs_pay_positive_funding_and_receive_negative():
+    for rate in (0.001, -0.001):
+        book = _long(2.0)
+        cash = book.cash
+        book.on_day(DAY, {"BTC": Bar(DAY, 100, 105, 95, 104)}, {"BTC": [104.0]}, {"BTC": rate})
+        assert cash - book.cash == pytest.approx(2.0 * 104 * rate)    # qty x the bar's close x its funding
+        assert book.funding_total == pytest.approx(2.0 * 104 * rate)
+
+
+def test_vt_perp_accounting_realises_pnl_as_the_position_shrinks():
+    book = _long(2.0)
+    e1, e2 = 100 * 1.0003, 110 * 1.0003
+    book.pending["BTC"] = {"kind": "resize", "qty": 1.0, "usd": 110.0, "units": 1.5, "ts": DAY}
+    book.fill_pending("BTC", 110.0, DAY)
+    avg = (2 * e1 + e2) / 3
+    assert book.sleeves["BTC"].avg_entry == pytest.approx(avg)
+    book.pending["BTC"] = {"kind": "resize", "qty": -1.5, "usd": -180.0, "units": 0.8, "ts": 2 * DAY}
+    book.fill_pending("BTC", 120.0, 2 * DAY)
+    x1 = 120 * 0.9997
+    book.pending["BTC"] = {"kind": "exit", "qty": -1.5, "usd": -135.0, "units": 0.0, "ts": 3 * DAY}
+    book.fill_pending("BTC", 90.0, 3 * DAY)
+    x2 = 90 * 0.9997
+    fees = (2 * e1 + e2 + 1.5 * x1 + 1.5 * x2) * 4.5e-4
+    pnl = 1.5 * (x1 - avg) + 1.5 * (x2 - avg)
+    assert book.cash == pytest.approx(1000 + pnl - fees) and book.equity() == book.cash
+    t = book.trades[0]
+    assert t["net_pnl"] == pytest.approx(pnl - fees) and t["entry_ts"] == 0 and t["exit_ts"] == 3 * DAY
+    said = " ".join(e.text for e in book.events)
+    assert "BOUGHT" in said and "ADDED" in said and "TRIMMED" in said and "SOLD" in said
 
 
 # ---------------------------------------------------------------- jev
