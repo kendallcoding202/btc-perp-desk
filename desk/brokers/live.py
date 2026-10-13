@@ -131,6 +131,7 @@ EQUITY_INCLUDES_UPNL = {"hyperliquid"}
 STOP_ATTEMPTS = 4
 STOP_BACKOFF_S = 1.0
 FILL_LOOKBACK_MS = 60_000   # an order's own fills are looked up from a minute before it was sent (clock skew)
+FUNDING_MAX_PAGES = 100     # 500 rows a page: years of hourly funding for a few coins
 
 
 def _trigger(o: dict) -> float | None:
@@ -293,18 +294,47 @@ class LiveBroker:
                  f"{self.p.costs.taker_fee_bps} bps taker estimate")
         return px, qty * px * self.p.costs.taker_fee_bps / 1e4, "estimate"
 
-    def _exchange_funding(self, since: int) -> float | None:
-        """Funding the exchange charged this market's position since `since`, in the desk's sign (+ = paid);
-        None if the venue can't say."""
+    def _is_this_market(self, row: dict) -> bool:
+        """Whether a funding row is this market's. ccxt's hyperliquid (4.5) labels every userFunding row with the
+        symbol that was asked for, whatever coin it is for, so its own coin (info.delta.coin) decides when present."""
+        delta = (row.get("info") or {}).get("delta")
+        if isinstance(delta, dict) and delta.get("coin") is not None:
+            name = (self.market.get("info") or {}).get("name") or self.market.get("baseName") or self.coin
+            return str(delta["coin"]) == str(name)
+        return row.get("symbol") in (None, self.symbol)
+
+    def _exchange_funding(self, since: int, until: int | None = None) -> float | None:
+        """Funding the exchange charged this market's position from `since` (to `until`), in the desk's sign
+        (+ = paid); None if the venue can't say. Read page by page: Hyperliquid answers at most 500 rows per call,
+        for every coin the account holds, and charges hourly."""
         if not (getattr(self.ex, "has", None) or {}).get("fetchFundingHistory", True):
             return None
-        try:
-            rows = self.ex.fetch_funding_history(self.symbol, since)
-        except Exception as exc:
-            self.log(f"{self.coin}: could not read funding: {type(exc).__name__}: {exc}")
-            return None
-        return -sum(float(r.get("amount") or 0.0) for r in rows
-                    if r.get("symbol") in (None, self.symbol) and (r.get("timestamp") or since) >= since)
+        rows, seen, start = [], set(), since
+        for _ in range(FUNDING_MAX_PAGES):
+            try:
+                page = self.ex.fetch_funding_history(self.symbol, start)
+            except Exception as exc:
+                self.log(f"{self.coin}: could not read funding: {type(exc).__name__}: {exc}")
+                return None
+            new = []
+            for r in page:
+                key = json.dumps(r.get("info"), sort_keys=True, default=str) if r.get("info") else \
+                    (r.get("timestamp"), r.get("symbol"), r.get("amount"))
+                if key not in seen:
+                    seen.add(key)
+                    new.append(r)
+            if not new:
+                break
+            rows += new
+            # the next page starts at the last time seen (not after it: other coins' rows share each hour's time)
+            start = max(start, max(int(r.get("timestamp") or start) for r in new))
+            if until is not None and start > until:
+                break
+        else:
+            self.log(f"{self.coin}: funding history still going after {FUNDING_MAX_PAGES} pages; the trade's funding "
+                     f"may be short")
+        return -sum(float(r.get("amount") or 0.0) for r in rows if self._is_this_market(r)
+                    and (r.get("timestamp") or since) >= since and (until is None or (r.get("timestamp") or 0) <= until))
 
     def _resting_stops(self, side: str | None = None) -> list[dict]:
         """Reduce-only trigger orders resting on this market (on `side`, if given)."""

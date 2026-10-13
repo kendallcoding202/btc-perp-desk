@@ -3,8 +3,9 @@
 FakeHyperliquid answers the way ccxt's hyperliquid class does (ccxt 4.5: create_order returns the parsed
 "filled" / "resting" status with no fee, fetch_positions gives contracts with contractSize None, trigger orders
 come back from fetch_open_orders with triggerPrice and reduceOnly, fills from fetch_my_trades carry the order id
-and the fee, funding from fetch_funding_history is signed USDC, sizes are rounded half-up to the size step and a
-positive size that rounds to zero raises). It records every order, can fail any call on demand, and fills resting
+and the fee, funding from fetch_funding_history is signed USDC, 500 rows a call, for every coin on the account and
+each labelled with the symbol asked for (ccxt's parse_income), its own coin only in info.delta.coin, sizes are
+rounded half-up to the size step and a positive size that rounds to zero raises). It records every order, can fail any call on demand, and fills resting
 stops when the test moves the price through them.
 """
 
@@ -49,6 +50,7 @@ def _q(x, places: int, rounding=ROUND_HALF_UP) -> Decimal:
 class FakeHyperliquid:
     id = "hyperliquid"
     precisionMode = 4                     # ccxt TICK_SIZE
+    FUNDING_PAGE = 500                    # rows per userFunding answer
 
     def __init__(self, marks: dict[str, float], usdc: float = 1_000.0, fee_bps: float = 4.5, slip_bps: float = 1.0,
                  coins=tuple(SZ_DECIMALS)):
@@ -242,8 +244,11 @@ class FakeHyperliquid:
         return [dict(t) for t in self.fills if symbol in (None, t["symbol"]) and (since is None or t["timestamp"] >= since)]
 
     def fetch_funding_history(self, symbol=None, since=None, limit=None, params=None):
+        """Hyperliquid's userFunding from `since`: every coin's rows, at most 500, oldest first. ccxt 4.5 then labels
+        each one with the symbol asked for (parse_income's safe_market falls back to it), whatever its coin."""
         self._maybe_fail("funding")
-        return [dict(e) for e in self.incomes if symbol in (None, e["symbol"]) and (since is None or e["timestamp"] >= since)]
+        rows = [e for e in self.incomes if since is None or e["timestamp"] >= since][:self.FUNDING_PAGE]
+        return [{**e, "symbol": symbol or e["symbol"]} for e in rows]
 
     # ---- the passage of time ------------------------------------------------
     def move(self, coin: str, price: float, fill_at: float | None = None, dt_ms: int = 60_000) -> None:
@@ -267,17 +272,19 @@ class FakeHyperliquid:
             filled = self._fill(symbol, o["side"], min(o["amount"], pos["qty"]), px, fill_oid, o["reduceOnly"])
             self.status[oid].update(status="closed", filled=filled, average=px)
 
-    def charge_funding(self, coin: str, rate: float) -> None:
+    def charge_funding(self, coin: str, rate: float, dt_ms: int = 1) -> None:
         """Hyperliquid's hourly funding on the open position: longs pay a positive rate (usdc < 0 = paid)."""
         symbol = f"{coin}/USDC:USDC"
         pos = self.positions.get(symbol)
+        self.now += dt_ms
         if pos is None:
             return
         usdc = -(1 if pos["side"] == "long" else -1) * pos["qty"] * self.marks[symbol] * rate
         self.cash += usdc
-        self.now += 1
-        self.incomes.append({"info": {}, "symbol": symbol, "code": "USDC", "timestamp": self.now, "id": None,
-                             "amount": usdc, "rate": rate})
+        self.incomes.append({"info": {"time": self.now, "hash": "0x" + "0" * 64, "delta": {
+                                 "type": "funding", "coin": coin, "usdc": str(usdc), "fundingRate": str(rate)}},
+                             "symbol": symbol, "code": "USDC", "timestamp": self.now, "id": None, "amount": usdc,
+                             "rate": rate})
 
 
 def _broker(coin, ex, tmp_path, cap=None, **kw):
@@ -897,3 +904,25 @@ def test_ccxt_signs_no_builder_fee_approval_or_referrer_and_attaches_no_builder_
     for _ in range(3):
         ex.initialize_client()
     assert sent == [] and not ex.options.get("approvedBuilderFee")     # no builder attached to orders, nothing signed
+
+
+# ---------------------------------------------------------------- review: a trade's funding is its own coin's, all of it
+
+def test_a_trade_carries_only_its_own_coins_funding_read_from_every_page(tmp_path):
+    """Two coins on one account (the README's discouraged case, or a position held by hand). ccxt labels every
+    funding row with the symbol asked for, so BTC's trade was charged ETH's funding too; and only the first 500 rows
+    were read. A BTC long held 274 h (the BTC backtest's longest hold) next to an ETH long: 548 hourly rows."""
+    ex = FakeHyperliquid({"BTC": 80_000.0, "ETH": 2_500.0}, usdc=5_000.0, slip_bps=0.0)
+    eth = _broker("ETH", ex, tmp_path, cap=500.0, sleep=Sleeps())
+    eth.submit(Order("open", Side.LONG, 0.1, "breakout", stop=2_300.0))
+    eth.execute_now(2_500.0, ex.now)
+    btc = _broker("BTC", ex, tmp_path, cap=500.0, sleep=Sleeps())
+    btc.submit(Order("open", Side.LONG, 0.004, "breakout", stop=76_000.0))
+    btc.execute_now(80_000.0, ex.now)
+    for _ in range(274):
+        ex.charge_funding("BTC", 0.0000125, dt_ms=3_600_000)
+        ex.charge_funding("ETH", 0.0000125, dt_ms=0)            # the same hour's time as BTC's row
+    assert len(ex.incomes) > ex.FUNDING_PAGE
+    btc_paid = -sum(e["amount"] for e in ex.incomes if e["info"]["delta"]["coin"] == "BTC")
+    t = btc.close_now(80_000.0, ex.now, "trend_flip")
+    assert t.funding == pytest.approx(btc_paid) and btc_paid == pytest.approx(274 * 0.004 * 80_000 * 0.0000125)
