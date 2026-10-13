@@ -11,6 +11,8 @@ with no gaps and no double-counting.
 
 Each coin's ledger lives in ledger/<COIN>/ (saved to the paper-ledger branch, so the
 experiment's history is permanent and auditable): paper.json + kills.json + board.json.
+
+`step_basket()` does the same for the VT basket (desk/voltrend.py) in ledger/VT/.
 """
 
 from __future__ import annotations
@@ -21,13 +23,15 @@ from pathlib import Path
 
 from . import board as board_mod
 from . import indicators as ind
+from . import voltrend
 from .brokers.sim import SimBroker
 from .engine import Desk, Kills
 from .filter import evaluate_entry
-from .thresholds import Params, report_name
+from .thresholds import VOLTREND, Params, VolTrend, report_name
 
 LOOKBACK_BARS = 1500
 FUNDING_WINDOW_MS = 4 * 86400_000
+VT_LOOKBACK_DAYS = 120    # daily candles per VT coin per run: the 50-day average and vol need 50, the rest is margin
 
 
 def _write(path: Path, data: dict) -> None:
@@ -140,6 +144,110 @@ def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=
                                 "source": f"hyperliquid · {p.market.interval}", "funding_prints": len(funding),
                                 "requests": feed.requests, "latency_ms": feed.last_latency_ms,
                                 "age_s": (now - (f.bars[-1].ts + f.bar_ms)) / 1000})
+    state["paper"] = {"days": (now - meta["started_ts"]) / 86400_000, "start_equity": meta["start_equity"],
+                      "runs": meta["runs"], "bars_processed_this_run": processed,
+                      "new_events": [{"ts": e.ts, "agent": e.agent, "text": e.text} for e in new_events],
+                      "changed": bool(processed or new_events)}
+    _write(ledger_dir / "board.json", state)
+    return state
+
+
+def step_basket(vt: VolTrend = VOLTREND, ledger_dir: str | Path = "ledger/VT", feeds: dict | None = None, log=print,
+                now_ms: int | None = None) -> dict:
+    """The VT basket's step, with `step`'s contract: idempotent and catch-up safe.
+
+    Every daily close since the last run goes through voltrend.advance, the backtest's own loop. Day one opens the
+    account flat; the first decision is at the next 00:00 UTC close. Orders decided at a close fill at the open of
+    the bar that's forming now: the backtest's price, without waiting a day. Hyperliquid rate-limits, so a run makes
+    one candle request per coin, plus one funding request per coin only when a day has closed to process.
+    """
+    from .feeds.hyperliquid import HyperliquidFeed
+
+    ledger_dir = Path(ledger_dir)
+    lpath = ledger_dir / "paper.json"
+    feeds = feeds or {c: HyperliquidFeed(c, vt.interval) for c in vt.coins}
+    now = now_ms or int(time.time() * 1000)
+    day = voltrend.DAY_MS
+    need = max(vt.sma_bars, vt.vol_lookback + 1)
+
+    book = voltrend.Book(vt)
+    meta = {"started_ts": now, "start_equity": vt.starting_equity, "last_bar_ts": 0, "runs": 0,
+            "interval": vt.interval, "strategy": "voltrend"}
+    if lpath.exists():
+        saved = json.loads(lpath.read_text())
+        book.load_dict(saved["broker"])
+        meta.update(saved["meta"])
+        if meta.get("strategy") != "voltrend" or meta.get("interval") != vt.interval:
+            # an error, not SystemExit: cmd_step reports it and the desk accounts still run
+            raise RuntimeError(f"{lpath} isn't a {vt.interval} vol-trend ledger; refusing to continue")
+    seen = {id(e) for e in book.events}
+
+    # Enough history for the 50-day average at the oldest close still to process (after an outage, fetch more).
+    since = now - VT_LOOKBACK_DAYS * day
+    if meta["last_bar_ts"]:
+        since = min(since, meta["last_bar_ts"] - (need + 10) * day)
+    raw = {c: feeds[c].candles(start_ms=since, closed_only=False) for c in vt.coins}
+    closed = {c: [b for b in bars if b.ts + day <= now] for c, bars in raw.items()}
+    forming = {c: bars[-1] for c, bars in raw.items() if bars and bars[-1].ts + day > now}
+    for c in vt.coins:
+        if len(closed[c]) < need:   # a short or broken answer must never read as "below the average": sell everything
+            raise RuntimeError(f"{c}: only {len(closed[c])} closed daily candles from the feed, need {need}")
+    # A day is processed once every coin has reported it: its bar has closed, or a later bar exists (then that
+    # coin's bar for the day is missing for good, and it sits the day out, as in the backtest).
+    covered = min(forming[c].ts - day if c in forming else closed[c][-1].ts for c in vt.coins)
+
+    processed = 0
+    if not meta["last_bar_ts"]:
+        # Day one: open flat. The history is for the averages, not for trading.
+        meta["last_bar_ts"] = covered
+        book.say(now, "chief", f"${vt.starting_equity:,.0f} paper account opened: {', '.join(vt.coins)}, a third each. "
+                               "first decision at the next 00:00 UTC close.")
+        log(f"VT paper ledger opened with ${vt.starting_equity:,.2f}; the first decision is at the next 00:00 UTC close")
+    else:
+        days = sorted({b.ts for c in vt.coins for b in closed[c] if meta["last_bar_ts"] < b.ts <= covered})
+        if days:
+            for c in vt.coins:
+                if sum(1 for b in closed[c] if b.ts <= days[0]) < need:
+                    raise RuntimeError(f"{c}: not enough daily history before {days[0]} for the {vt.sma_bars}-day average")
+            # Funding only for the days being processed: (first day's open, now].
+            fbar = {c: ind.funding_per_bar(closed[c], feeds[c].funding(days[0]), day) for c in vt.coins}
+
+            def after(b, d):
+                log(f"[{time.strftime('%Y-%m-%d', time.gmtime(d / 1000))} close] VT equity ${b.equity_curve[-1][1]:,.2f} · "
+                    + (", ".join(f"{c} {o['kind']} {o['usd']:+,.2f}" for c, o in b.pending.items()) or "no orders"))
+
+            voltrend.advance(book, closed, fbar, days, after=after)
+            meta["last_bar_ts"] = days[-1]
+            processed = len(days)
+
+    # The bar that's forming now: orders decided at the last close fill at its open, as in the backtest. Only for a
+    # coin whose closed bars are all processed (otherwise its order belongs to an earlier open).
+    for c in vt.coins:
+        bar = forming.get(c)
+        if bar is not None and bar.ts > meta["last_bar_ts"] and not any(b.ts > meta["last_bar_ts"] for b in closed[c]):
+            book.fill_pending(c, bar.open, bar.ts)
+    marks = {c: (forming[c] if c in forming else closed[c][-1]).close for c in vt.coins}
+    preview = {}
+    for c in vt.coins:
+        if c not in book.signals:   # day one: no decision yet, show what the rule sees at the last close
+            sig = voltrend.signal([b.close for b in closed[c] if b.ts <= meta["last_bar_ts"]], vt)
+            preview[c] = {**sig, "target": sig["raw"], "held": 0.0, "ts": None}
+
+    new_events = [e for e in book.events if id(e) not in seen]
+    meta["runs"] += 1
+    meta["last_run_ts"] = now
+    # Stored under "broker" like the desk's ledgers: the workflow's commit message reads broker.cash from each one.
+    _write(lpath, {"meta": meta, "broker": book.to_dict()})
+
+    goal_cagr = None
+    rep = Path(f"reports/{report_name('VT')}.json")
+    if rep.exists():
+        goal_cagr = json.loads(rep.read_text()).get("full", {}).get("cagr")
+    state = board_mod.basket(book, marks=marks, now_ms=now, meta=meta, goal_cagr=goal_cagr, preview=preview, crawler={
+        "source": f"hyperliquid · {vt.interval}", "bars": sum(len(v) for v in closed.values()),
+        "requests": sum(getattr(f, "requests", 0) for f in feeds.values()),
+        "latency_ms": max((getattr(f, "last_latency_ms", 0.0) for f in feeds.values()), default=0.0),
+        "age_s": (now - (meta["last_bar_ts"] + day)) / 1000})
     state["paper"] = {"days": (now - meta["started_ts"]) / 86400_000, "start_equity": meta["start_equity"],
                       "runs": meta["runs"], "bars_processed_this_run": processed,
                       "new_events": [{"ts": e.ts, "agent": e.agent, "text": e.text} for e in new_events],

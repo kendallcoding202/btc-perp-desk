@@ -7,6 +7,7 @@ says is always what the desk actually thought.
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from datetime import datetime, timezone
 
 from . import indicators as ind
@@ -307,4 +308,84 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
             "calls": getattr(jev_client, "calls", 0), "answers": dec.jev_answers if dec else None,
         },
         "events": [{"ts": e.ts, "agent": e.agent, "text": e.text} for e in list(desk.events)[-30:]],
+    }
+
+
+def basket(book, *, now_ms: int, marks: dict[str, float], meta: dict, crawler: dict | None = None,
+           goal_cagr: float | None = None, preview: dict | None = None, equity_points: int = 400) -> dict:
+    """The VT basket's board (desk/voltrend.py). Its own panels are under "basket". The keys the desk boards carry
+    are kept, empty where they don't apply (no agents, no candle chart, no gates), so a desk renderer still works.
+
+    `preview` = what the rule sees at the last close for a coin it hasn't decided on yet (day one): shown, with
+    decided_ts None, so the table isn't empty until the first decision."""
+    vt = book.vt
+    day_ms = 86400_000
+    now = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc)
+    equity = book.equity(marks)
+    start_eq = meta.get("start_equity", vt.starting_equity)
+    holdings = []
+    for c in vt.coins:
+        s, sig = book.sleeves[c], book.signals.get(c) or (preview or {}).get(c, {})
+        mark = marks.get(c, s.mark)
+        close, sma = sig.get("close"), sig.get("sma")
+        holdings.append({
+            "coin": c, "decided_ts": sig.get("ts"), "close": close, "sma50": sma,
+            "sma_gap": close / sma - 1 if close and sma else None, "above_sma": bool(close and sma and close > sma),
+            "vol10": sig.get("vol"), "warm": sig.get("warm", False),
+            "target_units": sig.get("target"), "held_units": s.units,
+            "qty": s.qty, "avg_entry": s.avg_entry, "mark": mark, "notional": s.qty * mark,
+            "weight": s.qty * mark / equity if equity > 0 else 0.0, "unrealised": s.qty * (mark - s.avg_entry),
+            "pending": book.pending.get(c),
+        })
+    held = [h for h in holdings if h["qty"] > 0]
+    notional = sum((h["notional"] for h in held), 0.0)
+    unreal = sum((h["unrealised"] for h in held), 0.0)
+    cost = sum((h["qty"] * h["avg_entry"] for h in held), 0.0)
+    wins = sum(1 for t in book.trades if t["net_pnl"] > 0)
+    losses = len(book.trades) - wins
+    started = meta.get("started_ts", now_ms)
+    return {
+        "updated": now_ms,
+        "header": {
+            "title": "VT VOL-TREND BASKET", "coin": "VT", "kind": "basket", "coins": list(vt.coins),
+            "tagline": f"{' · '.join(vt.coins)} · A THIRD EACH · LONG ABOVE THE {vt.sma_bars}-DAY AVERAGE",
+            "experiment": EXPERIMENTS.get("VT"), "risk_per_trade": None, "shorts": False,
+            "mode": "PAPER", "venue": "hyperliquid", "interval": vt.interval,
+            "day": int((now_ms - started) / day_ms) + 1, "date": now.strftime("%b %d").upper(),
+            "time": now.strftime("%H:%M"),
+        },
+        "ticker": {
+            "price": None, "change_24h": None, "bank": equity, "pnl": equity - start_eq,
+            "pnl_pct": equity / start_eq - 1, "position": f"LONG {len(held)}/{len(vt.coins)}" if held else "FLAT",
+            "position_detail": " · ".join(f"{h['coin']} {h['held_units']:.2f}u" for h in held),
+            "hold_pct": unreal / cost if cost else 0.0, "record": f"{wins}W {losses}L", "fees": book.fees_total,
+            "cash": book.cash, "pos": None, "funding": book.funding_total, "unrealised": unreal,
+            "notional": notional, "exposure": notional / equity if equity > 0 else 0.0,
+        },
+        "basket": {
+            "holdings": holdings,
+            "next_decision_ts": (now_ms // day_ms + 1) * day_ms,           # every 00:00 UTC
+            "last_close_ts": meta["last_bar_ts"] + day_ms if meta.get("last_bar_ts") else None,
+            "orders": {"submitted": book.orders_submitted, "filled": book.orders_filled,
+                       "blocked": book.orders_blocked},
+            "fills": book.fills[-30:], "trades": book.trades[-30:],
+            "rules": asdict(vt),
+            "sleeve": 1 / len(vt.coins), "crawler": crawler or {},
+        },
+        "equity": [[ts, round(eq, 2)] for ts, eq in _thin(book.equity_curve, equity_points)],
+        "pnl_bars": [round(t["net_pnl"], 2) for t in book.trades[-80:]],
+        "goal": goal(equity, start_eq, vt.goal_equity, goal_cagr, (now_ms - started) / day_ms),
+        "events": [{"ts": e.ts, "agent": e.agent, "text": e.text} for e in list(book.events)[-30:]],
+        # what the desk boards have and the basket doesn't
+        "agents": [],
+        "chart": {"candles": [], "ema_fast": [], "ema_slow": [], "don_hi": [], "don_lo": [], "stop": None,
+                  "entry": None, "markers": [], "bar_ms": day_ms},
+        "analysis": {"stats": {"price": None, "change_24h": None, "atr_pct": None, "funding_apr": None,
+                               "open_interest_usd": None, "spread_bps": None, "depth_usd": None},
+                     "gates": [], "outlook": [], "outlook_side": "long", "scanned": len(book.equity_curve),
+                     "direction": None},
+        "thresholds": [],
+        "kills": {"flat_kill": False, "entry_kill": False, "jev_kill": False, "halted": False, "daily_locked": False,
+                  "cooldown": False},
+        "jev": {"mode": "off", "enabled": False, "calls": 0, "answers": None},
     }

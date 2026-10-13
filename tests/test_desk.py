@@ -16,7 +16,7 @@ from desk.brokers.sim import SimBroker
 from desk.engine import Desk, Kills
 from desk.filter import evaluate_entry
 from desk.models import Bar, FundingEvent, MarketContext, Order, Side, Verdict
-from desk.thresholds import DEFAULT, INTERVAL_SECONDS, VOLTREND
+from desk.thresholds import DEFAULT, EXPERIMENTS, INTERVAL_SECONDS, VOLTREND
 
 H4 = INTERVAL_SECONDS["4h"] * 1000
 # Tests run a 4h desk on synthetic 4h bars, independent of whatever thresholds.py currently defaults to.
@@ -384,6 +384,13 @@ def daily(n=260, seed=1, drift=0.002, vol=0.035, start=100.0, skip=()):
     return bars
 
 
+def hourly_funding(bars, seed):
+    """Hyperliquid-style prints: every hour, a few ms late, mostly longs paying."""
+    rnd = random.Random(seed)
+    t0, t1 = bars[0].ts, bars[-1].ts + DAY
+    return [FundingEvent(t, rnd.gauss(1e-5, 2e-5)) for t in range(t0 + 3600_000 + 17, t1 + 1, 3600_000)]
+
+
 def test_vt_units_match_a_plain_computation():
     import statistics
 
@@ -473,6 +480,149 @@ def test_vt_perp_accounting_realises_pnl_as_the_position_shrinks():
     assert t["net_pnl"] == pytest.approx(pnl - fees) and t["entry_ts"] == 0 and t["exit_ts"] == 3 * DAY
     said = " ".join(e.text for e in book.events)
     assert "BOUGHT" in said and "ADDED" in said and "TRIMMED" in said and "SOLD" in said
+
+
+class FakeDailyFeed:
+    """One coin's daily candles as an exchange serves them at clock["now"]: the closed ones plus the one forming.
+    `lag` hides the newest N of them, like a feed that hasn't caught up yet (they show up on a later call)."""
+
+    def __init__(self, bars, funding, clock):
+        self.bars, self.all_funding, self.clock = bars, funding, clock
+        self.requests, self.last_latency_ms, self.bar_ms, self.lag = 0, 1.0, DAY, 0
+
+    def candles(self, start_ms=0, end_ms=None, closed_only=True):
+        self.requests += 1
+        now = self.clock["now"]
+        out = [b for b in self.bars if start_ms <= b.ts <= now and (not closed_only or b.ts + DAY <= now)]
+        return out[:len(out) - self.lag]
+
+    def funding(self, start_ms, end_ms=None):
+        self.requests += 1
+        return [e for e in self.all_funding if start_ms <= e.ts <= self.clock["now"]]
+
+
+def _vt_market():
+    series = {"BTC": daily(seed=11), "ETH": daily(seed=12, skip=(170, 171)), "SOL": daily(seed=13, vol=0.05, skip=(200,))}
+    return series, {c: hourly_funding(b, k) for k, (c, b) in enumerate(series.items())}
+
+
+def test_vt_paper_stepping_matches_the_backtest(tmp_path):
+    """Stepping the VT ledger as the cron does must give exactly what one backtest over the same days gives (same
+    fills, cash, equity curve and events): through missed days, an 80-day outage, a feed that's a day behind for
+    one coin, days a coin has no bar at all, and orders filled at the open of the bar that's still forming."""
+    series, funding = _vt_market()
+    clock = {}
+    feeds = {c: FakeDailyFeed(series[c], funding[c], clock) for c in series}
+    t0, start = series["BTC"][0].ts, 60
+    clock["now"] = t0 + start * DAY + DAY // 2           # day 60 is forming: the account opens, flat
+    paper.step_basket(VOLTREND, tmp_path, feeds=feeds, log=lambda *a: None, now_ms=clock["now"])
+    rnd, k, caught_up, forming_fills, lagged = random.Random(2), start, 0, 0, 0
+    while k < 260:
+        k = min(260, k + (80 if 100 <= k < 105 else rnd.choice([1, 1, 2, 3, 5])))   # the cron misses runs
+        clock["now"] = t0 + k * DAY + DAY // 2 + (DAY if k == 260 else 0)
+        for f in feeds.values():                        # a coin's newest closed bar and the forming one, late
+            f.lag = 2 if k < 260 and rnd.random() < 0.25 else 0
+        lagged += any(f.lag for f in feeds.values())
+        s = paper.step_basket(VOLTREND, tmp_path, feeds=feeds, log=lambda *a: None, now_ms=clock["now"])
+        caught_up = max(caught_up, s["paper"]["bars_processed_this_run"])
+        led = json.loads((tmp_path / "paper.json").read_text())["broker"]
+        forming_fills += sum(1 for f in led["fills"] if f["ts"] == t0 + k * DAY and k < 260)   # filled before it closed
+    led = json.loads((tmp_path / "paper.json").read_text())
+
+    ref = voltrend.run(series, funding, VOLTREND, start_ms=t0 + start * DAY).book
+    b = led["broker"]
+    assert {f["kind"] for f in ref.fills} == {"entry", "resize", "exit"} and len(ref.fills) > 10
+    assert caught_up >= 80 and forming_fills > 0 and lagged > 3
+    assert b["fills"] == ref.fills and b["trades"] == ref.trades and b["pending"] == ref.pending
+    assert b["cash"] == ref.cash and b["funding_total"] == ref.funding_total != 0
+    assert [tuple(x) for x in b["equity_curve"]] == ref.equity_curve
+    assert b["sleeves"] == {c: s.__dict__ for c, s in ref.sleeves.items()}
+    events = [(e["ts"], e["agent"], e["text"]) for e in b["events"]]
+    assert "opened" in events[0][2] and len(events) < 200
+    assert events[1:] == [(e.ts, e.agent, e.text) for e in ref.events]
+    assert led["meta"]["strategy"] == "voltrend" and led["meta"]["interval"] == "1d"
+    assert led["meta"]["last_bar_ts"] == t0 + 259 * DAY
+
+
+def test_vt_board_carries_the_experiment_label(tmp_path):
+    series, funding = _vt_market()
+    clock = {"now": series["BTC"][0].ts + 150 * DAY + DAY // 2}
+    feeds = {c: FakeDailyFeed(series[c], funding[c], clock) for c in series}
+    paper.step_basket(VOLTREND, tmp_path, feeds=feeds, log=lambda *a: None, now_ms=clock["now"])
+    clock["now"] += 3 * DAY
+    s = paper.step_basket(VOLTREND, tmp_path, feeds=feeds, log=lambda *a: None, now_ms=clock["now"])
+    b = json.loads((tmp_path / "board.json").read_text())
+    assert b == json.loads(json.dumps(s))
+    assert b["header"]["experiment"] == EXPERIMENTS["VT"] and "paper experiment" in b["header"]["experiment"]
+    assert b["header"]["coin"] == "VT" and b["header"]["kind"] == "basket"
+    assert [h["coin"] for h in b["basket"]["holdings"]] == ["BTC", "ETH", "SOL"]
+    assert b["basket"]["next_decision_ts"] % DAY == 0 and 0 < b["basket"]["next_decision_ts"] - clock["now"] <= DAY
+    held = sum(h["qty"] * (h["mark"] - h["avg_entry"]) for h in b["basket"]["holdings"])
+    assert b["ticker"]["bank"] == pytest.approx(b["ticker"]["cash"] + held)   # re-markable from live mids
+    assert b["goal"]["start"] == VOLTREND.starting_equity == 500 and b["paper"]["runs"] == 2
+
+
+def test_step_runs_vt_and_one_failure_never_stops_the_others(tmp_path, monkeypatch):
+    import argparse
+    import time as time_mod
+
+    from desk import __main__ as cli
+    from desk.feeds import hyperliquid
+
+    today = int(time_mod.time() * 1000) // DAY * DAY
+    bars = {c: [Bar(today - (200 - k) * DAY, b.open, b.high, b.low, b.close) for k, b in enumerate(daily(n=201, seed=s))]
+            for c, s in (("BTC", 21), ("ETH", 22), ("SOL", 23))}
+
+    class Feed(FakeDailyFeed):           # what cmd_step builds for VT, minus the network
+        def __init__(self, coin, interval):
+            super().__init__(bars[coin], [], {"now": int(time_mod.time() * 1000)})
+
+    def desk_step(p, ledger_dir, jev=None, **kw):
+        raise TimeoutError("rate limited")
+
+    monkeypatch.setattr(hyperliquid, "HyperliquidFeed", Feed)
+    monkeypatch.setattr(paper, "step", desk_step)
+    monkeypatch.delenv("NTFY_TOPIC", raising=False)
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    args = argparse.Namespace(coins="ETH,VT", ledger=str(tmp_path), interval=None, risk=None, jev_mode="off", coin=None)
+    assert cli.cmd_step(args) == 1                        # ETH failed...
+    idx = json.loads((tmp_path / "index.json").read_text())["coins"]
+    assert [c["coin"] for c in idx] == ["ETH", "VT"] and "rate limited" in idx[0]["error"]
+    assert idx[1]["kind"] == "basket" and idx[1]["bank"] == 500.0 and len(idx[1]["holdings"]) == 3   # ...VT ran
+    assert json.loads((tmp_path / "VT" / "paper.json").read_text())["meta"]["strategy"] == "voltrend"
+
+    def vt_step(vt, ledger_dir, **kw):
+        raise ValueError("bad candles")
+
+    ran = []
+    monkeypatch.setattr(paper, "step_basket", vt_step)
+    monkeypatch.setattr(paper, "step", lambda p, d, jev=None, **kw: ran.append(p.market.symbol) or {
+        "paper": {"changed": False, "new_events": []}, "updated": 1, "header": {"coin": p.market.symbol},
+        "ticker": {"bank": 150.0, "pnl": 0.0, "pnl_pct": 0.0, "position": "FLAT", "position_detail": "",
+                   "record": "0W 0L", "price": 100.0}, "goal": {"start": 150.0, "target": 1e5, "progress": 0.0}})
+    args.coins = "BTC,VT,SOL"
+    assert cli.cmd_step(args) == 1 and ran == ["BTC", "SOL"]   # VT failed; BTC and SOL still ran
+    idx = json.loads((tmp_path / "index.json").read_text())["coins"]
+    assert "bad candles" in idx[1]["error"] and idx[2]["bank"] == 150.0 and idx[0]["kind"] == "desk"
+
+
+def test_vt_fills_are_pushed_as_trades(monkeypatch):
+    from desk import __main__ as cli
+
+    sent = []
+    monkeypatch.setenv("NTFY_TOPIC", "test-topic")
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: sent.append(req) or io_ok())
+    state = {"header": {"coin": "VT", "kind": "basket"},
+             "ticker": {"bank": 512.3, "pnl_pct": 0.0246, "position": "LONG 2/3", "price": None},
+             "paper": {"new_events": [{"agent": "fills", "text": "ADDED 0.01 ETH @ $2,500.00 (resize to 1.20 units)"}]}}
+    cli._notify(state)
+    assert sent[0].headers["Title"] == "VT basket: TRADE" and b"ADDED" in sent[0].data and b"$512.30" in sent[0].data
+
+
+def io_ok():
+    import io
+
+    return io.BytesIO(b"ok")
 
 
 # ---------------------------------------------------------------- jev

@@ -194,6 +194,8 @@ VOLTREND = VolTrend()
 
 # The paper accounts the desk runs, $150 each. Same strategy for every coin; only what's listed here differs.
 COINS = ("BTC", "ETH", "SOL")
+# Every paper account `python -m desk step` runs: the three desk coins, plus the VT basket.
+ACCOUNTS = (*COINS, "VT")
 COIN_OVERRIDES: dict[str, dict] = {
     # ETH and SOL swing harder than BTC: at BTC's 5% risk both hit the 40% drawdown halt in the
     # 2020-26 backtest (ETH in 2024, SOL in 2021). At 2%: ETH +65% (26% worst drop), SOL +40% (17%).

@@ -4,7 +4,7 @@
     vt-backtest  the VT vol-trend basket's backtest (BTC+ETH+SOL, daily), write reports/backtest-VT.md
     replay       watch the desk trade history on the board (http://127.0.0.1:8787)
     paper        one coin's $150 paper account on live Hyperliquid prices, with a live local board
-    step         process newly closed bars for every paper account (BTC, ETH, SOL) once, then exit (cron / Actions)
+    step         process newly closed bars for every paper account (BTC, ETH, SOL, VT) once, then exit (cron / Actions)
     live         trade real money — refuses unless the backtest AND paper record pass
     reset-halt   clear a drawdown halt after you've looked at what happened
     jev-test     check that JEV_API_KEY works
@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 
 from . import backtest as bt
-from .thresholds import COINS, DEFAULT, VOLTREND, Params, params_for, report_name
+from .thresholds import ACCOUNTS, COINS, DEFAULT, EXPERIMENTS, VOLTREND, Params, params_for, report_name
 
 
 def _load_env(path: str = ".env") -> None:
@@ -168,10 +168,12 @@ def _notify(state: dict) -> None:
 
     t, coin = state["ticker"], state["header"].get("coin", "BTC")
     body = "\n".join(f"{e['agent'].upper()}: {e['text']}" for e in events)
-    body += f"\n\n{coin} account ${t['bank']:,.2f} ({t['pnl_pct']:+.2%}) · {t['position']} · {coin} ${t['price']:,.2f}"
-    trade = any(w in body for w in ("BOUGHT", "SOLD", "SHORTED", "COVERED", "HALT", "daily"))
+    body += f"\n\n{coin} account ${t['bank']:,.2f} ({t['pnl_pct']:+.2%}) · {t['position']}"
+    body += f" · {coin} ${t['price']:,.2f}" if t.get("price") is not None else ""    # the VT basket has no one price
+    trade = any(w in body for w in ("BOUGHT", "SOLD", "SHORTED", "COVERED", "ADDED", "TRIMMED", "HALT", "daily"))
+    name = "basket" if state["header"].get("kind") == "basket" else "desk"
     req = urllib.request.Request(f"https://ntfy.sh/{topic}", data=body.encode(), method="POST", headers={
-        "Title": f"{coin} desk: " + ("TRADE" if trade else "update"), "Priority": "high" if trade else "default",
+        "Title": f"{coin} {name}: " + ("TRADE" if trade else "update"), "Priority": "high" if trade else "default",
         "Tags": "chart_with_upwards_trend" if trade else "robot"})
     try:
         urllib.request.urlopen(req, timeout=10).read()
@@ -193,7 +195,7 @@ def migrate_ledger(root: Path) -> bool:
 
 
 def cmd_step(args) -> int:
-    """One pass over every paper account. A coin that errors is reported and skipped; the others still run."""
+    """One pass over every paper account. An account that errors is reported and skipped; the others still run."""
     import time
     import traceback
 
@@ -204,10 +206,13 @@ def cmd_step(args) -> int:
     migrated = migrate_ledger(root)
     changed, failed, summary = migrated, [], []
     for coin in coins:
-        p = _params(args, coin)
         try:
-            s = paper.step(p, root / coin, jev=_jev(p))
-        except Exception as exc:  # e.g. a rate-limited API call: retry next run, don't lose the other coins
+            if coin == "VT":    # the vol-trend basket: its own strategy (desk/voltrend.py), paper only
+                s = paper.step_basket(VOLTREND, root / coin)
+            else:
+                p = _params(args, coin)
+                s = paper.step(p, root / coin, jev=_jev(p))
+        except Exception as exc:  # e.g. a rate-limited API call: retry next run, don't lose the other accounts
             failed.append(coin)
             print(f"  {coin}: step failed: {type(exc).__name__}: {exc}")
             traceback.print_exc()
@@ -218,10 +223,15 @@ def cmd_step(args) -> int:
         t, g = s["ticker"], s["goal"]
         print(f"  {coin}: equity {t['bank']:,.2f} ({t['pnl_pct']:+.2%}) · {t['position']} {t['position_detail']} · "
               f"{t['record']} · {g['progress']:.1%} of the way to ${g['target']:,.0f}")
-        summary.append({"coin": coin, "bank": t["bank"], "start": g["start"], "pnl": t["pnl"], "pnl_pct": t["pnl_pct"],
-                        "position": t["position"], "record": t["record"], "price": t["price"],
-                        "risk_per_trade": p.sizing.risk_per_trade, "shorts": p.strategy.allow_shorts,
-                        "updated": s["updated"]})
+        row = {"coin": coin, "bank": t["bank"], "start": g["start"], "pnl": t["pnl"], "pnl_pct": t["pnl_pct"],
+               "position": t["position"], "record": t["record"], "price": t["price"], "updated": s["updated"]}
+        if coin == "VT":    # cash + holdings let a viewer re-mark the bank from live mids
+            row.update({"kind": "basket", "cash": t["cash"], "experiment": EXPERIMENTS.get("VT"),
+                        "holdings": [{k: h[k] for k in ("coin", "qty", "avg_entry", "held_units", "mark")}
+                                     for h in s["basket"]["holdings"]]})
+        else:
+            row.update({"kind": "desk", "risk_per_trade": p.sizing.risk_per_trade, "shorts": p.strategy.allow_shorts})
+        summary.append(row)
     root.mkdir(parents=True, exist_ok=True)
     (root / "index.json").write_text(json.dumps({"updated": int(time.time() * 1000), "coins": summary}))
     if os.environ.get("GITHUB_OUTPUT"):   # tells the workflow whether the ledger needs saving
@@ -350,8 +360,8 @@ def main(argv=None) -> int:
 
     sp = sub.add_parser("step")
     common(sp)
-    sp.add_argument("--coins", default=",".join(COINS), help="comma-separated paper accounts to step")
-    sp.add_argument("--ledger", default="ledger", help="ledger root; each coin lives in <root>/<COIN>/")
+    sp.add_argument("--coins", default=",".join(ACCOUNTS), help="comma-separated paper accounts to step (VT = basket)")
+    sp.add_argument("--ledger", default="ledger", help="ledger root; each account lives in <root>/<COIN>/")
     sp.set_defaults(fn=cmd_step)
 
     for name, fn in (("paper", cmd_paper), ("live", cmd_live)):
