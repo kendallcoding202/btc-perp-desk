@@ -1,0 +1,39 @@
+---
+description: How the phone dashboard is built and how to review or change it safely
+globs: dashboard/**
+alwaysApply: false
+---
+
+# How the dashboard works
+
+A static site with no build step and no framework, published by the paper workflow to GitHub Pages.
+
+- `index.html` and `style.css`: the layout. It is phone-first; the owner mostly views it on an iPhone.
+- `app.js`: fetches `boards/<ACCOUNT>.json` (BTC, ETH, SOL, VT) and `boards/index.json`, renders them, and polls Hyperliquid's public API in the viewer's browser for live prices and candles. After each board load it fires the window event `desk:board`, and after each live price `desk:tick`. Other scripts listen to these rather than editing app.js.
+- `spider.js`: a decorative pixel spider that walks to whatever the last board shows the desk did. It changes nothing about trading, and it sleeps when the board is more than 2.5h old (the footer button says why).
+- `boards/*.json` are generated each run by `desk/board.py`. Never hand-edit them. If the page needs a new field, add it in `board.py`, in a small separate function, with a test.
+- The VT tab (`header.kind === "basket"`, `body.kind-basket`) has no agent cards, price chart or buy line. It shows the three coin sleeves (`#holdings`) and the bank (`#vt-ticker`) instead.
+
+# Constraints
+
+- **Main targets: iPhone 390×844 and 375×667,** then desktop at 1280×900. No horizontal scroll at any width. Keep text readable without zooming.
+- **Performance:** animate with `transform`/`opacity` and requestAnimationFrame. Stop animating when the tab is hidden, and hold still under `prefers-reduced-motion`. Don't read layout every frame. The spider averages about 10–20 frames/s, so keep the page around that.
+- **Network:** only Hyperliquid's public API (`api.hyperliquid.xyz`, already used) and Google Fonts. No new CDNs, trackers or libraries without a strong reason.
+- Keep the PAPER badge visible, the four tabs, the spider, and its footer on/off toggle.
+
+# Previewing locally (no keys needed)
+
+```bash
+pip install -r requirements.txt
+mkdir -p /tmp/desk-preview/ledger /tmp/desk-preview/site/boards
+# optional: start from the real accounts so the boards look like production
+for a in BTC ETH SOL VT; do mkdir -p /tmp/desk-preview/ledger/$a
+  curl -s https://raw.githubusercontent.com/kendallcoding202/btc-perp-desk/paper-ledger/ledger/$a/paper.json -o /tmp/desk-preview/ledger/$a/paper.json; done
+env -u JEV_API_KEY -u NTFY_TOPIC python3 -m desk step --ledger /tmp/desk-preview/ledger
+cp dashboard/* /tmp/desk-preview/site/
+for a in BTC ETH SOL VT; do cp /tmp/desk-preview/ledger/$a/board.json /tmp/desk-preview/site/boards/$a.json; done
+cp /tmp/desk-preview/ledger/index.json /tmp/desk-preview/site/boards/index.json
+cd /tmp/desk-preview/site && python3 -m http.server 8000   # open http://localhost:8000/#BTC (or #ETH, #SOL, #VT)
+```
+
+This writes only to `/tmp/desk-preview`, never to the real ledgers. Re-run the `desk step` and copy lines to refresh the boards. The live site is https://kendallcoding202.github.io/btc-perp-desk/.
