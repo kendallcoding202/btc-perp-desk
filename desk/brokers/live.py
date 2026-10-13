@@ -176,6 +176,7 @@ class LiveBroker:
         self.alerts: list[tuple[int, str]] = []
         self.stop_order_id: str | None = None
         self.stop_px: float | None = None     # trigger of that resting stop, as the venue rounded it
+        self.entry_order_id: str | None = None  # the desk's own entry order (an opening fill from any other is an add)
         self.last_price: float | None = None
         self.stops_to_clean = False           # a close left reduce-only stops behind that couldn't be cancelled yet
         self.defer_stops = False              # catching up missed bars: trail moves are kept, sent once at the end
@@ -367,13 +368,13 @@ class LiveBroker:
                 self.alert(f"the exchange holds a {side.value} {qty:g} {self.coin}, not the desk's "
                            f"{self.position.side.value}: adopting the exchange's position")
             self.position = Position(side, qty, entry, self.clock(), stop=0.0, best_close=entry)
-            self.stop_order_id = self.stop_px = None
+            self.stop_order_id = self.stop_px = self.entry_order_id = None
             stops = self._resting_stops(self._closing_side(side))
             if stops:
                 self.position.stop = self.stop_px = _trigger(stops[0])
                 self.stop_order_id = str(stops[0]["id"])
         elif side is not None:
-            self.position.qty = qty
+            self._follow_size(qty, entry)
         if self.position is not None and self.position.stop:
             self._check_stop_resting()
         elif self.position is None and self.stops_to_clean:
@@ -381,17 +382,49 @@ class LiveBroker:
         self.cash = self._balance()
         self._save_local()
 
+    def _follow_size(self, qty: float, entry: float) -> None:
+        """The exchange holds the desk's side at another size: something closed part of it (by hand, or a close
+        that only partly filled) or added to it. Follow the exchange's size, so the stop and the next close cover
+        exactly what is open. Nothing is booked yet: when the position closes, the trade is booked from every one of
+        its closing fills since the entry, the part that went early included."""
+        pos = self.position
+        if math.isclose(qty, pos.qty, rel_tol=1e-9, abs_tol=1e-12):
+            return
+        if qty < pos.qty:
+            self.alert(f"the exchange holds {qty:g} {self.coin}, less than the desk's {pos.qty:g}: part of the "
+                       f"position was closed outside the desk. Following the exchange; the whole trade is booked from "
+                       f"its fills when it closes")
+        else:
+            self.alert(f"the exchange holds {qty:g} {self.coin}, more than the desk's {pos.qty:g}: something added to "
+                       f"the position. Following the exchange (average entry {entry:,.2f}) and resizing the stop")
+            if entry > 0:
+                pos.entry_price = entry
+        pos.qty = qty
+
+    def _covers(self, o: dict) -> bool:
+        """Whether a resting stop is big enough for the whole open position (a stop sized for less leaves the rest
+        unprotected when it fires)."""
+        amt = o.get("remaining") if o.get("remaining") is not None else o.get("amount")
+        return amt is None or float(amt) >= self._amount(self.position.qty) * (1 - 1e-9)
+
     def _check_stop_resting(self) -> None:
-        """Every sync while a position is open: the desk's stop must be resting on the exchange."""
+        """Every sync while a position is open: the desk's stop must be resting on the exchange, sized for the whole
+        position."""
         pos = self.position
         stops = self._resting_stops(self._closing_side(pos.side))
         want = self._px(pos.stop)
         at_stop = [o for o in stops if math.isclose(_trigger(o), want, rel_tol=1e-9)]
-        if at_stop:
-            ids = [str(o["id"]) for o in at_stop]
+        good = [o for o in at_stop if self._covers(o)]
+        if good:
+            ids = [str(o["id"]) for o in good]
             if self.stop_order_id not in ids:
                 self.stop_order_id = ids[0]
             self.stop_px = want
+            return
+        if at_stop:     # at the desk's level but too small: the position grew. Put a full-size one on.
+            self.log(f"{self.coin}: the resting stop covers {at_stop[0].get('amount')} of the open "
+                     f"{self._amount(pos.qty):g}: resizing it")
+            self._ensure_stop(pos.stop, self.last_price, self.clock(), keep_old=True)
             return
         if stops:   # a stop rests, just not at the desk's level: a trail move that didn't go through. Try again.
             self.log(f"{self.coin}: resting stop at {_trigger(stops[0]):,.2f}, desk's stop {want:,.2f}: moving it")
@@ -401,28 +434,30 @@ class LiveBroker:
                    f"placing it at {want:,.2f}")
         self._ensure_stop(pos.stop, self.last_price, self.clock())
 
+    def _exit_fills(self, pos: Position, fills: list[dict]) -> tuple[list[dict], list[dict]]:
+        """(every closing fill, every add) among this market's fills since the position's entry. The position may
+        have been closed in pieces (by hand, a close that only partly filled, then the stop): its trade is all of
+        them. An add is an opening fill that isn't the desk's own entry order."""
+        closing = [t for t in fills if t.get("side") == self._closing_side(pos.side)]
+        if self.entry_order_id is None and pos.fees_paid:
+            return closing, []      # an entry whose order id isn't known: its own fill can't be told from an add
+        adds = [t for t in fills if t.get("side") != self._closing_side(pos.side)
+                and str(t.get("order")) != str(self.entry_order_id)]
+        return closing, adds
+
     def _book_exchange_exit(self) -> Trade:
         """The exchange closed the position while the desk wasn't looking (its stop, or a liquidation): book it at
-        the exchange's own fills (price and fee) since the entry, preferring the stop order's. If the venue can't
-        say, ask for the stop order itself; failing that, book it at the stop level with the configured fee and
-        alert, so a human checks the venue's trade history."""
+        the exchange's own fills (price and fee) since the entry, every closing fill of it. If the venue can't say,
+        ask for the stop order itself; failing that, book it at the stop level with the configured fee and alert,
+        so a human checks the venue's trade history."""
         pos = self.position
-        closing = [t for t in self._fills_since(pos.entry_ts) or [] if t.get("side") == self._closing_side(pos.side)]
-        by_stop = [t for t in closing if self.stop_order_id and str(t.get("order")) == self.stop_order_id]
-        whole = by_stop and math.isclose(self._sum_fills(by_stop)[0], pos.qty, rel_tol=1e-6)
-        fills = by_stop if whole else closing      # the stop's own fills, unless something else closed part of it
+        fills = self._fills_since(pos.entry_ts)
+        closing, adds = self._exit_fills(pos, fills or [])
+        if closing:
+            return self._book_fills(pos, closing, adds, self._exit_reason(closing))
         est_fee = lambda px: pos.qty * px * self.p.costs.taker_fee_bps / 1e4   # noqa: E731
         reason, px, fee, ts = "stop (exchange)", None, None, None
-        if fills:
-            qty, px, fee, ts = self._sum_fills(fills)
-            if any((t.get("info") or {}).get("liquidationMarkPx") for t in fills):
-                reason = "liquidation"
-            if not math.isclose(qty, pos.qty, rel_tol=1e-6):
-                self.log(f"{self.coin}: exit fills add up to {qty:g}, the position was {pos.qty:g}")
-            if fee is None:
-                fee = est_fee(px)
-                self.log(f"{self.coin}: exit fee not readable; using the {self.p.costs.taker_fee_bps} bps estimate")
-        elif self.stop_order_id and (getattr(self.ex, "has", None) or {}).get("fetchOrder", True):
+        if self.stop_order_id and (getattr(self.ex, "has", None) or {}).get("fetchOrder", True):
             try:
                 o = self.ex.fetch_order(self.stop_order_id, self.symbol)
                 if o.get("status") == "closed" and o.get("average"):
@@ -439,22 +474,45 @@ class LiveBroker:
                        f"read: booked at the stop {px:,.2f} with an estimated fee. Check the venue's trade history.")
         return self._book(pos, px, fee, int(ts or self.clock()), reason)
 
-    def _book(self, pos: Position, px: float, fee: float, ts: int, reason: str) -> Trade:
-        """Record the closed trade, with the funding the exchange actually charged when it can say."""
+    def _exit_reason(self, closing: list[dict]) -> str:
+        if any((t.get("info") or {}).get("liquidationMarkPx") or (t.get("info") or {}).get("liquidation")
+               for t in closing):
+            return "liquidation"
+        return "stop (exchange)"
+
+    def _book_fills(self, pos: Position, closing: list[dict], adds: list[dict], reason: str) -> Trade:
+        """One trade for the whole position, from the exchange's fills: every closing fill's size, average price and
+        fee, plus the fee of anything added after the entry."""
+        qty, px, fee, ts = self._sum_fills(closing)
+        if fee is None:
+            fee = qty * px * self.p.costs.taker_fee_bps / 1e4
+            self.log(f"{self.coin}: exit fee not readable; using the {self.p.costs.taker_fee_bps} bps estimate")
+        if adds:
+            add_qty, add_px, add_fee, _ = self._sum_fills(adds)
+            fee += add_fee if add_fee is not None else add_qty * add_px * self.p.costs.taker_fee_bps / 1e4
+        if len(closing) > 1:
+            self.log(f"{self.coin}: the exit is {len(closing)} closing fills, {qty:g} in all, average {px:,.2f}")
+        return self._book(pos, px, fee, int(ts or self.clock()), reason, qty=qty)
+
+    def _book(self, pos: Position, px: float, fee: float, ts: int, reason: str, qty: float | None = None) -> Trade:
+        """Record the closed trade, with the funding the exchange actually charged when it can say. `qty` is what
+        the exit fills add up to (the whole position, even if part of it was closed earlier); the desk's size if
+        the fills couldn't be read."""
+        qty = pos.qty if qty is None else qty
         funding = self._exchange_funding(pos.entry_ts)
         if funding is None:
             funding = pos.funding_paid
             self.log(f"{self.coin}: funding not readable from the exchange; the trade carries the desk's estimate")
         self.funding_total += funding - pos.funding_paid
         self.fees_total += fee
-        gross = pos.side.sign * pos.qty * (px - pos.entry_price)
-        t = Trade(pos.side, pos.qty, pos.entry_ts, pos.entry_price, ts, px, reason, gross, pos.fees_paid + fee,
+        gross = pos.side.sign * qty * (px - pos.entry_price)
+        t = Trade(pos.side, qty, pos.entry_ts, pos.entry_price, ts, px, reason, gross, pos.fees_paid + fee,
                   funding)
         self.trades.append(t)
         self.position = None
-        self.stop_order_id = self.stop_px = None
+        self.stop_order_id = self.stop_px = self.entry_order_id = None
         self.stops_to_clean = True
-        self.last_fill = {"action": "close", "side": pos.side.value, "qty": pos.qty, "price": px, "fee": fee,
+        self.last_fill = {"action": "close", "side": pos.side.value, "qty": qty, "price": px, "fee": fee,
                           "ts": ts, "reason": reason, "net_pnl": t.net_pnl}
         return t
 
@@ -507,6 +565,7 @@ class LiveBroker:
         self.fees_total += fee
         self.position = Position(o.side, qty, fill, ts, stop=o.stop or 0.0, best_close=fill, fees_paid=fee,
                                  setup=o.reason)
+        self.entry_order_id = str(res["id"])
         self.orders_filled += 1
         self.last_fill = {"action": "open", "side": o.side.value, "qty": qty, "price": fill, "fee": fee, "ts": ts,
                           "reason": o.reason}
@@ -537,13 +596,32 @@ class LiveBroker:
             pos.qty = after_qty
             self._save_local()
             raise RuntimeError(f"close ({reason}) left {after_qty:g} {self.coin} open; its stop stays in place")
-        fill, fee, _ = self._order_fill(res, ts, ref, pos.qty)
-        t = self._book(pos, fill, fee, ts, reason)
+        t = self._book_desk_close(pos, res, ts, ref, reason)
         self._cancel_stops(keep=None)
         self.orders_filled += 1
         self.cash = self._balance()
         self._save_local()
         return t
+
+    def _book_desk_close(self, pos: Position, res: dict, ts: int, ref: float, reason: str) -> Trade:
+        """The desk's own close went through: book the whole position from its closing fills since the entry (an
+        earlier part may have gone by hand, or in a close that only partly filled). If this order's own fills aren't
+        readable (yet), its answer stands in for them: its average, else the reference price, and its fee, else the
+        configured taker fee."""
+        fills = self._fills_since(pos.entry_ts)
+        closing, adds = self._exit_fills(pos, fills or [])
+        if not any(str(t.get("order")) == str(res["id"]) for t in closing):
+            amount = float(res.get("filled") or 0.0) or pos.qty / self.contract_size
+            px = float(res.get("average") or res.get("price") or ref)
+            fee = (res.get("fee") or {}).get("cost")
+            if fee is None:
+                fee = amount * self.contract_size * px * self.p.costs.taker_fee_bps / 1e4
+                self.log(f"{self.coin}: close {res['id']}'s fills and fee aren't readable from the exchange; using its "
+                         f"answer and the {self.p.costs.taker_fee_bps} bps taker estimate")
+            closing = closing + [{"order": str(res["id"]), "side": self._closing_side(pos.side), "amount": amount,
+                                  "price": px, "timestamp": ts,
+                                  "fee": {"cost": float(fee), "currency": self.market.get("settle")}}]
+        return self._book_fills(pos, closing, adds, reason)
 
     def close_now(self, price: float, ts: int, reason: str) -> Trade | None:
         self.pending = []
@@ -567,7 +645,7 @@ class LiveBroker:
             if oid is not None and str(o["id"]) == oid:
                 return o
         for o in stops:
-            if math.isclose(_trigger(o), want, rel_tol=1e-9):
+            if math.isclose(_trigger(o), want, rel_tol=1e-9) and self._covers(o):
                 return o
         return None
 
@@ -688,6 +766,7 @@ class LiveBroker:
         self.state_path.write_text(json.dumps({
             "coin": self.coin, "venue": self.venue, "symbol": self.symbol,
             "stop_order_id": self.stop_order_id, "stop_px": self.stop_px, "stops_to_clean": self.stops_to_clean,
+            "entry_order_id": self.entry_order_id,
             "position": None if pos is None else {
                 "side": pos.side.value, "qty": pos.qty, "entry_price": pos.entry_price, "entry_ts": pos.entry_ts,
                 "stop": pos.stop, "best_close": pos.best_close, "fees_paid": pos.fees_paid,
@@ -704,6 +783,7 @@ class LiveBroker:
         self.stop_order_id = d.get("stop_order_id")
         self.stop_px = d.get("stop_px")
         self.stops_to_clean = bool(d.get("stops_to_clean", False))
+        self.entry_order_id = d.get("entry_order_id")
         pd = d.get("position")
         if pd:
             self.position = Position(Side(pd["side"]), pd["qty"], pd["entry_price"], pd["entry_ts"], pd["stop"],

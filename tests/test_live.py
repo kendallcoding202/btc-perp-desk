@@ -83,6 +83,7 @@ class FakeHyperliquid:
         self.oid = 100
         self.has = {"fetchMyTrades": True, "fetchFundingHistory": True, "fetchOpenOrders": True, "fetchOrder": True}
         self.stop_fill_under_new_oid = False      # True: a triggered stop's fill carries a fresh order id
+        self.liquidity: dict[str, float] = {}     # symbol -> the most one market (IOC) order finds inside its band
 
     # ---- plumbing ---------------------------------------------------------
     def _maybe_fail(self, kind: str) -> None:
@@ -208,7 +209,8 @@ class FakeHyperliquid:
         px = mark * (1 + self.slip) if side == "buy" else mark * (1 - self.slip)
         if not params.get("reduceOnly") and sz * px < 10.0:
             raise InvalidOrder("Order must have minimum value of $10.")
-        filled = self._fill(symbol, side, sz, px, oid, bool(params.get("reduceOnly")))
+        filled = self._fill(symbol, side, min(sz, self.liquidity.get(symbol, sz)), px, oid,
+                            bool(params.get("reduceOnly")))
         self.status[oid] = {"id": oid, "symbol": symbol, "status": "closed", "side": side, "amount": sz,
                             "filled": filled, "average": px, "fee": None}
         return {"info": {"filled": {"totalSz": str(filled), "avgPx": str(px), "oid": int(oid)}}, "id": oid,
@@ -926,3 +928,75 @@ def test_a_trade_carries_only_its_own_coins_funding_read_from_every_page(tmp_pat
     btc_paid = -sum(e["amount"] for e in ex.incomes if e["info"]["delta"]["coin"] == "BTC")
     t = btc.close_now(80_000.0, ex.now, "trend_flip")
     assert t.funding == pytest.approx(btc_paid) and btc_paid == pytest.approx(274 * 0.004 * 80_000 * 0.0000125)
+
+
+# ---------------------------------------------------------------- review: a position closed in pieces, or grown
+
+def _realised(ex, start_cash):
+    return ex.cash - start_cash          # what the exchange says the trade made: closed P&L, every fee, funding
+
+
+def test_a_part_closed_by_hand_with_a_check_in_between_is_still_booked_in_the_trade(tmp_path):
+    """0.001 of a 0.004 BTC long is sold by hand; a 15 s check runs; then the stop takes the other 0.003. The check
+    used to shrink the desk's size and book nothing, so the trade was 0.003 at the stop's price and the hand-closed
+    part (its loss and fee) was in no trade at all."""
+    ex, said = FakeHyperliquid({"BTC": 80_000.0}, slip_bps=0.0), []
+    b = _broker("BTC", ex, tmp_path, cap=500.0, sleep=Sleeps(), on_alert=said.append)
+    cash0 = ex.cash
+    b.submit(Order("open", Side.LONG, 0.004, "breakout", stop=78_000.0))
+    b.execute_now(80_000.0, T0)
+    ex.move("BTC", 79_500.0)
+    ex.create_order("BTC/USDC:USDC", "market", "sell", 0.001, 79_500.0, {"reduceOnly": True})   # by hand
+    b.check_stop_price(79_500.0, ex.now)
+    assert b.position.qty == pytest.approx(0.003) and any("closed outside the desk" in a for a in said)
+    ex.move("BTC", 77_900.0, fill_at=77_850.0)
+    b.check_stop_price(77_900.0, ex.now)
+    assert len(b.trades) == 1 and b.position is None
+    t = b.trades[0]
+    assert t.qty == pytest.approx(0.004) and t.exit_price == pytest.approx((0.001 * 79_500 + 0.003 * 77_850) / 0.004)
+    assert t.net_pnl == pytest.approx(_realised(ex, cash0))
+
+
+def test_a_desk_close_that_only_partly_fills_is_booked_in_full_when_the_rest_goes(tmp_path):
+    """The desk's reduce-only close finds 0.0025 of 0.004 inside its band; the stop takes the other 0.0015 later.
+    Only the stop's 0.0015 used to be booked."""
+    ex = FakeHyperliquid({"BTC": 80_000.0}, slip_bps=0.0)
+    b = _broker("BTC", ex, tmp_path, cap=500.0, sleep=Sleeps())
+    cash0 = ex.cash
+    b.submit(Order("open", Side.LONG, 0.004, "breakout", stop=78_000.0))
+    b.execute_now(80_000.0, T0)
+    ex.move("BTC", 79_000.0)
+    ex.liquidity["BTC/USDC:USDC"] = 0.0025
+    with pytest.raises(RuntimeError, match="left 0.0015"):
+        b.close_now(79_000.0, ex.now, "trend_flip")
+    del ex.liquidity["BTC/USDC:USDC"]
+    assert [o["triggerPrice"] for o in ex.fetch_open_orders()] == [78_000.0]     # its stop stays in place
+    ex.move("BTC", 77_900.0, fill_at=77_850.0)
+    b.check_stop_price(77_900.0, ex.now)
+    t = b.trades[-1]
+    assert len(b.trades) == 1 and t.qty == pytest.approx(0.004)
+    assert t.exit_price == pytest.approx((0.0025 * 79_000 + 0.0015 * 77_850) / 0.004)
+    assert t.net_pnl == pytest.approx(_realised(ex, cash0))
+
+
+def test_a_position_grown_on_the_exchange_gets_a_stop_for_all_of_it(tmp_path):
+    """+0.002 BTC is added by hand to the desk's 0.004 long. The check used to copy the size but keep the 0.004 stop,
+    so when it fired 0.002 stayed open with no stop, and the 0.004 the stop sold was never booked."""
+    ex, said = FakeHyperliquid({"BTC": 80_000.0}, slip_bps=0.0), []
+    b = _broker("BTC", ex, tmp_path, cap=500.0, sleep=Sleeps(), on_alert=said.append)
+    cash0 = ex.cash
+    b.submit(Order("open", Side.LONG, 0.004, "breakout", stop=78_000.0))
+    b.execute_now(80_000.0, T0)
+    ex.move("BTC", 80_400.0)
+    ex.create_order("BTC/USDC:USDC", "market", "buy", 0.002, 80_400.0)                       # by hand
+    b.check_stop_price(80_400.0, ex.now)
+    stops = ex.fetch_open_orders("BTC/USDC:USDC")
+    assert [(o["triggerPrice"], o["amount"]) for o in stops] == [(78_000.0, 0.006)]           # resized, one stop
+    assert b.position.qty == pytest.approx(0.006) and b.position.entry_price == pytest.approx(
+        ex.positions["BTC/USDC:USDC"]["entry"]) and any("added to the position" in a for a in said)
+    ex.move("BTC", 77_900.0, fill_at=77_850.0)
+    assert "BTC/USDC:USDC" not in ex.positions                                                 # nothing left open
+    b.check_stop_price(77_900.0, ex.now)
+    t = b.trades[-1]
+    assert len(b.trades) == 1 and t.qty == pytest.approx(0.006) and t.exit_price == pytest.approx(77_850.0)
+    assert t.net_pnl == pytest.approx(_realised(ex, cash0))
