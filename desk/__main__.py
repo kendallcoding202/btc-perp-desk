@@ -170,11 +170,16 @@ def _notify(state: dict) -> None:
     body = "\n".join(f"{e['agent'].upper()}: {e['text']}" for e in events)
     body += f"\n\n{coin} account ${t['bank']:,.2f} ({t['pnl_pct']:+.2%}) · {t['position']}"
     body += f" · {coin} ${t['price']:,.2f}" if t.get("price") is not None else ""    # the VT basket has no one price
+    fl = state.get("flows")
+    if fl:      # the percentage above is the time-weighted one: deposits and withdrawals aren't in it
+        body += f"\n{fl['net']:+,.2f} net deposited so far (not profit) · P&L {fl['pnl']:+,.2f}"
     trade = any(w in body for w in ("BOUGHT", "SOLD", "SHORTED", "COVERED", "ADDED", "TRIMMED", "HALT", "daily"))
+    money = next((w for w in ("DEPOSIT", "WITHDRAWAL") for e in events if e["text"].startswith(w)), None)
     name = "basket" if state["header"].get("kind") == "basket" else "desk"
     req = urllib.request.Request(f"https://ntfy.sh/{topic}", data=body.encode(), method="POST", headers={
-        "Title": f"{coin} {name}: " + ("TRADE" if trade else "update"), "Priority": "high" if trade else "default",
-        "Tags": "chart_with_upwards_trend" if trade else "robot"})
+        "Title": f"{coin} {name}: " + ("TRADE" if trade else money or "update"),
+        "Priority": "high" if trade else "default",
+        "Tags": "chart_with_upwards_trend" if trade else "moneybag" if money else "robot"})
     try:
         urllib.request.urlopen(req, timeout=10).read()
     except Exception as exc:  # a missed notification must never break the ledger
@@ -199,19 +204,25 @@ def cmd_step(args) -> int:
     import time
     import traceback
 
+    from . import flows as flows_mod
     from . import paper
 
     coins = [c.strip().upper() for c in args.coins.split(",") if c.strip()]
     root = Path(args.ledger)
     migrated = migrate_ledger(root)
     changed, failed, summary = migrated, [], []
+    try:    # deposits and withdrawals: a bad file stops the accounts it may be about, loudly, never silently
+        plans = flows_mod.load(getattr(args, "flows", flows_mod.FILE))
+    except flows_mod.FlowsError as exc:
+        plans = {c: exc for c in coins}
     for coin in coins:
         try:
+            sched = flows_mod.schedule(plans, coin) or None
             if coin == "VT":    # the vol-trend basket: its own strategy (desk/voltrend.py), paper only
-                s = paper.step_basket(VOLTREND, root / coin)
+                s = paper.step_basket(VOLTREND, root / coin, flows=sched)
             else:
                 p = _params(args, coin)
-                s = paper.step(p, root / coin, jev=_jev(p))
+                s = paper.step(p, root / coin, jev=_jev(p), flows=sched)
         except Exception as exc:  # e.g. a rate-limited API call: retry next run, don't lose the other accounts
             failed.append(coin)
             print(f"  {coin}: step failed: {type(exc).__name__}: {exc}")
@@ -222,9 +233,12 @@ def cmd_step(args) -> int:
         changed = changed or s["paper"]["changed"]
         t, g = s["ticker"], s["goal"]
         print(f"  {coin}: equity {t['bank']:,.2f} ({t['pnl_pct']:+.2%}) · {t['position']} {t['position_detail']} · "
-              f"{t['record']} · {g['progress']:.1%} of the way to ${g['target']:,.0f}")
+              f"{t['record']} · {g['progress']:.1%} of the way to ${g['target']:,.0f}"
+              + (f" · {s['flows']['net']:+,.2f} deposited (not profit)" if s.get("flows") else ""))
         row = {"coin": coin, "bank": t["bank"], "start": g["start"], "pnl": t["pnl"], "pnl_pct": t["pnl_pct"],
                "position": t["position"], "record": t["record"], "price": t["price"], "updated": s["updated"]}
+        if s.get("flows"):      # the ALL card and a live re-mark take deposits out of the P&L with these
+            row.update({"net_flows": s["flows"]["net"], "units": s["flows"]["units"]})
         if coin == "VT":    # cash + holdings let a viewer re-mark the bank from live mids
             row.update({"kind": "basket", "cash": t["cash"], "experiment": EXPERIMENTS.get("VT"),
                         "holdings": [{k: h[k] for k in ("coin", "qty", "avg_entry", "held_units", "mark")}
@@ -258,10 +272,20 @@ def promotion_status(p: Params) -> list[tuple[str, bool, str]]:
 
     days = (time.time() * 1000 - meta.get("started_ts", time.time() * 1000)) / 86400_000
     ret = broker["cash"] / meta.get("start_equity", broker["cash"]) - 1 if meta.get("start_equity") else 0.0
+    shown = f"{ret:+.2%} realised"
+    recorded = saved.get("flows") or []
+    if recorded:    # "up overall" is the trading's, never the money put in: time-weighted, flows taken out
+        from . import flows as flows_mod
+
+        start = meta.get("start_equity", 0.0)
+        net = sum(r["amount"] for r in recorded)
+        ret = flows_mod.realised_twr(start, recorded, broker["cash"])
+        shown = (f"{ret:+.2%} realised, time-weighted · P&L {broker['cash'] - start - net:+,.2f} · "
+                 f"{net:+,.2f} net deposited, not counted")
     checks.append((f"paper traded ≥ {p.promotion.min_paper_days:.0f} days", days >= p.promotion.min_paper_days,
                    f"{days:.1f} days"))
     checks.append((f"paper return > {p.promotion.min_paper_return:.0%}", ret > p.promotion.min_paper_return,
-                   f"{ret:+.2%} realised"))
+                   shown))
     return checks
 
 
@@ -397,6 +421,7 @@ def main(argv=None) -> int:
     common(sp)
     sp.add_argument("--coins", default=",".join(ACCOUNTS), help="comma-separated paper accounts to step (VT = basket)")
     sp.add_argument("--ledger", default="ledger", help="ledger root; each account lives in <root>/<COIN>/")
+    sp.add_argument("--flows", default="deposits.json", help="the deposits and withdrawals file (README)")
     sp.set_defaults(fn=cmd_step)
 
     for name, fn in (("paper", cmd_paper), ("live", cmd_live)):

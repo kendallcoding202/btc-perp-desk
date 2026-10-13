@@ -13,6 +13,10 @@ Each coin's ledger lives in ledger/<COIN>/ (saved to the paper-ledger branch, so
 experiment's history is permanent and auditable): paper.json + kills.json + board.json.
 
 `step_basket()` does the same for the VT basket (desk/voltrend.py) in ledger/VT/.
+
+Both take the account's deposits and withdrawals (desk/flows.py, from deposits.json): each one is applied once, at the
+open of the first bar that opens on or after its date's 00:00 UTC, before that bar's fills, and kept in the ledger's
+"flows" list. A ledger that has none has no "flows" key, as before.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ import time
 from pathlib import Path
 
 from . import board as board_mod
+from . import flows as flows_mod
 from . import indicators as ind
 from . import voltrend
 from .brokers.sim import SimBroker
@@ -52,8 +57,14 @@ def _write(path: Path, data: dict) -> None:
     tmp.replace(path)
 
 
+def _saved(meta: dict, recorded: list[dict], **parts) -> dict:
+    """The ledger file's content: "flows" only once the account has one, so a ledger without stays as it was."""
+    return {"meta": meta, **parts, **({"flows": recorded} if recorded else {})}
+
+
 def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=print,
-         now_ms: int | None = None) -> dict:
+         now_ms: int | None = None, flows: list | None = None) -> dict:
+    """`flows`: this account's deposits and withdrawals (flows.schedule), or None for none."""
     from .feeds.hyperliquid import HyperliquidFeed
 
     ledger_dir = Path(ledger_dir)
@@ -65,14 +76,24 @@ def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=
     desk = Desk(p, broker, jev=jev)
     meta = {"started_ts": now, "start_equity": p.sizing.starting_equity, "last_bar_ts": 0, "runs": 0,
             "interval": p.market.interval}
+    recorded: list[dict] = []
     if lpath.exists():
         saved = json.loads(lpath.read_text())
         broker.load_dict(saved["broker"])
         desk.load_dict(saved["desk"])
         meta.update(saved["meta"])
+        recorded = list(saved.get("flows") or [])
         if meta.get("interval") != p.market.interval:
             raise SystemExit(f"ledger was started on {meta['interval']} bars; refusing to continue on {p.market.interval}")
     desk.kills = Kills.load(ledger_dir / "kills.json")
+    todo = flows_mod.due(flows or [], recorded, now, p.market.symbol)    # before any request: a bad file stops here
+
+    def take_flows(ts: int, price: float) -> None:
+        """Every flow due by `ts` (a bar's open), at that bar's open price, before its fills: money in or out, the
+        brakes scaled so they read the same percentage, nothing else touched."""
+        while todo and todo[0].ts <= ts:
+            rec = flows_mod.apply_desk(desk, todo.pop(0), ts, price, meta["start_equity"], recorded)
+            log(f"{p.market.symbol}: {flows_mod.describe(rec)}")
 
     raw = feed.candles(start_ms=now - LOOKBACK_BARS * feed.bar_ms, closed_only=False)
     forming = raw[-1] if raw and raw[-1].ts + feed.bar_ms > now else None
@@ -111,6 +132,7 @@ def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=
         for i, bar in enumerate(bars):
             if bar.ts <= meta["last_bar_ts"]:
                 continue
+            take_flows(bar.ts, bar.open)
             n0, had = len(broker.trades), broker.position is not None
             broker.fill_pending(bar.open, bar.ts)
             broker.check_stop_bar(bar)
@@ -130,6 +152,7 @@ def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=
     if forming is not None and forming.ts > meta["last_bar_ts"]:
         # The bar that's still forming: orders decided at the last close fill at its open (the backtest's price),
         # and the stop is checked against its range so far. Same fills as the backtest, minus the wait for the bar to close.
+        take_flows(forming.ts, forming.open)
         n0, had = len(broker.trades), broker.position is not None
         broker.fill_pending(forming.open, forming.ts)
         broker.check_stop_bar(forming)
@@ -140,14 +163,19 @@ def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=
         desk.last_decision = evaluate_entry(p, f, len(bars) - 1, equity=eq, kills=desk.kill_gates(now, eq),
                                             ctx=ctx, now_ms=now)
 
+    if todo:    # due, but no bar has opened since its date's 00:00 UTC in this answer: the next run takes it
+        log(f"{p.market.symbol}: {', '.join(fl.id for fl in todo)} due; recorded at the next bar's open")
     new_events = _new_events(before, desk.events)
 
     meta["runs"] += 1
     meta["last_run_ts"] = now
-    _write(lpath, {"meta": meta, "broker": broker.to_dict(), "desk": desk.to_dict()})
+    _write(lpath, _saved(meta, recorded, broker=broker.to_dict(), desk=desk.to_dict()))
 
+    done = {r["id"] for r in recorded}
     state = board_mod.build(desk, f, len(f.bars) - 1, mode="paper", ctx=ctx, jev_client=jev, now_ms=now,
                             goal_pace=board_mod.report_pace(p.market.symbol),
+                            flows=flows_mod.State(meta["start_equity"], recorded,
+                                                  [fl for fl in flows or [] if fl.id not in done]),
                             elapsed_days=(now - meta["started_ts"]) / 86400_000, crawler={
                                 "source": f"hyperliquid · {p.market.interval}", "funding_prints": len(funding),
                                 "requests": feed.requests, "latency_ms": feed.last_latency_ms,
@@ -161,7 +189,7 @@ def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=
 
 
 def step_basket(vt: VolTrend = VOLTREND, ledger_dir: str | Path = "ledger/VT", feeds: dict | None = None, log=print,
-                now_ms: int | None = None) -> dict:
+                now_ms: int | None = None, flows: list | None = None) -> dict:
     """The VT basket's step, with `step`'s contract: idempotent and catch-up safe.
 
     Every daily close since the last run goes through voltrend.advance, the backtest's own loop. Day one opens the
@@ -185,15 +213,25 @@ def step_basket(vt: VolTrend = VOLTREND, ledger_dir: str | Path = "ledger/VT", f
     meta = {"started_ts": now, "start_equity": vt.starting_equity, "last_bar_ts": 0, "runs": 0,
             "interval": vt.interval, "strategy": "voltrend"}
     remembered = {}
+    recorded: list[dict] = []
     if lpath.exists():
         saved = json.loads(lpath.read_text())
         book.load_dict(saved["broker"])
         meta.update(saved["meta"])
         remembered = saved.get("bars", {})       # [[ts, open, high, low, close], ...] per coin; none in older ledgers
+        recorded = list(saved.get("flows") or [])
         if meta.get("strategy") != "voltrend" or meta.get("interval") != vt.interval:
             # an error, not SystemExit: cmd_step reports it and the desk accounts still run
             raise RuntimeError(f"{lpath} isn't a {vt.interval} vol-trend ledger; refusing to continue")
     before = list(book.events)
+    todo = flows_mod.due(flows or [], recorded, now, "VT")
+
+    def take_flows(ts: int, opens: dict) -> None:
+        """Every flow due by the daily open `ts`, before that day's fills, with each coin marked at its open (a coin
+        with no bar that day at its last close). VT has no brakes: only the cash and the units move."""
+        while todo and todo[0].ts <= ts:
+            rec = flows_mod.apply_book(book, todo.pop(0), ts, opens, meta["start_equity"], recorded)
+            log(f"VT: {flows_mod.describe(rec)}")
 
     # Enough history for the 50-day average at the oldest close still to process (after an outage, fetch more).
     since = now - VT_LOOKBACK_DAYS * day
@@ -256,7 +294,19 @@ def step_basket(vt: VolTrend = VOLTREND, ledger_dir: str | Path = "ledger/VT", f
                 log(f"[{time.strftime('%Y-%m-%d', time.gmtime(d / 1000))} close] VT equity ${b.equity_curve[-1][1]:,.2f} · "
                     + (", ".join(f"{c} {o['kind']} {o['usd']:+,.2f}" for c, o in b.pending.items()) or "no orders"))
 
-            voltrend.advance(book, closed, fbar, days, after=after)
+            if not todo:
+                voltrend.advance(book, closed, fbar, days, after=after)
+            else:   # the same loop, cut at each flow's day so the flow goes in at that day's open
+                opens = {c: {b.ts: b.open for b in closed[c]} for c in vt.coins}
+                run: list[int] = []
+                for d in days:
+                    if todo and todo[0].ts <= d:
+                        if run:
+                            voltrend.advance(book, closed, fbar, run, after=after)
+                        run = []
+                        take_flows(d, {c: opens[c][d] for c in vt.coins if d in opens[c]})
+                    run.append(d)
+                voltrend.advance(book, closed, fbar, run, after=after)
             meta["last_bar_ts"] = days[-1]
             processed = len(days)
 
@@ -267,6 +317,7 @@ def step_basket(vt: VolTrend = VOLTREND, ledger_dir: str | Path = "ledger/VT", f
     last = meta["last_bar_ts"]
     if all(c in forming and forming[c].ts == last + day for c in vt.coins) and \
             not any(b.ts > last for c in vt.coins for b in closed[c]):
+        take_flows(last + day, {c: forming[c].open for c in vt.coins})
         for c in vt.coins:
             book.fill_pending(c, forming[c].open, forming[c].ts)
     marks = {c: (forming[c] if c in forming else closed[c][-1]).close for c in vt.coins}
@@ -276,14 +327,19 @@ def step_basket(vt: VolTrend = VOLTREND, ledger_dir: str | Path = "ledger/VT", f
             sig = voltrend.signal([b.close for b in closed[c] if b.ts <= meta["last_bar_ts"]], vt)
             preview[c] = {**sig, "target": sig["raw"], "held": 0.0, "ts": None}
 
+    if todo:
+        log(f"VT: {', '.join(fl.id for fl in todo)} due; recorded at the next daily open every coin has")
     new_events = _new_events(before, book.events)
     meta["runs"] += 1
     meta["last_run_ts"] = now
     # Stored under "broker" like the desk's ledgers: the workflow's commit message reads broker.cash from each one.
-    _write(lpath, {"meta": meta, "broker": book.to_dict(),
-                   "bars": {c: [[b.ts, b.open, b.high, b.low, b.close] for b in memory[c]] for c in vt.coins}})
+    _write(lpath, _saved(meta, recorded, broker=book.to_dict(),
+                         bars={c: [[b.ts, b.open, b.high, b.low, b.close] for b in memory[c]] for c in vt.coins}))
 
+    done = {r["id"] for r in recorded}
     state = board_mod.basket(book, marks=marks, now_ms=now, meta=meta, goal_pace=board_mod.report_pace("VT"),
+                             flows=flows_mod.State(meta["start_equity"], recorded,
+                                                   [fl for fl in flows or [] if fl.id not in done]),
                              preview=preview, crawler={
         "source": f"hyperliquid · {vt.interval}", "bars": sum(len(v) for v in closed.values()),
         "requests": sum(getattr(f, "requests", 0) for f in feeds.values()),

@@ -114,7 +114,8 @@ jobs:
           cd "$work"
           git add -A ledger
           git diff --cached --quiet && exit 0
-          banks=$(python3 -c "import json, glob; print(' '.join(f\"{p.split('/')[1]} \${json.load(open(p))['broker']['cash']:.2f}\" for p in sorted(glob.glob('ledger/*/paper.json'))))")
+          # each bank, and what of it was deposited or withdrawn (desk/flows.py): money in or out, never profit or loss
+          banks=$(python3 -c "import json, glob; tag = lambda n: f' (+\${n:,.2f} deposited, not profit)' if n > 0 else f' (\${-n:,.2f} withdrawn, not a loss)' if n < 0 else ''; print(' '.join(f\"{p.split('/')[1]} \${d['broker']['cash']:.2f}\" + tag(sum(f['amount'] for f in d.get('flows', []))) for p in sorted(glob.glob('ledger/*/paper.json')) for d in [json.load(open(p))]))")
           git commit -qm "ledger: ${banks} at $(date -u +%Y-%m-%dT%H:%MZ)"
           git push origin paper-ledger
 

@@ -1,0 +1,7 @@
+{
+  "_how": "Money put into or taken out of a paper account, so the desk never counts it as profit or loss. Amounts are dollars; an extra below 0 is a withdrawal. Add new extras at the end of the list. Never edit or delete one that's already been recorded: correct it with another extra. README: Deposits and withdrawals.",
+  "BTC": {
+    "monthly": {"amount": 100, "day": 1, "first": "2026-11-01", "count": 60},
+    "extra": []
+  }
+}

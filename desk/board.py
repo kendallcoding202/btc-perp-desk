@@ -70,10 +70,18 @@ def report_pace(account: str, reports_dir: str | Path = "reports") -> dict | Non
     return oos_pace(json.loads(path.read_text())) if path.exists() else None
 
 
-def goal(equity: float, start: float, target: float, pace: dict | None, elapsed_days: float | None) -> dict:
+def goal(equity: float, start: float, target: float, pace: dict | None, elapsed_days: float | None,
+         flows=None, now_ms: int | None = None) -> dict:
     """Progress toward the target on a log scale ($150→$100k is 667x: $300 is 11% of the way, $1,500 is 35%), and
-    the years left at `pace` (oos_pace) and, once the account is 30 days old, at its own pace."""
+    the years left at `pace` (oos_pace) and, once the account is 30 days old, at its own pace.
+
+    With deposits or withdrawals recorded (`flows`, a flows.State), the progress is still the bank's, but each pace is
+    a time-weighted one (the account's own: its NAV, never the money put in) and the years left count the deposits
+    still planned, as they come."""
     import math
+
+    if flows is not None and flows.active:
+        return _goal_with_flows(equity, start, target, pace, elapsed_days, flows, now_ms)
 
     progress = math.log(equity / start) / math.log(target / start) if equity > 0 and target > start else 0.0
     left = math.log(target / equity) if equity > 0 else math.inf
@@ -93,6 +101,37 @@ def goal(equity: float, start: float, target: float, pace: dict | None, elapsed_
             # deploy): it shows them as "at backtest pace", which they are
             "backtest_cagr": test, "years_at_backtest_rate": years(test),
             "realised_cagr": realised, "years_at_realised_rate": years(realised)}
+
+
+def _goal_with_flows(equity, start, target, pace, elapsed_days, flows, now_ms) -> dict:
+    import math
+
+    from .flows import years_to
+
+    g = goal(equity, start, target, pace, None)       # progress, multiple left, and the paces' years without the plan
+    future = flows.future(now_ms or 0)
+    nav = flows.nav(equity)
+    realised = None
+    if elapsed_days and elapsed_days >= 30 and nav > 0:
+        realised = nav ** (365.25 / elapsed_days) - 1      # the NAV's pace: deposits aren't growth
+    test = g["test_cagr"]
+    left = math.log(target / equity) if equity > 0 else math.inf
+
+    def no_plan(rate):
+        return left / math.log(1 + rate) if rate and rate > 0 else None
+
+    s = flows.summary(equity, now_ms or 0)
+    years = years_to(target, equity, test, future)
+    g.update({
+        "years_at_test_rate": years, "years_at_backtest_rate": years,
+        "realised_cagr": realised, "years_at_realised_rate": years_to(target, equity, realised, future)
+        if realised is not None else None,
+        "years_at_test_rate_without_plan": no_plan(test),
+        "deposited": s["net"], "deposits_in": s["deposited"], "withdrawn": s["withdrawn"],
+        "planned_left": s["planned"]["count"], "planned_left_usd": s["planned"]["usd"],
+        "plan_included": True, "twr": s["twr"],
+    })
+    return g
 
 
 def trigger_outlook(f: ind.Features, i: int, n: int, limit: int = 10, short: bool = False) -> list[dict]:
@@ -118,7 +157,7 @@ def trigger_outlook(f: ind.Features, i: int, n: int, limit: int = 10, short: boo
 
 def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict | None = None,
           jev_client=None, now_ms: int | None = None, candles: int = 140, goal_pace: dict | None = None,
-          elapsed_days: float | None = None) -> dict:
+          elapsed_days: float | None = None, flows=None) -> dict:
     p, broker, dec = desk.p, desk.broker, desk.last_decision
     coin = p.market.symbol
     shorts = p.strategy.allow_shorts and p.strategy.short_mode == "breakdown"
@@ -281,7 +320,7 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
 
     curve = _thin(desk.equity_curve, 400)
     k = desk.kills
-    return {
+    return with_flows({
         "updated": now_ms,
         "header": {
             "title": f"{coin} PERP DESK", "coin": coin, "risk_per_trade": p.sizing.risk_per_trade,
@@ -323,7 +362,7 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
             "direction": dec.direction.value if dec else None,
         },
         "thresholds": thr_rows,
-        "goal": goal(equity, start_eq, p.sizing.goal_equity, goal_pace, elapsed_days),
+        "goal": goal(equity, start_eq, p.sizing.goal_equity, goal_pace, elapsed_days, flows, now_ms),
         "kills": {"flat_kill": k.flat_kill, "entry_kill": k.entry_kill, "jev_kill": k.jev_kill,
                   "halted": r.halted, "daily_locked": desk.day_locked, "cooldown": now_ms < r.cooldown_until_ts},
         "jev": {
@@ -331,11 +370,23 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
             "calls": getattr(jev_client, "calls", 0), "answers": dec.jev_answers if dec else None,
         },
         "events": [{"ts": e.ts, "agent": e.agent, "text": e.text} for e in list(desk.events)[-30:]],
-    }
+    }, flows, equity, now_ms)
+
+
+def with_flows(state: dict, flows, equity: float, now_ms: int) -> dict:
+    """Deposits and withdrawals on the board, once the account has one: P&L in dollars is equity - start - net
+    flows, the percentage is the NAV's (time-weighted), and "flows" carries the totals, the units, the plan still to
+    come and a mark for each one on the equity chart. A board without any is returned as it was."""
+    if flows is None or not flows.active:
+        return state
+    s = flows.summary(equity, now_ms)
+    state["ticker"].update({"pnl": s["pnl"], "pnl_pct": s["twr"], "net_flows": s["net"]})
+    state["flows"] = s
+    return state
 
 
 def basket(book, *, now_ms: int, marks: dict[str, float], meta: dict, crawler: dict | None = None,
-           goal_pace: dict | None = None, preview: dict | None = None, equity_points: int = 400) -> dict:
+           goal_pace: dict | None = None, preview: dict | None = None, equity_points: int = 400, flows=None) -> dict:
     """The VT basket's board (desk/voltrend.py). Its own panels are under "basket". The keys the desk boards carry
     are kept, empty where they don't apply (no agents, no candle chart, no gates), so a desk renderer still works.
 
@@ -368,7 +419,7 @@ def basket(book, *, now_ms: int, marks: dict[str, float], meta: dict, crawler: d
     wins = sum(1 for t in book.trades if t["net_pnl"] > 0)
     losses = len(book.trades) - wins
     started = meta.get("started_ts", now_ms)
-    return {
+    return with_flows({
         "updated": now_ms,
         "header": {
             "title": "VT VOL-TREND BASKET", "coin": "VT", "kind": "basket", "coins": list(vt.coins),
@@ -398,7 +449,7 @@ def basket(book, *, now_ms: int, marks: dict[str, float], meta: dict, crawler: d
         },
         "equity": [[ts, round(eq, 2)] for ts, eq in _thin(book.equity_curve, equity_points)],
         "pnl_bars": [round(t["net_pnl"], 2) for t in book.trades[-80:]],
-        "goal": goal(equity, start_eq, vt.goal_equity, goal_pace, (now_ms - started) / day_ms),
+        "goal": goal(equity, start_eq, vt.goal_equity, goal_pace, (now_ms - started) / day_ms, flows, now_ms),
         "events": [{"ts": e.ts, "agent": e.agent, "text": e.text} for e in list(book.events)[-30:]],
         # what the desk boards have and the basket doesn't
         "agents": [],
@@ -412,4 +463,4 @@ def basket(book, *, now_ms: int, marks: dict[str, float], meta: dict, crawler: d
         "kills": {"flat_kill": False, "entry_kill": False, "jev_kill": False, "halted": False, "daily_locked": False,
                   "cooldown": False},
         "jev": {"mode": "off", "enabled": False, "calls": 0, "answers": None},
-    }
+    }, flows, equity, now_ms)
