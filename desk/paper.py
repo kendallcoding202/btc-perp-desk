@@ -27,11 +27,14 @@ from . import voltrend
 from .brokers.sim import SimBroker
 from .engine import Desk, Kills
 from .filter import evaluate_entry
+from .models import Bar
 from .thresholds import VOLTREND, Params, VolTrend
 
 LOOKBACK_BARS = 1500
 FUNDING_WINDOW_MS = 4 * 86400_000
 VT_LOOKBACK_DAYS = 120    # daily candles per VT coin per run: the 50-day average and vol need 50, the rest is margin
+VT_MEMORY_BARS = 70       # closed daily bars per VT coin the ledger keeps: the 50-day window, plus 20 days to spare
+VT_GAP_WAIT_DAYS = 3      # a bar no answer has had yet is waited for this long after its close, then it's a real gap
 
 
 def _new_events(before: list, events) -> list:
@@ -165,6 +168,9 @@ def step_basket(vt: VolTrend = VOLTREND, ledger_dir: str | Path = "ledger/VT", f
     account flat; the first decision is at the next 00:00 UTC close. Orders decided at a close fill at the open of
     the bar that's forming now: the backtest's price, without waiting a day. Hyperliquid rate-limits, so a run makes
     one candle request per coin, plus one funding request per coin only when a day has closed to process.
+
+    The ledger keeps each coin's last VT_MEMORY_BARS closed daily bars, so a bar missing from one answer (an API
+    glitch) is filled in from an earlier one, and the averages see the bars the backtest sees.
     """
     from .feeds.hyperliquid import HyperliquidFeed
 
@@ -178,10 +184,12 @@ def step_basket(vt: VolTrend = VOLTREND, ledger_dir: str | Path = "ledger/VT", f
     book = voltrend.Book(vt)
     meta = {"started_ts": now, "start_equity": vt.starting_equity, "last_bar_ts": 0, "runs": 0,
             "interval": vt.interval, "strategy": "voltrend"}
+    remembered = {}
     if lpath.exists():
         saved = json.loads(lpath.read_text())
         book.load_dict(saved["broker"])
         meta.update(saved["meta"])
+        remembered = saved.get("bars", {})       # [[ts, open, high, low, close], ...] per coin; none in older ledgers
         if meta.get("strategy") != "voltrend" or meta.get("interval") != vt.interval:
             # an error, not SystemExit: cmd_step reports it and the desk accounts still run
             raise RuntimeError(f"{lpath} isn't a {vt.interval} vol-trend ledger; refusing to continue")
@@ -199,9 +207,28 @@ def step_basket(vt: VolTrend = VOLTREND, ledger_dir: str | Path = "ledger/VT", f
     for c in vt.coins:
         if len(closed[c]) < need:   # a short or broken answer must never read as "below the average": sell everything
             raise RuntimeError(f"{c}: only {len(closed[c])} closed daily candles from the feed, need {need}")
+    # Then the closed bars earlier answers had fill the holes in this one; the answer wins where both have a bar. The
+    # memory keeps a bar this run's clock calls still open (a clock a little behind the last run's) but doesn't use it.
+    memory, reach = {}, {c: closed[c][-1].ts for c in vt.coins}      # reach: the answer's newest closed bar
+    for c in vt.coins:
+        kept = {x[0]: Bar(*x) for x in remembered.get(c, [])}
+        kept.update((b.ts, b) for b in closed[c])
+        memory[c] = [kept[t] for t in sorted(kept)][-VT_MEMORY_BARS:]
+        closed[c] = [kept[t] for t in sorted(kept) if t + day <= now]
     # A day is processed once every coin has a closed bar on or after it. A coin with no bar that day sits it out, as
     # in the backtest, but only once a later bar of its has closed: a bar missing from one answer is waited for.
     covered = min(closed[c][-1].ts for c in vt.coins)
+    # So is a bar missing between two of a coin's bars that no answer has had (the first run after a day without one,
+    # say, got an answer with a hole): the days from it on wait for it, until an answer that reaches past it still
+    # lacks it VT_GAP_WAIT_DAYS after its close. Then it's a day the exchange has no bar for, and the coin sits it
+    # out, as in the backtest.
+    hole = min(((t, c) for c in vt.coins for a, b in zip(closed[c], closed[c][1:]) for t in range(a.ts + day, b.ts, day)
+                if t > reach[c] or t + day + VT_GAP_WAIT_DAYS * day > now), default=None)
+    if hole and hole[0] <= covered:
+        if 0 < meta["last_bar_ts"] < covered:     # it holds back days that would be processed now
+            log(f"VT: no answer has had {hole[1]}'s {time.strftime('%Y-%m-%d', time.gmtime(hole[0] / 1000))} bar yet; "
+                f"the days from it wait for it (a day with no bar if still missing {VT_GAP_WAIT_DAYS} days after its close)")
+        covered = hole[0] - day
 
     processed = 0
     if not meta["last_bar_ts"]:
@@ -248,7 +275,8 @@ def step_basket(vt: VolTrend = VOLTREND, ledger_dir: str | Path = "ledger/VT", f
     meta["runs"] += 1
     meta["last_run_ts"] = now
     # Stored under "broker" like the desk's ledgers: the workflow's commit message reads broker.cash from each one.
-    _write(lpath, {"meta": meta, "broker": book.to_dict()})
+    _write(lpath, {"meta": meta, "broker": book.to_dict(),
+                   "bars": {c: [[b.ts, b.open, b.high, b.low, b.close] for b in memory[c]] for c in vt.coins}})
 
     state = board_mod.basket(book, marks=marks, now_ms=now, meta=meta, goal_pace=board_mod.report_pace("VT"),
                              preview=preview, crawler={

@@ -72,7 +72,7 @@ python3 -m desk vt-backtest                  # the VT basket: reports/backtest-V
 python3 -m desk replay                       # watch it trade 2024→now at http://127.0.0.1:8787
 python3 -m desk paper                        # a $150 paper account (add --coin ETH), live board at :8787
 python3 -m desk step                         # one step for every account (BTC, ETH, SOL, VT), the way the Action runs it
-python3 -m pytest                            # 38 tests, incl. "paper ledger == backtest" for the desk and for VT
+python3 -m pytest                            # 50 tests, incl. "paper ledger == backtest" for the desk and for VT
 ```
 
 ## The paper experiments
@@ -84,7 +84,7 @@ python3 -m pytest                            # 38 tests, incl. "paper ledger == 
 - **The record** lives on the [`paper-ledger`](../../tree/paper-ledger/ledger) branch, saved whenever something happens, so the history is permanent and public:
   - `ledger/<COIN>/paper.json` (`BTC`, `ETH`, `SOL`): the account, open position, every trade, and the desk's memory
   - `ledger/<COIN>/kills.json`: that account's kill switches. Create or edit it on that branch, e.g. `ledger/SOL/kills.json` with `{"entry_kill": true}`.
-  - `ledger/VT/paper.json`: the VT basket's cash, its three positions, every fill and closed position. VT has no kill switches.
+  - `ledger/VT/paper.json`: the VT basket's cash, its three positions, every fill and closed position, and each coin's last 70 daily candles. A candle missing from one Hyperliquid answer is filled in from those, so the 50-day average never shifts. A candle no answer has had yet is waited for, up to 3 days after its close; only then is it a day with no candle, which that coin sits out, as in the backtest. VT has no kill switches.
 - **The board** for your phone is published to GitHub Pages every run: **https://kendallcoding202.github.io/btc-perp-desk/** (open an account directly with `#ETH`, `#SOL` or `#VT`). It is read-only; kill switches go through `kills.json`.
   - Tabs at the top switch accounts and show all four balances, plus the total.
   - **Between runs, your browser pulls prices straight from Hyperliquid every 5 seconds.** The price, open-position P&L, balance and the candle that's still forming move live. Decisions, fills and the record change only when the desk runs: every 2h candle close, picked up within 15 minutes.

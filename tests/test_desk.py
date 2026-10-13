@@ -710,6 +710,146 @@ def test_vt_day_one_never_trades_on_closes_from_before_the_account_opened(tmp_pa
     _assert_vt_ledger_is_the_backtest(tmp_path, series, funding, t0 + start * DAY)
 
 
+def _vt_daily_runs(tmp_path, upto, start=60, skip=(), hide=None):
+    """A VT ledger opened at day `start` and stepped at 00:04 every day up to day `upto` (bar k is forming at run k),
+    except the days in `skip`. hide(k) = {coin: bar indexes} that run's answers lack. Returns what replay() needs."""
+    series, funding = _vt_market()
+    clock = {}
+    feeds = {c: FakeDailyFeed(series[c], funding[c], clock) for c in series}
+    t0 = series["BTC"][0].ts
+    clock["now"] = t0 + start * DAY + DAY // 2
+    paper.step_basket(VOLTREND, tmp_path, feeds=feeds, log=lambda *a: None, now_ms=clock["now"])
+    states = {}
+    for k in range(start + 1, upto + 1):
+        if k in skip:
+            continue
+        clock["now"] = t0 + k * DAY + 4 * 60_000
+        for c, f in feeds.items():
+            f.hide = {t0 + j * DAY for j in (hide(k).get(c, ()) if hide else ())}
+        states[k] = paper.step_basket(VOLTREND, tmp_path, feeds=feeds, log=lambda *a: None, now_ms=clock["now"])
+        for f in feeds.values():
+            f.hide = set()
+    return series, funding, feeds, clock, t0, states
+
+
+def _vt_finish(tmp_path, series, funding, feeds, clock, t0, start=60):
+    """Every bar closed, a last run, and the ledger must be the backtest from day `start`."""
+    clock["now"] = t0 + 261 * DAY
+    paper.step_basket(VOLTREND, tmp_path, feeds=feeds, log=lambda *a: None, now_ms=clock["now"])
+    _assert_vt_ledger_is_the_backtest(tmp_path, series, funding, t0 + start * DAY)
+
+
+def _vt_signal_is_the_full_data_one(tmp_path, series, coin, t0, close_day):
+    """The ledger's last decision for `coin` was at the close of day `close_day`, on the same closes the backtest uses."""
+    sig = json.loads((tmp_path / "paper.json").read_text())["broker"]["signals"][coin]
+    want = voltrend.signal([b.close for b in series[coin] if b.ts <= t0 + close_day * DAY][-50:])
+    assert sig["ts"] == t0 + (close_day + 1) * DAY
+    assert (sig["sma"], sig["vol"], sig["raw"]) == (want["sma"], want["vol"], want["raw"])
+
+
+def test_vt_fills_in_a_bar_missing_from_the_middle_of_an_answer_from_its_memory(tmp_path):
+    """One coin's answer on one normal run lacks a bar inside the 50-day window (an API glitch). Earlier answers had
+    it, and the ledger remembers them: the average and the vol use the same bars as the backtest, and so does
+    every decision and order after it. (Before, the window shifted by a day and ETH's order at day 126 was wrong.)"""
+    hide = lambda k: {"ETH": (116,)} if k == 126 else {"SOL": (140,)} if k == 150 else {}
+    series, funding, feeds, clock, t0, states = _vt_daily_runs(tmp_path, 126, hide=hide)
+    assert states[126]["paper"]["bars_processed_this_run"] == 1        # no waiting: the memory has the bar
+    _vt_signal_is_the_full_data_one(tmp_path, series, "ETH", t0, 125)
+    led = json.loads((tmp_path / "paper.json").read_text())
+    assert t0 + 116 * DAY in [b[0] for b in led["bars"]["ETH"]]          # and keeps it, though this answer hadn't
+    for k in range(127, 151):
+        clock["now"] = t0 + k * DAY + 4 * 60_000
+        feeds["SOL"].hide = {t0 + 140 * DAY} if k == 150 else set()
+        paper.step_basket(VOLTREND, tmp_path, feeds=feeds, log=lambda *a: None, now_ms=clock["now"])
+    feeds["SOL"].hide = set()
+    _vt_signal_is_the_full_data_one(tmp_path, series, "SOL", t0, 149)
+    _vt_finish(tmp_path, series, funding, feeds, clock, t0)
+
+
+def test_vt_waits_for_a_bar_no_answer_has_had_yet(tmp_path):
+    """A day with no run, then an answer that lacks one coin's bar from the day before the one that just closed. No
+    answer has had that bar, so memory can't fill it in, and it may yet show up: the days from it wait. The next
+    run's answer has it, and the ledger goes on exactly as the backtest. (Before, BTC sat out day 76 and the next
+    close was decided on a window shifted by a day.)"""
+    series, funding, feeds, clock, t0, states = _vt_daily_runs(tmp_path, 78, skip=(77,),
+                                                               hide=lambda k: {"BTC": (76,)} if k == 78 else {})
+    s = states[78]
+    led = json.loads((tmp_path / "paper.json").read_text())
+    assert s["paper"]["bars_processed_this_run"] == 0 and led["meta"]["last_bar_ts"] == t0 + 75 * DAY
+    assert led["broker"]["signals"]["BTC"]["ts"] == t0 + 76 * DAY      # still the close of day 75's decision
+    clock["now"] += 15 * 60_000                                          # the next run: the answer has the bar
+    s = paper.step_basket(VOLTREND, tmp_path, feeds=feeds, log=lambda *a: None, now_ms=clock["now"])
+    assert s["paper"]["bars_processed_this_run"] == 2
+    _vt_signal_is_the_full_data_one(tmp_path, series, "BTC", t0, 77)
+    _vt_finish(tmp_path, series, funding, feeds, clock, t0)
+
+
+def test_vt_a_real_gap_is_waited_for_three_days_then_sat_out_as_in_the_backtest(tmp_path):
+    """ETH has no bars at all on days 170 and 171 (_vt_market): no answer ever has them. VT waits for each until 3 days
+    after its close, then the coin sits that day out, as in the backtest, and VT catches up: it never stalls."""
+    series, funding, feeds, clock, t0, states = _vt_daily_runs(tmp_path, 176)
+    last = {k: (s["basket"]["last_close_ts"] - t0) // DAY - 1 for k, s in states.items()}   # the last day processed
+    assert [last[k] for k in range(170, 177)] == [169, 169, 169, 169, 170, 174, 175]
+    led = json.loads((tmp_path / "paper.json").read_text())
+    assert not {t0 + 170 * DAY, t0 + 171 * DAY} & {b[0] for b in led["bars"]["ETH"]}
+    _vt_finish(tmp_path, series, funding, feeds, clock, t0)
+
+
+@pytest.mark.parametrize("seed", [14, 25])
+def test_vt_paper_matches_the_backtest_through_holes_lags_and_odd_runs_together(tmp_path, seed):
+    """Every glitch at once, on every coin: answers up to 3 bars behind, holes in the newest 3 closed bars, runs
+    missed or repeated, a clock a little off either way, late answers. A bar a lagging answer hasn't reached isn't
+    a gap, though memory has later ones: these two seeds have one missing more than 3 days after its close. Every
+    hole heals from memory or a later answer, and the ledger is the backtest."""
+    series, funding = _vt_market()
+    clock = {}
+    feeds = {c: FakeDailyFeed(series[c], funding[c], clock) for c in series}
+    t0, start = series["BTC"][0].ts, 60
+    clock["now"] = t0 + start * DAY + DAY // 2
+    paper.step_basket(VOLTREND, tmp_path, feeds=feeds, log=lambda *a: None, now_ms=clock["now"])
+    rnd, k, waited = random.Random(seed), start, []
+    while k < 258:
+        k = min(258, k + rnd.choice([0, 1, 1, 1, 2]))
+        clock["now"] = t0 + k * DAY + rnd.choice([0, 1, 30_000, 4 * 60_000, 3600_000, DAY - 1, DAY - 60_000, -120_000])
+        for f in feeds.values():
+            f.lag = rnd.choice([0, 0, 0, 1, 2, 3])
+            f.hide = {t0 + (k - j) * DAY for j in range(1, 4) if rnd.random() < 0.15}
+            f.late_ms = rnd.choice([0, 0, 0, 40_000])
+        try:
+            paper.step_basket(VOLTREND, tmp_path, feeds=feeds, log=waited.append, now_ms=clock["now"])
+        except RuntimeError:                              # a lagging answer one bar short of 50: next run
+            pass
+        for f in feeds.values():
+            f.lag, f.hide, f.late_ms = 0, set(), 0
+    _vt_finish(tmp_path, series, funding, feeds, clock, t0)
+    assert sum("wait for it" in w for w in waited) >= 5
+
+
+def test_vt_ledger_remembers_its_last_70_closed_bars_and_an_older_ledger_gains_them(tmp_path):
+    """The memory is each coin's last 70 closed daily bars (ts, open, high, low, close), next to "meta" and "broker":
+    what the workflow reads (meta's started_ts and runs, broker.cash) is unchanged. A ledger from before it, with no
+    memory (the live one), steps as before and gains it."""
+    series, funding = _vt_market()
+    clock = {}
+    feeds = {c: FakeDailyFeed(series[c], funding[c], clock) for c in series}
+    t0 = series["BTC"][0].ts
+    clock["now"] = t0 + 120 * DAY + DAY // 2
+    paper.step_basket(VOLTREND, tmp_path, feeds=feeds, log=lambda *a: None, now_ms=clock["now"])
+    led = json.loads((tmp_path / "paper.json").read_text())
+    assert set(led) == {"meta", "broker", "bars"} and set(led["bars"]) == set(VOLTREND.coins)
+    del led["bars"]                                                      # as the ledgers saved before the memory
+    (tmp_path / "paper.json").write_text(json.dumps(led))
+    clock["now"] += 2 * DAY
+    s = paper.step_basket(VOLTREND, tmp_path, feeds=feeds, log=lambda *a: None, now_ms=clock["now"])
+    new = json.loads((tmp_path / "paper.json").read_text())
+    assert s["paper"]["bars_processed_this_run"] == 2
+    assert new["meta"]["started_ts"] == led["meta"]["started_ts"] and new["meta"]["runs"] == led["meta"]["runs"] + 1
+    assert isinstance(new["broker"]["cash"], float)
+    for c in VOLTREND.coins:
+        want = [[b.ts, b.open, b.high, b.low, b.close] for b in series[c] if b.ts + DAY <= clock["now"]][-70:]
+        assert new["bars"][c] == want and len(want) == 70
+
+
 def test_vt_board_carries_the_experiment_label(tmp_path):
     series, funding = _vt_market()
     clock = {"now": series["BTC"][0].ts + 150 * DAY + DAY // 2}
