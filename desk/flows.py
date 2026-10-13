@@ -280,8 +280,9 @@ def due(flows: list[Flow], recorded: list[dict], now_ms: int, account: str = "")
         if f is None or f.date != r["date"] or abs(f.amount - r["amount"]) > 1e-9:
             now = "no longer lists it" if f is None else f"now says {f.amount:+,.2f} on {f.date}"
             # the likeliest way to get here without editing anything: a new extra put above one on the same day
-            # (entries on one day are numbered in file order)
-            same_day = r["kind"] == "extra" and any(g.kind == "extra" and g.date == r["date"] for g in flows)
+            # (entries on one day are numbered in file order), so the file has more that day than the ledger
+            day = lambda xs: sum(1 for x in xs if x["kind"] == "extra" and x["date"] == r["date"])   # noqa: E731
+            same_day = r["kind"] == "extra" and day([{"kind": g.kind, "date": g.date} for g in flows]) > day(recorded)
             fix = (f"if you added an entry dated {r['date']}, move it below the one already there. Otherwise " if
                    same_day else "")
             raise FlowsError(f"{who}{fix}put back what was recorded: a recorded deposit or withdrawal can't be "

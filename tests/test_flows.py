@@ -193,6 +193,9 @@ def test_an_extra_put_above_a_recorded_one_on_the_same_day_says_to_move_it(tmp_p
     with pytest.raises(FlowsError, match=r"^BTC: if you added an entry dated 2020-12-05, move it below the one "
                                          r"already there"):
         _desk_run(tmp_path, sorted(above, key=lambda f: (f.ts, f.kind != "plan", f.id)), [600])
+    edited = [Flow(f.id, f.date, f.ts, 333.0, f.kind, f.note) if f.id == "extra-2020-12-05-0" else f for f in plan]
+    with pytest.raises(FlowsError, match=r"^BTC: put back what was recorded"):            # an edit, nothing added
+        _desk_run(tmp_path, edited, [600])
 
 
 def test_a_bad_entry_stops_only_its_account_and_a_bad_file_stops_every_account(tmp_path, monkeypatch):
