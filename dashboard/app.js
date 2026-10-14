@@ -776,9 +776,29 @@
     } catch { /* the chart just shows closed candles */ }
   }
 
+  // BTC SHADOW (the real Coinbase account, read only): a link to its own page (shadow.html, which opens its encrypted
+  // board with DESK_STATE_KEY), shown only once it publishes a status. Never a tab, never in the ALL total.
+  async function shadowLink() {
+    const el = $("shadow-link");
+    if (!el || !staticMode) return;
+    let st = null;
+    try {
+      const r = await fetch(`boards/BTC-SHADOW.status.json?t=${Date.now()}`, { cache: "no-store" });
+      st = r.ok ? await r.json() : null;
+    } catch { st = null; }
+    el.hidden = !st;
+    if (!st) return;
+    const age = Math.round((Date.now() - st.updated) / 60000), stale = age > 60;
+    el.className = `panel shadow-link${!st.ok || stale ? " bad" : ""}`;
+    el.innerHTML = `<b>BTC SHADOW</b><span class="mode shadow">SHADOW</span><span>real Coinbase account · read only · ` +
+      `no orders sent · ${st.ok && !stale ? `updated ${age} min ago` : !st.ok ? `not working (${esc(st.problem || "error")})` :
+      `not updated for ${age} min`} · open →</span>`;
+  }
+
   window.addEventListener("resize", render);
   (async function loop() {
     await tick();
+    shadowLink();
     setTimeout(loop, staticMode ? 60000 : 2000);
   })();
   pollMids(); pollCandle();

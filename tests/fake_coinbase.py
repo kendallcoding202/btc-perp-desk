@@ -176,6 +176,11 @@ class FakeCoinbase:
         self.usdc_account = "aaaaaaaa-0000-4000-8000-000000000002"
         self._seq = 0
         self._product = json.loads((FIX / "product.json").read_text())["calls"][0]["response"]
+        self.realtime = False                   # True: the fake's clock keeps up with this machine's (the CLI's tests)
+        self.funding_now = True                 # the product's funding_time is this hour (the recorded one is fixed)
+        self.bars2h: dict[int, tuple] = {}      # TWO_HOUR candles: start (s) -> (open, high, low, close, volume)
+        self.book_levels = 30                   # levels each side of the book, 100 contracts each, $5 apart
+        self.book_404_when_closed = False       # Coinbase may answer no book at all while closed
         self.server: ThreadingHTTPServer | None = None
 
     # ---- lifecycle
@@ -678,6 +683,8 @@ class FakeCoinbase:
         d["fcm_trading_session_details"]["is_session_open"] = self.session_open
         d["fcm_trading_session_details"]["session_state"] = ("FCM_TRADING_SESSION_STATE_OPEN" if self.session_open
                                                              else "FCM_TRADING_SESSION_STATE_CLOSED")
+        if self.funding_now:
+            d["future_product_details"]["funding_time"] = iso(self.now_s - self.now_s % 3600)
 
         def merge(a, b):
             for k, v in b.items():
@@ -768,6 +775,13 @@ class FakeCoinbase:
                                          "deleted": False}]}
         if path == f"{V3}/products/{PRODUCT}":
             return 200, self._product_answer()
+        if path == f"{V3}/product_book":
+            return self._book_answer()
+        if path == f"{V3}/products/{PRODUCT}/candles" and q["granularity"][0] == "TWO_HOUR":
+            lo, hi = int(q["start"][0]), int(q["end"][0])
+            rows = [(t, b) for t, b in sorted(self.bars2h.items(), reverse=True) if lo <= t <= hi][:300]
+            return 200, {"candles": [{"start": str(t), "open": f"{b[0]:g}", "high": f"{b[1]:g}", "low": f"{b[2]:g}",
+                                      "close": f"{b[3]:g}", "volume": f"{b[4]:g}"} for t, b in rows]}
         if path == f"{V3}/products/{PRODUCT}/candles":
             sec = {"ONE_MINUTE": 60, "FIVE_MINUTE": 300, "ONE_HOUR": 3600}[q["granularity"][0]]
             lo, hi = int(q["start"][0]), int(q["end"][0])
@@ -805,6 +819,20 @@ class FakeCoinbase:
             return self._v2_page(list(reversed(self.transactions)), q, path)
         return 404, {"error": "NOT_FOUND", "error_details": "Not Found", "message": "Not Found"}
 
+    def _book_answer(self):
+        """The product's book: book_levels levels a side, 100 contracts each, $5 apart from the best bid and ask.
+        Empty while the market is closed (Coinbase may answer none then)."""
+        if not self.session_open:
+            if self.book_404_when_closed:
+                return 404, {"error": "NOT_FOUND", "error_details": "no pricebook found", "message": "no pricebook found"}
+            return 200, {"pricebook": {"product_id": PRODUCT, "bids": [], "asks": [], "time": iso(self.now_s)}}
+        bids = [{"price": f"{self.bid - 5 * k:.0f}", "size": "100"} for k in range(self.book_levels)]
+        asks = [{"price": f"{self.ask + 5 * k:.0f}", "size": "100"} for k in range(self.book_levels)]
+        return 200, {"pricebook": {"product_id": PRODUCT, "bids": bids, "asks": asks, "time": iso(self.now_s)}}
+
+    PUBLIC = {f"{V3}/market/products/{PRODUCT}", f"{V3}/market/products/{PRODUCT}/candles", f"{V3}/market/product_book",
+              f"{V3}/market/products/{PRODUCT}/ticker"}
+
     def _auth(self, method: str, path: str, header: str) -> FakeKey | None:
         if not header.startswith("Bearer "):
             return None
@@ -840,12 +868,20 @@ class FakeCoinbase:
         except ValueError:
             body = None
         with self.lock:
+            if self.realtime:
+                import time
+
+                self.now_s = max(self.now_s, time.time())
             rec = {"method": method, "path": path, "query": q, "body": body, "raw": raw, "key": None,
                    "status": None, "ts": self.now_s}
             self.requests.append(rec)
             if method == "GET" and path == f"{V3}/time":
                 return self._send(h, rec, 200, {"iso": iso(self.now_s), "epochSeconds": str(int(self.now_s)),
                                                 "epochMillis": str(int(self.now_s * 1000))})
+            if method == "GET" and path in self.PUBLIC:        # the public market data paper reads, with no key
+                status, out = self._route("GET", path.replace("/market", "", 1), q, None,
+                                          FakeKey("public", "none", None, None))
+                return self._send(h, rec, status, out)
             key = self._auth(method, path, h.headers.get("Authorization", ""))
             if key is None:
                 return self._send(h, rec, 401, b"Unauthorized\n")
@@ -927,3 +963,51 @@ def arm_rest(fake: FakeCoinbase, fk: FakeKey | None = None, *, cap: float = 1_00
     assert got is not None, "\n".join(out)
     got[0].min_gap_s = 0
     return got[0]
+
+
+# ---------------------------------------------------------------- 2h candles for the desk to decide on
+
+def seed_bars(fake: FakeCoinbase, bars) -> None:
+    """The 2h candles the fake serves: desk Bars (ts in ms)."""
+    fake.bars2h = {int(b.ts // 1000): (b.open, b.high, b.low, b.close, b.volume or 1.0) for b in bars}
+
+
+def trend_bars(end_s: float, n: int = 1600, *, seed: int = 3, last: float = 83_000.0, breakout: bool = False):
+    """n closed 2h candles ending at the last close before `end_s`: a steady uptrend with noise ending near `last`
+    (the 100-EMA above the 400-EMA). breakout: the newest close takes out the prior 60-candle high by 1.5%."""
+    import math
+    import random
+
+    from desk.models import Bar
+
+    rnd = random.Random(seed)
+    bar = 7200
+    t_end = int(end_s) - int(end_s) % bar - bar          # the newest closed candle's open
+    closes = [1.0]
+    for _ in range(n - 1):
+        closes.append(closes[-1] * math.exp(rnd.gauss(0.0006, 0.009)))
+    scale = last / closes[-1]
+    out = []
+    prev = closes[0] * scale
+    for k, c in enumerate(closes):
+        c *= scale
+        o = prev
+        h = max(o, c) * (1 + abs(rnd.gauss(0, 0.002)))
+        lo = min(o, c) * (1 - abs(rnd.gauss(0, 0.002)))
+        out.append(Bar((t_end - (n - 1 - k) * bar) * 1000, round(o), round(h), round(lo), round(c), 100.0))
+        prev = c
+    if breakout:
+        hi = max(b.high for b in out[-61:-1])
+        c = round(hi * 1.015)
+        b = out[-1]
+        out[-1] = Bar(b.ts, b.open, max(b.high, c + 20), b.low, c, 100.0)
+    return out
+
+
+def next_bar(bars, close: float, *, low: float | None = None, high: float | None = None):
+    """One more 2h candle after `bars`, opening at the last close."""
+    from desk.models import Bar
+
+    b = bars[-1]
+    o = b.close
+    return bars + [Bar(b.ts + 7_200_000, o, max(o, close, high or 0), min(o, close, low or 1e18), close, 100.0)]

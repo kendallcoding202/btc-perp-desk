@@ -129,6 +129,15 @@ jobs:
           done
           [ -f ledger/index.json ] && cp ledger/index.json _site/boards/index.json
           [ -f _site/boards/BTC.json ] && cp _site/boards/BTC.json _site/board.json   # old links keep working
+          # BTC SHADOW (the real Coinbase account, read only): its encrypted board and public status, as the shadow
+          # job saved them on the coinbase-state branch (the previous run's). Display only, never in index.json or the
+          # ALL total; no branch (no key yet), nothing is shown. Nothing here can fail this step.
+          if timeout 60 git fetch -q --depth=1 origin +coinbase-state:refs/remotes/origin/coinbase-state 2>/dev/null; then
+            for pair in board-shadow.enc.json:BTC-SHADOW.enc.json status.json:BTC-SHADOW.status.json; do
+              git show "refs/remotes/origin/coinbase-state:BTC/${pair%%:*}" > "_site/boards/${pair##*:}" 2>/dev/null \
+                || rm -f "_site/boards/${pair##*:}"
+            done
+          fi
           ls -l _site _site/boards
 
       - uses: actions/upload-pages-artifact@v3
@@ -139,3 +148,129 @@ jobs:
       - id: deploy
         if: ${{ !cancelled() && steps.load.outcome == 'success' }}
         uses: actions/deploy-pages@v4
+
+      # Last, after the save and the deploy, and unable to fail the job: BTC's paper board for the shadow job, which
+      # compares its decision with paper's at the same close. (Not secret: it's the board published above.)
+      - name: Hand BTC's paper board to the shadow job
+        if: ${{ !cancelled() && hashFiles('ledger/BTC/board.json') != '' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: paper-btc-board
+          path: ledger/BTC/board.json
+          retention-days: 1
+          if-no-files-found: ignore
+
+  shadow:
+    # BTC SHADOW on Coinbase (BIP-20DEC30-CDE): reads the REAL Coinbase account with a View-only key, decides as the
+    # desk would live, and records the orders it would send, with simulated fills. It sends nothing; its client can't.
+    # After the paper job, which it can't touch: its own job, its own branch (coinbase-state), continue-on-error (a
+    # SHADOW failure never fails the run). Skipped, green, until both secrets exist. The repo is public: its state and
+    # board are saved encrypted (DESK_STATE_KEY) and its log line says nothing about money (desk/coinbase_run.py).
+    needs: step
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    continue-on-error: true
+    permissions:
+      contents: write
+    env:
+      SHADOW_ON: ${{ secrets.COINBASE_CDP_KEY != '' && secrets.DESK_STATE_KEY != '' }}
+    steps:
+      - name: Waiting for the Coinbase key
+        if: env.SHADOW_ON != 'true'
+        run: echo "SHADOW skipped - set the COINBASE_CDP_KEY and DESK_STATE_KEY secrets to start it (docs/coinbase-setup.md). Paper is unaffected."
+
+      - uses: actions/checkout@v4
+        if: env.SHADOW_ON == 'true'
+
+      - uses: actions/setup-python@v5
+        if: env.SHADOW_ON == 'true'
+        with:
+          python-version: "3.12"
+
+      - name: Install the Coinbase signing libraries (pinned, hashed)
+        if: env.SHADOW_ON == 'true'
+        run: |
+          python -m pip install --disable-pip-version-check --no-input --only-binary :all: --require-hashes \
+            -r requirements-coinbase.txt
+
+      - name: BTC's paper board, to compare decisions
+        if: env.SHADOW_ON == 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: paper-btc-board
+          path: ${{ runner.temp }}/paper-btc
+
+      - name: Load the SHADOW state
+        id: load
+        if: env.SHADOW_ON == 'true'
+        run: |
+          # As paper's load: a failed fetch stops the run, so a fresh SHADOW state never replaces the saved one (that
+          # would count the account's money again). Only a branch that doesn't exist yet (exit 2) means a first run.
+          mkdir -p "$RUNNER_TEMP/cb"
+          for attempt in 1 2 3; do
+            if git fetch --depth=1 origin +coinbase-state:refs/remotes/origin/coinbase-state; then
+              git archive refs/remotes/origin/coinbase-state BTC | tar -x -C "$RUNNER_TEMP/cb"
+              git rev-parse refs/remotes/origin/coinbase-state > "$RUNNER_TEMP/cb.lease"
+              exit 0
+            fi
+            rc=0
+            git ls-remote --exit-code --heads origin coinbase-state > /dev/null || rc=$?
+            if [ "$rc" -eq 2 ]; then
+              echo "no coinbase-state branch yet: SHADOW opens a new state"
+              : > "$RUNNER_TEMP/cb.lease"
+              exit 0
+            fi
+            sleep $((attempt * 10))
+          done
+          echo "::error::could not fetch the coinbase-state branch; stopping so the SHADOW state is not reset"
+          exit 1
+
+      - name: SHADOW run (reads the real account, sends nothing)
+        id: shadow
+        if: env.SHADOW_ON == 'true' && steps.load.outcome == 'success'
+        timeout-minutes: 6
+        env:
+          COINBASE_CDP_KEY: ${{ secrets.COINBASE_CDP_KEY }}
+          DESK_STATE_KEY: ${{ secrets.DESK_STATE_KEY }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          DESK_COINBASE_KILL: ${{ vars.DESK_COINBASE_KILL }}
+        run: python -m desk shadow --coin BTC --state-dir "$RUNNER_TEMP/cb" --paper-board "$RUNNER_TEMP/paper-btc/board.json"
+
+      - name: Save the SHADOW state
+        if: ${{ always() && env.SHADOW_ON == 'true' && steps.load.outcome == 'success' && steps.shadow.outputs.changed == 'true' }}
+        timeout-minutes: 2
+        run: |
+          git config user.name "paper-desk[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          gitdir="$(git rev-parse --absolute-git-dir)"
+          # Never a younger state, never a plain-text file (desk/coinbase_state.py: standard library, no secrets).
+          # One orphan commit, replaced each save (--force-with-lease on the commit loaded), built without a branch.
+          for attempt in 1 2 3; do
+            python3 -m desk.coinbase_state check "$RUNNER_TEMP/cb" refs/remotes/origin/coinbase-state
+            work="$RUNNER_TEMP/cb-tree-$attempt"
+            idx="$RUNNER_TEMP/cb-index-$attempt"
+            rm -rf "$work" "$idx"
+            mkdir -p "$work"
+            # kills.json = the branch's (your edits) with any kill this run set added
+            python3 -m desk.coinbase_state stage "$RUNNER_TEMP/cb" "$work" refs/remotes/origin/coinbase-state
+            GIT_INDEX_FILE="$idx" git -C "$work" --git-dir="$gitdir" --work-tree=. add -A .
+            tree=$(GIT_INDEX_FILE="$idx" git --git-dir="$gitdir" write-tree)
+            lease=$(cat "$RUNNER_TEMP/cb.lease")
+            if [ -n "$lease" ] && [ "$(git rev-parse "$lease^{tree}")" = "$tree" ]; then
+              echo "coinbase-state: nothing new to save"
+              exit 0
+            fi
+            commit=$(git commit-tree "$tree" -m "coinbase-state: BTC SHADOW at $(date -u +%Y-%m-%dT%H:%MZ)")
+            if git push --force-with-lease=coinbase-state:"$lease" origin "$commit":refs/heads/coinbase-state; then
+              exit 0
+            fi
+            # the branch moved (you edited kills.json, say): read it again and redo the save on top of it
+            if git fetch --depth=1 origin +coinbase-state:refs/remotes/origin/coinbase-state; then
+              git rev-parse refs/remotes/origin/coinbase-state > "$RUNNER_TEMP/cb.lease"
+            fi
+          done
+          echo "::error::coinbase-state moved three times while saving; this run's SHADOW state isn't saved (the next run redoes it)"
+          exit 1

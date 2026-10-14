@@ -83,7 +83,14 @@ class _AuthedFeed(CoinbaseFeed):
         self.raw: dict[str, dict] = {}
 
     def _get(self, path: str, params: dict | None = None, retries: int = 3):
-        out = self.rest.get(f"{V3}/{path}", params)
+        try:
+            out = self.rest.get(f"{V3}/{path}", params)
+        except CoinbaseRejected as exc:
+            # While Coinbase is closed it may have no book at all (404 "no pricebook found", as the public feed
+            # sees): an empty book, which context() takes as expected then and refuses while the session reads open.
+            if path != "product_book" or exc.status != 404:
+                raise
+            out = {"pricebook": {}}
         self.raw[path] = out
         return out
 

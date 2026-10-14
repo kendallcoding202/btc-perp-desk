@@ -95,14 +95,14 @@ def goal(equity: float, start: float, target: float, pace: dict | None, elapsed_
     if flows is not None and flows.active:
         return _goal_with_flows(equity, start, target, pace, elapsed_days, flows, now_ms)
 
-    progress = math.log(equity / start) / math.log(target / start) if equity > 0 and target > start else 0.0
+    progress = math.log(equity / start) / math.log(target / start) if equity > 0 and 0 < start < target else 0.0
     left = math.log(target / equity) if equity > 0 else math.inf
 
     def years(rate):
         return left / math.log(1 + rate) if rate and rate > 0 else None
 
     realised = None
-    if elapsed_days and elapsed_days >= 30 and equity > 0:
+    if elapsed_days and elapsed_days >= 30 and equity > 0 and start > 0:
         realised = (equity / start) ** (365.25 / elapsed_days) - 1
     test = (pace or {}).get("cagr")
     return {"start": start, "target": target, "equity": equity, "progress": max(0.0, min(1.0, progress)),
@@ -362,6 +362,7 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
             "title": title, "coin": coin, "risk_per_trade": p.sizing.risk_per_trade,
             "tagline": ("SCAN PICKS · RISK SIZES · FILLS TRADES" + (" · LONG + SHORT" if p.strategy.allow_shorts else "")
                         if vrules is None else    # its title is the real product's: say it's simulated, up front
+                        tagline_for(mode) if mode in REAL_ACCOUNT_MODES else
                         f"{mode.upper()} · SIMULATED ON {vrules.spec.name.upper()} RULES · NO ORDERS SENT"),
             "shorts": p.strategy.allow_shorts, "experiment": EXPERIMENTS.get(coin),
             "mode": mode.upper(), "venue": p.market.venue, "interval": p.market.interval,
@@ -369,7 +370,7 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
         },
         "ticker": {
             "price": price, "change_24h": chg_24h, "bank": equity, "pnl": equity - start_eq,
-            "pnl_pct": equity / start_eq - 1, "position": side_txt,
+            "pnl_pct": equity / start_eq - 1 if start_eq > 0 else 0.0, "position": side_txt,
             "position_detail": ((f"{vrules.contracts(pos.qty)} contract{'s' if vrules.contracts(pos.qty) != 1 else ''} "
                                  f"@ {pos.entry_price:,.0f}" if vrules else
                                  f"{pos.qty:.4f} @ {pos.entry_price:,.0f}") if pos else ""),
@@ -414,7 +415,25 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
     }, flows, equity, now_ms)
     if vrules is not None:      # only an account with venue rules: the other boards are as they were
         state["venue"] = venue_block(desk, f, i, price, equity, now_ms, venue_state)
+        if mode in REAL_ACCOUNT_MODES:
+            state["venue"]["stop_fill"] = STOP_FILL[mode]
     return state
+
+
+# The modes that are the real Coinbase account (desk/coinbase_run.py): SHADOW reads it and simulates the orders, LIVE
+# trades it. Their boards say so up front; a paper board's tagline and venue panel are unchanged.
+REAL_ACCOUNT_MODES = ("shadow", "live")
+STOP_FILL = {
+    "shadow": "stops simulated from Coinbase's 5-minute candles as stop-limits: filled at the stop, or at the open past "
+              "it, only within the limit; otherwise left open, as on Coinbase",
+    "live": "the stop rests on Coinbase as a stop-limit, its limit 5% past the trigger: it fills only within the "
+            "limit; a gap past it leaves the position open until the next run closes it at market",
+}
+
+
+def tagline_for(mode: str) -> str:
+    return {"shadow": "SHADOW · YOUR REAL COINBASE ACCOUNT, READ ONLY · NO ORDERS SENT · TRADES SIMULATED",
+            "live": "LIVE · YOUR REAL COINBASE ACCOUNT · REAL ORDERS · REAL MONEY"}.get(mode, mode.upper())
 
 
 def _venue_skip(dec):

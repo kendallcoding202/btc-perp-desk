@@ -866,6 +866,10 @@ def _gate(tmp_path, monkeypatch, *, report="pass", paper_days=20.0, paper_cash=1
     from desk import __main__ as cli
 
     monkeypatch.chdir(tmp_path)
+    # These exercise the go-live gate of the long-running loop (Hyperliquid and the ccxt venues). BTC itself is set up
+    # for Coinbase, whose LIVE is its own locked path (`live --once`, tests/test_coinbase_shadow.py): here it's
+    # read as a loop venue, so the gate these tests check is the one they always checked.
+    monkeypatch.setattr(cli, "venue_for", lambda p: None)
     (tmp_path / "reports").mkdir()
     if report is not None:
         rep = json.loads((REPO / "reports" / "backtest.json").read_text())

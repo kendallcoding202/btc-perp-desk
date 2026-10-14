@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>BTC Shadow</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Silkscreen:wght@400;700&family=JetBrains+Mono:wght@400;600;700&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body data-coin="BTC" class="shadow-page">
+<div class="frame">
+
+  <header class="panel header">
+    <div class="brand">
+      <h1 id="title">BTC SHADOW · COINBASE</h1>
+      <span class="tagline" id="tagline">SHADOW · YOUR REAL COINBASE ACCOUNT, READ ONLY · NO ORDERS SENT · TRADES SIMULATED</span>
+    </div>
+    <div class="clock">
+      <span class="mode shadow" id="mode">SHADOW</span>
+      <a class="back" href="./">← paper accounts</a>
+    </div>
+  </header>
+
+  <section class="panel sh-status" id="status" role="status">reading the status…</section>
+
+  <section class="panel sh-lock" id="lock" hidden>
+    <p>This tab shows your real Coinbase account, so it's encrypted (this site is public). Enter DESK_STATE_KEY to open it
+      on this device. It stays on this device; nothing is sent.</p>
+    <form id="unlock" autocomplete="off">
+      <label for="pw" class="label muted">DESK_STATE_KEY</label>
+      <input id="pw" type="password" autocomplete="off" spellcheck="false" minlength="32" required>
+      <label class="remember"><input id="remember" type="checkbox"> remember it on this device (off: this tab only)</label>
+      <button type="submit">open</button>
+      <span class="sh-err" id="err" role="alert"></span>
+    </form>
+  </section>
+
+  <main id="board" hidden></main>
+
+  <footer class="foot"><span id="foot"></span> · <a href="#" id="forget">forget the key on this device</a> ·
+    not financial advice; the desk can and will lose money</footer>
+</div>
+<script src="shadow.js"></script>
+</body>
+</html>

@@ -74,6 +74,43 @@ html[data-desk="up"] .ring::after { border-color: transparent; border-bottom-col
 .mode.paper { color: #1a1203; background: var(--amber); border-color: var(--amber); }
 .mode.live { color: #1a0508; background: var(--red); border-color: var(--red); }
 .mode.replay { color: #06101f; background: var(--blue); border-color: var(--blue); }
+.mode.shadow { color: #06101f; background: var(--cyan); border-color: var(--cyan); }
+
+/* BTC SHADOW: the link on the main board, and its own page (shadow.html) */
+.shadow-link { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 9px 12px; color: var(--text); text-decoration: none; font-size: 11px; border-color: var(--cyan); }
+.shadow-link[hidden] { display: none; }
+.shadow-link b { font-family: var(--pixel); font-size: 13px; color: var(--btc); letter-spacing: .08em; }
+.shadow-link .mode { font-family: var(--pixel); font-size: 10px; }
+.shadow-link.bad { border-color: var(--red); }
+.shadow-page .back { color: var(--muted); font-family: var(--mono); font-size: 11px; }
+.shadow-page .ok { color: var(--green); } .shadow-page .bad { color: var(--red); } .shadow-page .amber { color: var(--amber); }
+.sh-status, .sh-lock, .sh-warn { padding: 10px 14px; font-size: 11.5px; line-height: 1.6; overflow-wrap: anywhere; }
+.sh-warn { border-color: var(--red); }
+.sh-lock form { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.sh-lock input[type=password] { flex: 1 1 220px; min-width: 0; background: var(--panel-2); color: var(--text); border: 1px solid var(--line); padding: 7px 8px; font-family: var(--mono); }
+.sh-lock button { background: var(--cyan); color: #06101f; border: 0; padding: 7px 14px; font-family: var(--pixel); cursor: pointer; }
+.sh-lock .remember { font-size: 10.5px; color: var(--muted); flex-basis: 100%; }
+.sh-err { color: var(--red); flex-basis: 100%; }
+#board { display: grid; gap: 10px; }
+#board[hidden] { display: none; }
+#board .panel-head { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; padding: 8px 12px; font-family: var(--pixel); font-size: 11px; border-bottom: 1px solid var(--line); }
+#board .panel-head .muted { font-family: var(--mono); font-size: 10px; }
+.sh-two { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px; background: var(--line); }
+.sh-two > div { background: var(--panel); padding: 10px 12px; min-width: 0; }
+.sh-two .big { font-size: 26px; font-weight: 700; margin: 4px 0 8px; }
+#board .stats { display: grid; gap: 4px; padding: 8px 12px; }
+#board .stats > div { display: flex; justify-content: space-between; gap: 10px; font-size: 11px; border-bottom: 1px dotted var(--line); padding-bottom: 3px; }
+#board .stats span { color: var(--muted); flex: 0 0 auto; }
+#board .stats b { text-align: right; font-weight: 600; overflow-wrap: anywhere; min-width: 0; }
+.sh-body { padding: 8px 12px; font-size: 11.5px; line-height: 1.55; }
+.sh-body p { margin: 0 0 6px; }
+#board ul { list-style: none; margin: 0; padding: 8px 12px; display: grid; gap: 5px; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.sh-checks li b { display: inline-block; width: 38px; font-family: var(--pixel); font-size: 10px; }
+.sh-checks li i { display: block; font-style: normal; color: var(--dim); margin-left: 42px; }
+#board details { margin-top: 3px; } #board summary { color: var(--dim); cursor: pointer; font-size: 10px; }
+#board pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 10px; color: var(--muted); max-height: 320px; overflow: auto; margin: 4px 0 0; }
+.sh-notes { padding-bottom: 8px; } .sh-notes details { padding: 0 12px; }
+@media (max-width: 560px) { .sh-two { grid-template-columns: minmax(0, 1fr); } .sh-two .big { font-size: 22px; } }
 
 /* account tabs: one per paper account (BTC, ETH, SOL, the VT basket), plus the total. app.js sets --tabs */
 .coins { display: grid; grid-template-columns: repeat(var(--tabs, 4), minmax(0, 1fr)); gap: 1px; padding: 0; overflow: hidden; background: var(--line); }

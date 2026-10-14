@@ -150,7 +150,7 @@ def _utc(ms: int) -> str:
 
 
 def process_closed_bars(desk: Desk, broker, f, new: list[int], *, ctx, now: int, mid: float, meta: dict,
-                        log=print) -> None:
+                        log=print, fresh_ms: int = FRESH_MS) -> None:
     """Every bar that closed since the last one processed, oldest first, through paper.step's steps (desk/paper.py):
     fill what the previous close decided, check the stop against the bar, charge funding, let the desk decide.
 
@@ -163,12 +163,13 @@ def process_closed_bars(desk: Desk, broker, f, new: list[int], *, ctx, now: int,
         one went through it, paper is out at that bar, so live gets out now. The final trail is sent once;
       * an entry decided at a missed bar is NOT taken: paper filled it at an open that has passed, and live would
         be acting on a stale signal at today's price. It is said on the board and logged.
-    The newest close is fresh only if it closed less than FRESH_MS ago: then its orders go to the exchange now, as when
-    no bar was missed. If it closed longer ago (waking from a gap late in the bar, a restart), it is handled like a
-    missed bar: its exits and trail go, its entry is not taken."""
+    The newest close is fresh only if it closed less than `fresh_ms` ago (FRESH_MS, 5 minutes, for this loop; the
+    Coinbase one-shot runs on Actions pass 30: they land 7-9 minutes after a close): then its orders go to the exchange
+    now, as when no bar was missed. If it closed longer ago (waking from a gap late in the bar, a restart), it is
+    handled like a missed bar: its exits and trail go, its entry is not taken."""
     newest = new[-1]
     age_ms = now - (f.bars[newest].ts + f.bar_ms)
-    fresh = age_ms <= FRESH_MS
+    fresh = age_ms <= fresh_ms
     broker.defer_stops = True
     try:
         for i in new:

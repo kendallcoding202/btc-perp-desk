@@ -5,7 +5,8 @@
     replay       watch the desk trade history on the board (http://127.0.0.1:8787)
     paper        one coin's paper account on live prices (BTC: Coinbase's rules and prices), with a live local board
     step         process newly closed bars for every paper account (BTC, ETH, SOL, VT) once, then exit (cron / Actions)
-    live         trade real money — refuses unless the backtest AND paper record pass
+    live         trade real money — refuses unless the backtest AND paper record pass (BTC on Coinbase: --once, LOCKED)
+    shadow       BTC on Coinbase: the REAL account, read only with a View-only key; orders simulated, none sent
     reset-halt   clear a drawdown halt after you've looked at what happened
     jev-test     check that JEV_API_KEY works
 """
@@ -382,10 +383,65 @@ def _live_confirmed() -> bool:
     return os.environ.get("DESK_LIVE_CONFIRM") == LIVE_CONFIRM_PHRASE
 
 
+def cmd_shadow(args) -> int:
+    """SHADOW (desk/coinbase_run.py): one check of the real Coinbase account, read only. stdout and stderr are
+    captured from here on: the Actions log is public, so it gets the key's masks and one line, nothing else."""
+    from . import coinbase_run as cr
+
+    env = dict(os.environ)
+    paper_board = None
+    if args.paper_board and Path(args.paper_board).exists():
+        try:
+            paper_board = json.loads(Path(args.paper_board).read_text())
+        except ValueError:
+            paper_board = None
+
+    def go(mask_emit, buf):
+        return cr.run_shadow(args.state_dir, env, base_url=cr.base_url_from(env), mask_emit=mask_emit,
+                             paper_board=paper_board, stray=buf)
+
+    code, _, _ = cr.captured(go, lambda line: print(line, flush=True))
+    return code
+
+
+COINBASE_LOOP = ("  Coinbase LIVE runs one check per call (--once), the way GitHub Actions runs it; the long-running loop "
+                 "isn't built for Coinbase.")
+
+
+def cmd_live_coinbase(args, p) -> int:
+    """LIVE on Coinbase: LOCKED behind coinbase_live.arm() (README: Going live on Coinbase). One check per call."""
+    from . import coinbase_run as cr
+
+    if not args.once:
+        print(COINBASE_LOOP)
+        return 2
+    on_actions = os.environ.get("GITHUB_ACTIONS") == "true"
+    if not on_actions and not args.local:
+        print("  Coinbase LIVE runs on GitHub Actions, where its state is saved (the coinbase-state branch). Two "
+              "machines with separate states would manage one position twice: run it here only with --local, and only "
+              "with the Actions job stopped.")
+        return 2
+    env = dict(os.environ)
+    gate = promotion_status(p)
+
+    def go(mask_emit, buf):
+        return cr.run_live_once(args.state_dir, env, max_notional=args.max_notional, gate=gate,
+                                force_unproven=args.force_unproven, base_url=cr.base_url_from(env),
+                                mask_emit=mask_emit, stray=buf)
+
+    code, _, run = cr.captured(go, lambda line: print(line, flush=True))
+    if run is not None and not on_actions:      # your own terminal: every arming check, PASS or FAIL
+        for line in run.arm_lines:
+            print(line)
+    return code
+
+
 def cmd_live(args) -> int:
     from . import runner
 
     p = _params(args)
+    if venue_for(p) is not None:        # BTC on Coinbase: its own client, LOCKED
+        return cmd_live_coinbase(args, p)
     checks = promotion_status(p)
     for label, ok, val in checks:
         print(f"  {'PASS' if ok else 'FAIL'}  {label} — {val}")
@@ -520,7 +576,16 @@ def main(argv=None) -> int:
         if name == "live":
             sp.add_argument("--max-notional", type=float, default=None, help="hard USD cap per position")
             sp.add_argument("--force-unproven", action="store_true", help="override the go-live gate (don't)")
+            sp.add_argument("--once", action="store_true", help="BTC on Coinbase: one check, then exit (Actions)")
+            sp.add_argument("--state-dir", default="state", help="BTC on Coinbase: where its encrypted state is")
+            sp.add_argument("--local", action="store_true", help="BTC on Coinbase: allow --once off GitHub Actions")
         sp.set_defaults(fn=fn)
+
+    sp = sub.add_parser("shadow")
+    sp.add_argument("--coin", default="BTC", type=str.upper, choices=["BTC"])
+    sp.add_argument("--state-dir", required=True, help="the coinbase-state branch's files (the workflow loads them)")
+    sp.add_argument("--paper-board", default=None, help="the BTC paper account's board.json, to compare decisions")
+    sp.set_defaults(fn=cmd_shadow)
 
     sp = sub.add_parser("reset-halt")
     sp.add_argument("--mode", choices=["paper", "live"], default="paper")

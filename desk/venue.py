@@ -224,6 +224,19 @@ class Rules:
         gates.append(GateResult("margin", Verdict.PASS, round(left, 2), round(need, 2), "min", "size", note))
         return self.qty(n), gates
 
+    def min_equity_for_one(self, price: float, stop: float, side_sign: int, risk_budget: float,
+                           desk_max_leverage: float | None = None) -> float:
+        """The smallest account that holds one contract at `price` with this stop, as size() decides: the loss at the
+        stop within the risk budget, one contract's notional within the leverage caps, and the equity left at the
+        stop covering its overnight margin. (What the board shows an account too small to trade.)"""
+        one = self.spec.contract_size * price
+        loss1 = self.spec.contract_size * abs(price - stop)
+        need = [loss1 / risk_budget if risk_budget > 0 else math.inf, one / self.spec.max_leverage,
+                loss1 + one * self.overnight_margin(side_sign)]
+        if desk_max_leverage:
+            need.append(one / desk_max_leverage)
+        return max(need)
+
     def as_dict(self) -> dict:
         return {"spec": asdict(self.spec), "margin": dict(self.margin), "windows": self.sessions.windows}
 

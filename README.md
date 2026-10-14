@@ -73,9 +73,10 @@ python3 -m desk vt-backtest                  # the VT basket: reports/backtest-V
 python3 -m desk replay                       # watch it trade 2024→now at http://127.0.0.1:8787
 python3 -m desk paper                        # a $500 BTC paper account ($150 with --coin ETH or SOL), board at :8787
 python3 -m desk step                         # one step for every account (BTC, ETH, SOL, VT), the way the Action runs it
-python3 -m pytest                            # 238 tests, incl. "paper ledger == backtest" for the desk, for BTC on
-                                             # Coinbase rules and for VT,
-                                             # and live mode against a fake exchange (tests/test_live.py)
+python3 -m pytest                            # 485 tests, incl. "paper ledger == backtest" for the desk, for BTC on
+                                             # Coinbase rules and for VT, live mode against a fake exchange
+                                             # (tests/test_live.py), and SHADOW and the locked Coinbase LIVE path
+                                             # against a local fake Coinbase (tests/test_coinbase_shadow.py)
 ```
 
 ## The paper experiments
@@ -278,7 +279,7 @@ This is for the BTC, ETH and SOL desk accounts only. VT has no live mode.
 
 `--force-unproven` overrides 1 and 2: it prints a warning and carries on. 3 and 4 always hold. Don't use it.
 
-**BTC can't go live yet.** Its account is set up for Coinbase, and the live broker only trades Hyperliquid (and the ccxt venues below), so `python -m desk live --coin BTC` refuses and says why. Live on Coinbase needs its own work: ccxt 4.5.85's Coinbase futures support has gaps the October 2026 research found (stop-market orders are unsupported, and its futures positions, balances and reduce-only closes don't work as the live broker needs), and the fee estimate needs the real fee tier.
+**BTC on Coinbase has its own path: SHADOW now, LIVE locked.** `python -m desk live --coin BTC` without `--once` refuses: Coinbase runs one check per call on GitHub Actions ([Going live on Coinbase (locked)](#going-live-on-coinbase-locked)). What's below is the Hyperliquid (and ccxt) live loop.
 
 It also refuses to start if:
 - a credential is missing, or the account reads $0. On Hyperliquid, `HL_WALLET_ADDRESS` is the account the API wallet was approved for, never the API wallet's own address.
@@ -316,6 +317,79 @@ Paper trading is not affected by any of this. The backtests (BTC, ETH, SOL, VT) 
 
 Perpetual futures are restricted in some countries, including for US persons on most venues. Check that your venue is legal where you live.
 
+## Coinbase SHADOW (the real account, read only)
+
+**SHADOW reads your real Coinbase account and sends no order.** It runs with a View-only key, a GitHub job after the paper step every 15 minutes. It makes the same decisions LIVE would make, on Coinbase's own 2h candles with paper's venue rules, and records the exact orders LIVE would have sent. To set it up, follow [`docs/coinbase-setup.md`](docs/coinbase-setup.md): one secret for the key file (`COINBASE_CDP_KEY`) and one password (`DESK_STATE_KEY`).
+
+- **It can't send an order, three ways over.**
+  - The key is View only: SHADOW checks Coinbase's key permissions every run and refuses a key that can trade or move money.
+  - Its client (`desk/brokers/coinbase_rest.py`) refuses every POST before a socket opens unless it holds an Armed token, and only `desk/coinbase_live.py`'s `arm()` makes one. A test scans the code to keep it that way.
+  - Its exchange (`desk/brokers/coinbase_shadow.py`) records each order instead of sending it.
+- **The money is real; the trades are simulated.** SHADOW's balance is your real Coinbase balance (spot + futures + open and unsettled P&L, cross-checked against available margin and holds) plus the estimated P&L of the orders LIVE would have sent. The board shows the two side by side, the second marked as an estimate.
+  - Simulated fills are at Coinbase's best ask (buys) or bid (sells) when the run looked, with the fee estimate max($0.20 a contract, 5 bps). The real fee tier is read and shown, but Coinbase's per-contract futures fee isn't in it.
+  - Stops are simulated from Coinbase's 5-minute candles as stop-limits. One fills at the stop, or at the open past it, only within its limit; a gap past the limit leaves it unfilled, as on Coinbase, and the next run closes at market.
+  - Funding on the simulated position is an estimate from the hourly rates SHADOW logs (Coinbase publishes no funding history).
+- **Deposits and withdrawals are read from Coinbase** (the USD wallet's transactions): money in or out, never profit or loss. `deposits.json` drives the paper accounts only.
+  - The first deposit opens the account: it is the start, not profit. On day one at $0 the desk reads and decides but sizes nothing, and says how big an account the current setup needs for one contract.
+  - A withdrawal that empties the account closes it, with no drawdown halt; the next deposit opens it again.
+  - USDC turned into USD for margin counts as money in from your USDC. A transfer type the desk doesn't know is alerted, never booked.
+  - Every run checks that the balance moved by what P&L, fees, funding and those flows explain. A move nothing explains waits 3 hours for its ledger entry, then alerts and sets `entry_kill`, as LIVE would.
+- **It's compared with paper.** The paper BTC account's board is handed to the SHADOW job. At the same close, the gates that rest on the candles alone (the setup, the trend, the volatility band) must agree; a disagreement is alerted. The gates that differ by design are named: the account's own balance and brakes, the moment each read the book, each one's own funding log.
+- **Entries.** An entry goes out at most 30 minutes after its close (runs land 7 to 9 minutes after a close on Actions), at market, sized again at the best ask then, and only while Coinbase is open. The weekly break and maintenance come from paper's rules and Coinbase's own session flag.
+- **The repository is public, so:**
+  - SHADOW's state and board are encrypted (PBKDF2 + AES-256-GCM, `desk/statebox.py`) and saved on their own branch, `coinbase-state`, never `paper-ledger`.
+  - The public `BTC/status.json` has no amounts and no ids.
+  - The Actions log gets one fixed line plus GitHub's masks for the key: the run captures everything else it prints.
+  - The dashboard's **BTC SHADOW** bar links to `shadow.html`, which opens the encrypted board on your device with `DESK_STATE_KEY` (WebCrypto; nothing is sent). It's never one of the paper tabs or in the ALL total, and nothing shows until SHADOW has published a status.
+- **Pushes** (ntfy): `BTC SHADOW: connected (read only)` once; `would BUY (no order sent)`, `would SELL (no order sent)` and `would SELL (stop, simulated)`; `DEPOSIT`, `WITHDRAWAL` and `account opened`; `ALERT` (each kind at most every 6 hours); `not working` (the first failure, then every 6 hours).
+- **The job can't hurt paper.**
+  - It runs after the paper job (`needs: step`) and installs its two pinned, hashed libraries (PyJWT 2.14.0, cryptography 50.0.1) only for itself.
+  - It holds only `contents: write` and pushes only `coinbase-state`, one commit replaced each save with `--force-with-lease`, after a check that refuses a younger or plain-text state (`desk/coinbase_state.py`).
+  - It's `continue-on-error`: a SHADOW failure never fails the run.
+  - Without both secrets it skips, green.
+- **Not yet known** (the docs couldn't be read verbatim from where this was built):
+  - whether Coinbase's balance fields mean exactly what the formula assumes (ACH holds, the daily settlement);
+  - how quickly deposits show up in the v2 transactions for a View key;
+  - whether Ed25519 keys work (use ECDSA).
+  
+  SHADOW exists to find these out before any money moves. Every inferred fact is checked at runtime: SHADOW refuses or alerts rather than guess.
+
+## Going live on Coinbase (locked)
+
+**LIVE on Coinbase is locked, and nothing in this repository arms it.** `python -m desk live --coin BTC --once --max-notional N` runs one check, with the same code as SHADOW, on the client `coinbase_live.arm()` unlocks.
+- Entries go out as whole contracts at market.
+- A protective stop-limit rests on Coinbase at all times, its limit 5% past the trigger; Coinbase has no stop-market and no reduce-only.
+- The stop is trailed cancel-first at each run: two full-size stops at once could open a short.
+- Exits cancel the stop, then close the position.
+
+It has only ever run against the tests' local fake Coinbase (`tests/fake_coinbase.py`). `arm()` prints every check as PASS or FAIL and sends nothing unless all of them pass: the go-live gate, `DESK_LIVE_CONFIRM`, `DESK_LIVE_COINBASE=BIP-20DEC30-CDE`, a `--max-notional` that buys one contract, SHADOW's 14 clean days with a deposit reconciled to the cent, a View + Trade key that can't move money on SHADOW's portfolio, no USDC, and a flat start. Off GitHub Actions it also needs `--local`. The steps to arm it, and to disarm it, are in [`docs/coinbase-setup.md`](docs/coinbase-setup.md#part-2-the-trade-key-and-live-later-not-armed). This is the workflow edit they describe, for when you decide, not before. In the `shadow` job, add `environment: coinbase-live` (a GitHub Environment limited to the `main` branch, holding the secrets below), and replace the SHADOW run step with this one, never with `--force-unproven`:
+
+```yaml
+      - name: LIVE run (real orders)
+        id: shadow
+        if: env.SHADOW_ON == 'true' && steps.load.outcome == 'success'
+        timeout-minutes: 6
+        env:
+          COINBASE_CDP_KEY: ${{ secrets.COINBASE_CDP_TRADE_KEY }}
+          DESK_STATE_KEY: ${{ secrets.DESK_STATE_KEY }}
+          DESK_LIVE_CONFIRM: ${{ secrets.DESK_LIVE_CONFIRM }}
+          DESK_LIVE_COINBASE: ${{ vars.DESK_LIVE_COINBASE }}
+          DESK_LIVE_MAX_NOTIONAL: ${{ vars.DESK_LIVE_MAX_NOTIONAL }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          DESK_COINBASE_KILL: ${{ vars.DESK_COINBASE_KILL }}
+        run: |
+          git fetch --depth=1 origin paper-ledger && git checkout FETCH_HEAD -- ledger/BTC/paper.json
+          python -m desk live --coin BTC --once --max-notional "$DESK_LIVE_MAX_NOTIONAL" --state-dir "$RUNNER_TEMP/cb"
+```
+
+LIVE keeps its own encrypted state (`BTC/state-live.enc.json`; SHADOW refuses to run beside it) and its own board (`board-live.enc.json`), which the dashboard doesn't open yet: that's a follow-up for the day it's armed.
+
+What a real-money run risks, beyond the strategy's own losses:
+- The job runs about every 15 minutes, best effort: late, or skipped, at busy times. Between runs only the stop resting on Coinbase protects the position.
+- The stop is a stop-limit. The board shows two figures, "risk at the stop trigger" (the 5% budget) and "if filled at the stop-limit's limit" (more). A gap past the limit has no bound until the next run closes at market.
+- Each trailing move leaves a few seconds with no stop resting (up to about 30 s if Coinbase is slow).
+- If you close the position yourself, cancel its stop too: a stop with no position opens one when it fires.
+
 ## Layout
 
 ```
@@ -329,10 +403,16 @@ desk/voltrend.py     the VT basket: its rule, its book, and its backtest (one co
 desk/paper.py        the paper ledger step (one ledger per account under ledger/<COIN>/, VT's in ledger/VT/)
 desk/jev.py          TypeSafe Jev client (POST api.typesafe.ai/v1/systemone)
 desk/venue.py        a venue's own rules (BTC on Coinbase): whole contracts, margin, sessions, fees, the funding log
-desk/brokers/        sim.py (backtest + paper; VenueSimBroker for a venue's fees), live.py (ccxt)
+desk/brokers/        sim.py (backtest + paper; VenueSimBroker for a venue's fees), live.py (ccxt; and Coinbase's
+                     adapter: coinbase.py, coinbase_rest.py, coinbase_auth.py, coinbase_orders.py, and SHADOW's
+                     coinbase_shadow.py: the real money, a virtual book, the orders it would send)
+desk/coinbase_run.py SHADOW and LIVE on Coinbase, one check per call (python -m desk shadow / live --once)
+desk/coinbase_live.py the lock: arm() and its Armed token, the only way to an order-capable client
+desk/statebox.py     the encrypted state and board (the repo is public); coinbase_state.py: the save checks
+docs/coinbase-setup.md  click by click: the View-only key, the two secrets, what to expect; the trade key, later
 desk/feeds/          hyperliquid.py (live), coinbase.py (live, BTC), binance_vision.py (history)
 desk/board.py        state → dashboard JSON (agent cards, bubbles, gates, thresholds; the VT holdings)
-dashboard/           the board: no build step, phone-friendly
+dashboard/           the board: no build step, phone-friendly; shadow.html opens SHADOW's encrypted board
 dashboard/spider.js  the walking CRAWLER: visits whatever the desk just did (gate cards in the order the desk
                      checks them, the newest candle, the trigger line, new fills) and curls up when the board
                      is stale. Decoration only; it changes no rule
