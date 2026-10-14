@@ -202,10 +202,15 @@ def test_remember_keeps_margin_windows_and_the_funding_log_across_runs():
 
 
 def test_live_refuses_btc_on_coinbase_with_why():
-    from desk.brokers.live import LiveBroker, LiveSetupError
+    """BTC on Coinbase goes only through Coinbase's own adapter (desk/brokers/coinbase.py), and LIVE on it is locked
+    (desk/coinbase_live.py): never through ccxt, never without arming."""
+    from desk.brokers.live import LiveBroker, LiveSetupError, make_exchange
 
-    with pytest.raises(LiveSetupError, match="BTC is set up for COINBASE · BTC PERP .*live trading there isn't built"):
-        LiveBroker(params_for("BTC"), exchange=object(), state_path="/nonexistent/x.json")
+    for ex in (object(), None):
+        with pytest.raises(LiveSetupError, match="BTC is set up for COINBASE · BTC PERP .*LIVE on it is locked"):
+            LiveBroker(params_for("BTC"), exchange=ex, state_path="/nonexistent/x.json")
+    with pytest.raises(LiveSetupError, match="LIVE on it is locked"):
+        make_exchange("coinbase")
 
 
 # a venue like Coinbase's for the tests' synthetic 4h series: no known closures (they're from 2025-26), 3x

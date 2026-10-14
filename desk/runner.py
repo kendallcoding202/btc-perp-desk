@@ -318,6 +318,10 @@ def run(p: Params, mode: str, *, state_dir: str = "state", poll_s: float = 15.0,
                 desk.kills.entry_kill = True
                 desk.kills.save(kills_path)
                 broker.flow_gap = None
+            if getattr(broker, "entry_kill_why", None):     # Coinbase: something entries must stop for (alerted)
+                desk.kills.entry_kill = True
+                desk.kills.save(kills_path)
+                broker.entry_kill_why = None
 
             if broker.close_wanted and broker.position is not None:
                 # a close the desk decided that didn't go through: send it again now, not at the next bar close

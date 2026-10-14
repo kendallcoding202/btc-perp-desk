@@ -1,0 +1,27 @@
+# Coinbase (BTC on BIP-20DEC30-CDE): the CDP JWT signing desk/brokers/coinbase_auth.py needs. Nothing else in the desk
+# imports these: backtest and paper stay standard-library only (requirements.txt). Installed, wheels only, with
+#   python -m pip install --only-binary :all: --require-hashes -r requirements-coinbase.txt
+# Every version was published on PyPI at least two weeks before 2026-10-13 (upload dates below); the hashes are PyPI's
+# sha256 of each Linux x86_64 wheel (GitHub's ubuntu-latest runners), for CPython 3.12 and 3.13 where a wheel is per
+# version. coinbase-advanced-py (Coinbase's SDK) isn't used: it would add requests, websockets and backoff and nothing
+# the desk needs; its signing is copied in coinbase_auth.py instead. cryptography 50.0.1 also satisfies ccxt 4.5.85's
+# cryptography>=50,<51.
+
+# 2026-09-11
+PyJWT==2.14.0 \
+    --hash=sha256:ad0cef71c756a56e74863c2919cf0985f72decbcfcb550ee2f422e7c62b5eedc
+# 2026-08-25
+cryptography==50.0.1 \
+    --hash=sha256:51afcfceb15597cf2635068e4ac9a56b2abde622edde17f37d85fd7b5306497a \
+    --hash=sha256:51593d180cf6d179bde5c5d065bed81386b1f381656ae7d042b7ffc87a9895ad \
+    --hash=sha256:ff838d62ec1bfce4f9ba7fa16f4a7b554cd8d0c299e6be37502161a660c84eef \
+    --hash=sha256:9dde0a357190eb3b1da1bb9ab750e9c85cba82ca5977aa0836cbb94e92611239 \
+    --hash=sha256:407fe2b6db00939c05c0e945e9914238f2f0a430974839429dafc82b1ee6bee5 \
+    --hash=sha256:e22dfed744bd4002e909464cb23d2f0b05c6f3113a79ef2e9864a53db737c733
+# 2025-09-08 (cryptography's own dependency)
+cffi==2.0.0 \
+    --hash=sha256:3e17ed538242334bf70832644a32a7aae3d83b57567f9fd60a26257e992b79ba \
+    --hash=sha256:c8d3b5532fc71b7a77c09192b4a5a200ea992702734a2e9279a37f2478236f26
+# 2026-01-21 (cffi's dependency: the newest release uploaded before 2026-09-29)
+pycparser==3.0 \
+    --hash=sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992

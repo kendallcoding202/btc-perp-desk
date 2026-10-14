@@ -39,6 +39,28 @@ Design rules:
     only once it's confirmed: read with a readable ledger, its move from the last confirmed one (saved, so across a
     restart too) explained by P&L, fees, funding and the flows. Until then the last confirmed one stands and the
     runner holds new candles; a move nothing explains is alerted (and entry_kill set) instead of a guess.
+
+Coinbase (BTC on BIP-20DEC30-CDE, through desk/brokers/coinbase.py's CoinbaseExchange; every change below is gated
+on that adapter, so Hyperliquid runs exactly as before):
+  * Coinbase has no stop-market order and no reduce-only, so the protective stop is a stop-limit, and two full-size
+    stops resting at once could both fire and open the opposite position. A stop is therefore moved CANCEL-FIRST: the
+    old one is cancelled and confirmed gone, then the new one placed (about a second with no stop resting, longer if
+    Coinbase is slow), never two at once; the adapter refuses any stop that would make the closing contracts resting
+    more than the position. A close cancels the stop first, then sends close_position for the size Coinbase holds;
+    after any failure the position is read again and a stop goes back only on what's still open. Flat with an order
+    resting: it's cancelled now.
+  * Every open order on the product is the desk's (LIVE starts flat with no orders). A position the desk doesn't know
+    is adopted only if the order that opened it carries one of the desk's entry ids (rebuilt from the bar it was
+    decided at); one opened by a stop, a close or an unknown order is closed at market and entry_kill is asked for.
+  * A stop-limit can't fill once the price is past its limit (a gap): seen at a sync, the position is closed at market.
+  * An entry's answer lost (a timeout) is resolved in the same check: if the position is there, it's adopted and gets
+    its stop at once. Every order carries a client_order_id, so sending it again can't make a second one.
+  * Entries are sized again just before they go out, at Coinbase's best bid or ask then (the desk decided at the
+    close), on the part of the balance that can be margin; nothing goes while Coinbase is closed (market orders can't
+    be queued), and no stop moves then either (a queued cancel and a queued new stop could both be live at the
+    reopen). A missing stop is still placed: stop-limits can be queued.
+  * Deposits and withdrawals come from the v2 USD wallet, each with a stable id: a pending one only explains a move
+    that matches it to the cent; a completed one is counted once.
 """
 
 from __future__ import annotations
@@ -48,7 +70,7 @@ import json
 import math
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..models import Order, Position, Side, Trade
@@ -73,16 +95,22 @@ class LiveSetupError(RuntimeError):
     """Live trading refuses to start (no such market, a cap below the venue's minimum order, ...)."""
 
 
-def market_symbol(venue: str, coin: str) -> str:
-    """The perp this coin's desk trades on `venue`: the coin's own market, never another coin's."""
+COINBASE_LOCKED = ("Coinbase has its own client and LIVE on it is locked: use `python -m desk shadow` (read only), or "
+                   "once you arm it, `python -m desk live --coin BTC --once` (README: Going live on Coinbase)")
+
+
+def market_symbol(venue: str, coin: str, exchange=None) -> str:
+    """The perp this coin's desk trades on `venue`: the coin's own market, never another coin's. A venue with its own
+    rules (BTC on Coinbase) is traded only through its own adapter (desk/brokers/coinbase.py), never ccxt."""
     if venue not in SYMBOL_FORMATS:
         from ..thresholds import VENUES
 
-        if venue in VENUES:     # a venue paper simulates (BTC on Coinbase): live can't trade it yet
+        if venue in VENUES:
             v = VENUES[venue]
-            raise LiveSetupError(f"{coin} is set up for {v.display} ({v.product}, desk/thresholds.py), which its paper "
-                                 f"account simulates; live trading there isn't built yet (this broker knows "
-                                 f"{', '.join(SYMBOL_FORMATS)})")
+            if getattr(exchange, "is_coinbase_adapter", False) and coin.upper() == "BTC":
+                return v.product
+            raise LiveSetupError(f"{coin} is set up for {v.display} ({v.product}, desk/thresholds.py). "
+                                 f"{COINBASE_LOCKED}")
         raise LiveSetupError(f"no perp symbol known for venue {venue!r} (known: {', '.join(SYMBOL_FORMATS)})")
     return SYMBOL_FORMATS[venue].format(coin=coin.upper())
 
@@ -115,6 +143,10 @@ def exchange_config(venue: str, *, wallet: str | None = None, key: str | None = 
 
 
 def make_exchange(venue: str):
+    from ..thresholds import VENUES
+
+    if venue in VENUES:
+        raise LiveSetupError(COINBASE_LOCKED)
     try:
         import ccxt  # imported lazily so backtest/paper never need it
     except ImportError:
@@ -148,8 +180,8 @@ def _no_builder_fee(ex) -> None:
     ex.options["refSet"] = True
 
 
-# Venues whose reported account value already includes unrealised PnL.
-EQUITY_INCLUDES_UPNL = {"hyperliquid"}
+# Venues whose reported account value already includes unrealised PnL (Coinbase: the adapter's balance adds it).
+EQUITY_INCLUDES_UPNL = {"hyperliquid", "coinbase"}
 
 # The protective stop: tries to get it resting on the exchange before giving up and closing the position,
 # and the wait before each retry (doubling: 1 s, 2 s, 4 s).
@@ -167,6 +199,13 @@ FLOW_FRESH_MS = 120_000     # a flow read within this of when it happened is pri
 FUNDING_GAP_MS = 3600_000   # explaining a longer stretch with a position held (a restart): the exchange's funding too
 LEDGER_SKEW_MS = 10 * 60_000        # on a first start, the ledger is read from this long before now (clock skew)
 FIRST_LOOKBACK_MS = 86400_000       # ...after marking everything on it from the last day as the start
+# Coinbase (no reduce-only): the worst case, in seconds, of an order sequence that must not be cut off half way (a
+# stop moved cancel-first: cancel, confirm, place and read back, four tries with backoff; a close: cancel the stop,
+# close_position, read back, put a stop back on what's left). None starts unless it fits in the run's time left.
+CB_MOVE_WORST_S = 45.0
+CB_CLOSE_WORST_S = 45.0
+CB_ADOPT_LOOKBACK_MS = 7 * 86400_000    # the fills read to find the order that opened a position the desk doesn't know
+CB_ENTRY_BARS = 4                       # an entry id is rebuilt from the bars that closed this many bars before it
 
 
 @dataclass
@@ -175,6 +214,7 @@ class _Read:
     flows: list
     cursor: int
     seen: list
+    candidates: list = field(default_factory=list)  # pending entries (Coinbase): used only if they match a move exactly
 
 
 class UnknownLedgerEntry(ValueError):
@@ -239,7 +279,8 @@ class LiveBroker:
 
     def __init__(self, p: Params, venue: str | None = None, state_path: str | Path | None = None,
                  max_notional_usd: float | None = None, exchange=None, log=print, on_alert=None, sleep=time.sleep,
-                 clock=None, price_at=None):
+                 clock=None, price_at=None, allow_empty: bool = False, unexplained_wait_ms: int | None = None,
+                 provisional_tries: int | None = None, rules=None, market_closed=None):
         self.p = p
         self.log = log
         self.on_alert = on_alert              # the runner puts alerts on the board and the phone
@@ -247,8 +288,20 @@ class LiveBroker:
         self.clock = clock or (lambda: int(time.time() * 1000))
         self.venue = venue or p.market.venue
         self.coin = p.market.symbol.upper()
-        self.symbol = market_symbol(self.venue, self.coin)
+        self.symbol = market_symbol(self.venue, self.coin, exchange)
         self.ex = exchange or make_exchange(self.venue)
+        # Coinbase (desk/brokers/coinbase.py): no reduce-only, the product is the desk's alone (module docstring)
+        self._cb = bool(getattr(self.ex, "is_coinbase_adapter", False))
+        if self._cb and getattr(self.ex, "on_alert", None) is None:
+            self.ex.on_alert = self.alert
+        self.unexplained_wait_ms = UNEXPLAINED_WAIT_MS if unexplained_wait_ms is None else unexplained_wait_ms
+        self.provisional_tries = PROVISIONAL_TRIES if provisional_tries is None else provisional_tries
+        self.rules = rules                    # venue rules (desk/venue.py): an entry is sized again just before it goes
+        self.market_closed = market_closed    # () -> True while the venue is known to be closed (the runner's sessions)
+        self.order_seq = 0                    # Coinbase: the next client_order_id's sequence number (saved before a POST)
+        self.entry_kill_why: str | None = None  # something the runner must stop entries for (entry_kill)
+        self._said: set[str] = set()          # this process's once-only alerts
+        self.alerts = []
         self._load_market()
         if max_notional_usd is not None and self.min_cost and max_notional_usd < self.min_cost:
             raise LiveSetupError(f"--max-notional ${max_notional_usd:,.2f} is below {self.venue}'s minimum order of "
@@ -265,7 +318,7 @@ class LiveBroker:
         self.orders_filled = 0
         self.last_fill: dict | None = None
         self.skipped: dict | None = None      # the last entry not sent: under the venue's minimum after rounding
-        self.alerts: list[tuple[int, str]] = []
+        self.alerts: list[tuple[int, str]] = getattr(self, "alerts", [])     # (any raised loading the market)
         self.stop_order_id: str | None = None
         self.stop_px: float | None = None     # trigger of that resting stop, as the venue rounded it
         self.entry_order_id: str | None = None  # the desk's own entry order (an opening fill from any other is an add)
@@ -284,6 +337,8 @@ class LiveBroker:
         self.flows_seen: list[str] = []
         self.on_flow = None
         self.price_at = price_at              # ts -> the coin's price then (the runner's feed): a flow read late
+        if self.price_at is None and self._cb:
+            self.price_at = self.ex.price_at  # Coinbase's own candles
         self.flow_gap: str | None = None      # an unexplained move in the account's value, for the runner (entry_kill)
         self.balance_confirmed = True         # False: the last balance read isn't explained yet; the runner waits
         self.unconfirmed_why: str | None = None
@@ -307,7 +362,7 @@ class LiveBroker:
         if not self.flows_readable:
             self.alert(f"{self.venue}'s deposits and withdrawals can't be read here (no fetch_ledger): one would count as "
                        f"profit or loss, brakes included. A move nothing explains is still alerted")
-        if bal <= 0 and self.position is None:
+        if bal <= 0 and self.position is None and not allow_empty:
             raise LiveSetupError(f"the {self.venue} account reads ${bal:,.2f}: nothing to trade with. On "
                                  f"Hyperliquid, HL_WALLET_ADDRESS (and HL_SUBACCOUNT_ADDRESS for a sub-account) must "
                                  f"name the account that holds the money, not the API wallet's own address")
@@ -490,10 +545,17 @@ class LiveBroker:
                     and (r.get("timestamp") or since) >= since and (until is None or (r.get("timestamp") or 0) <= until))
 
     def _resting_stops(self, side: str | None = None) -> list[dict]:
-        """Reduce-only trigger orders resting on this market (on `side`, if given)."""
+        """Reduce-only trigger orders resting on this market (on `side`, if given). On Coinbase, which has no
+        reduce-only, every trigger order on the product (all of them are the desk's), but not one whose cancel is
+        queued for the reopen (it doesn't protect: it's going)."""
         out = []
         for o in self.ex.fetch_open_orders(self.symbol):
-            if o.get("symbol") not in (None, self.symbol) or _trigger(o) is None or o.get("reduceOnly") is False:
+            if o.get("symbol") not in (None, self.symbol) or _trigger(o) is None:
+                continue
+            if self._cb:
+                if o.get("status") == "canceling":
+                    continue
+            elif o.get("reduceOnly") is False:
                 continue
             if side is None or o.get("side") in (None, side):
                 out.append(o)
@@ -507,6 +569,8 @@ class LiveBroker:
     def sync(self, price: float | None = None) -> None:
         """Reconcile with the exchange: the exchange's position is the truth. If the stop filled while we were away,
         record the trade. While a position is open, a stop must be resting on the exchange: if it's gone, put it back."""
+        if self._cb:
+            return self._cb_sync(price)
         if price is not None:
             self.last_price = price
         side, qty, entry = self._exchange_position()
@@ -566,6 +630,8 @@ class LiveBroker:
         base = base or _Read([], self.flows_cursor, list(self.flows_seen))
         if not self.flows_readable:
             return base
+        if getattr(self.ex, "ledger_ids_stable", False):
+            return self._read_flows_stable(base, alert)
         seen, seen_list, out, since = set(base.seen), list(base.seen), list(base.flows), base.cursor
         for _ in range(LEDGER_PAGES):
             try:
@@ -682,9 +748,18 @@ class LiveBroker:
             if len(more.flows) > len(read.flows):
                 read, bal = more, self._balance()
                 left = self._unexplained(bal, read.flows, px)
+            elif self._cb:
+                read = more         # the latest pending entries
+        if left is not None and abs(left) > self._tolerance(bal) and read.candidates:
+            pick = self._match_candidates(left, read.candidates)
+            if pick:        # pending entries that explain the move to the cent: they're it
+                ids = [c["id"] for c in pick]
+                read = _Read(read.flows + pick, read.cursor, (read.seen + ids)[-1000:],
+                             [c for c in read.candidates if c["id"] not in ids])
+                left -= sum(c["amount"] for c in pick)
         if left is not None and abs(left) > self._tolerance(bal):
             self._unexplained_since = self._unexplained_since or self.clock()
-            if self.clock() - self._unexplained_since < UNEXPLAINED_WAIT_MS:
+            if self.clock() - self._unexplained_since < self.unexplained_wait_ms:
                 return self._unconfirmed(f"{left:+,.2f} of a move to ${bal:,.2f} isn't explained yet; reading the "
                                          f"ledger again")
             prev_av = self._recon["av"]
@@ -901,10 +976,10 @@ class LiveBroker:
                 continue
             if not closing:
                 rec["tries"] += 1
-                if rec["tries"] >= PROVISIONAL_TRIES:
+                if rec["tries"] >= self.provisional_tries:
                     self.provisional.remove(rec)
                     self.alert(f"the {rec['side']} {self.coin} exit booked without its fills still can't be read "
-                               f"after {PROVISIONAL_TRIES} tries: it stays at {self.trades[k].exit_price:,.2f}. Check "
+                               f"after {self.provisional_tries} tries: it stays at {self.trades[k].exit_price:,.2f}. Check "
                                f"the venue's trade history.")
                 continue
             old = self.trades[k]
@@ -1007,6 +1082,8 @@ class LiveBroker:
         return res
 
     def _open(self, o: Order, price: float, ts: int) -> None:
+        if self._cb:
+            return self._cb_open(o, price, ts)
         qty = o.qty
         if self.max_notional_usd is not None:
             # the cap holds after the fill's slippage too
@@ -1051,7 +1128,9 @@ class LiveBroker:
 
     def _close(self, price: float | None, ts: int, reason: str) -> Trade | None:
         """Close at market (reduce-only). The close goes first and the stops are cancelled after it's done, so a
-        close that fails leaves the stop in place."""
+        close that fails leaves the stop in place. (Coinbase, with no reduce-only: _cb_close.)"""
+        if self._cb:
+            return self._cb_close(price, ts, reason)
         pos = self.position
         if pos is None:
             return None
@@ -1129,9 +1208,14 @@ class LiveBroker:
     def _place_stop(self, stop: float) -> str:
         pos = self.position
         trig = self._px(stop)
+        params = {"stopLossPrice": trig, "reduceOnly": True}
+        if self._cb:    # a stop-limit (the adapter); its id is the stop's, the position's and a sequence number's
+            params = {"stopLossPrice": trig,
+                      "clientOrderId": self.ex.client_order_id("stop", pos.entry_ts, trig, self.order_seq)}
         res = self._accepted(self.ex.create_order(self.symbol, "market", self._closing_side(pos.side),
-                                                  self._amount(pos.qty), trig,
-                                                  {"stopLossPrice": trig, "reduceOnly": True}), "stop order")
+                                                  self._amount(pos.qty), trig, params), "stop order")
+        if self._cb:
+            self.order_seq += 1     # the next stop, even at the same level, is a new order
         return str(res["id"])
 
     def _find_stop(self, oid: str | None, stop: float) -> dict | None:
@@ -1151,7 +1235,10 @@ class LiveBroker:
         """Get a stop at `stop` resting on the exchange, confirmed by reading it back from the open orders. Tries
         STOP_ATTEMPTS times with backoff. If it never shows up, the position is closed (reduce-only market) and an
         alert goes out: never a position without a stop. With `keep_old` (moving a trail), an older stop that is
-        still resting keeps protecting the position instead, and the next sync tries the move again."""
+        still resting keeps protecting the position instead, and the next sync tries the move again. (Coinbase, with
+        no reduce-only: a move is cancel-first, _cb_replace_stop.)"""
+        if self._cb:
+            return self._cb_replace_stop(stop) if keep_old else self._cb_ensure_stop(stop, price, ts)
         pos = self.position
         if pos is None:
             return True
@@ -1273,23 +1360,666 @@ class LiveBroker:
             self.position.funding_paid += paid
             self.funding_total += paid
 
+    # ---- Coinbase: no reduce-only, one product that is the desk's alone (module docstring) --------------------
+    @property
+    def bar_ms(self) -> int:
+        from ..thresholds import INTERVAL_SECONDS
+
+        return INTERVAL_SECONDS[self.p.market.interval] * 1000
+
+    def _closed_now(self) -> bool:
+        """Coinbase is known to be closed now: the runner's sessions say so, or this run's product answer did. Not
+        knowing isn't closed (a close or a stop that Coinbase then refuses is harmless; holding a position isn't)."""
+        if self.market_closed is not None:
+            try:
+                if self.market_closed():
+                    return True
+            except Exception as exc:
+                self.log(f"{self.coin}: could not tell whether the market is closed: {type(exc).__name__}")
+        return self._cb and getattr(self.ex, "session_open", lambda: None)() is False
+
+    def _say_once(self, key: str, text: str) -> None:
+        if key not in self._said:
+            self._said.add(key)
+            self.alert(text)
+
+    def _cb_sync(self, price: float | None = None) -> None:
+        if price is not None:
+            self.last_price = price
+        side, qty, entry = self._exchange_position()
+        if self.position is not None and (side is None or side is not self.position.side):
+            self._book_exchange_exit()      # its stop, a liquidation, by hand (or a stop that went through, then more)
+        if side is not None and self.position is None:
+            self._cb_adopt(side, qty, entry)
+        elif side is not None:
+            self._follow_size(qty, entry)
+        if self.position is not None and self.position.stop:
+            self._check_stop_resting()
+        if self.position is not None:
+            self._cb_limit_passed()
+        else:
+            self._cb_clear_strays()
+        if self.provisional:
+            self._resolve_provisional()
+        foreign = getattr(self.ex, "foreign", None) or {}
+        if foreign.get("positions") or foreign.get("orders"):
+            what = [f"a {p['side']} {p['contracts']} on {p['product_id']}" for p in foreign.get("positions") or []] + \
+                   [f"order {o['id']} on {o['product_id']}" for o in foreign.get("orders") or []]
+            self._say_once("foreign", f"the account holds {', '.join(what)}, not the desk's: no entries while it does. "
+                                      f"The desk trades only {self.symbol} and never touches anything else: close or "
+                                      f"cancel it yourself, or move it to another portfolio")
+        self.cash = self._refresh_cash()
+        self._save_local()
+
+    def _is_desk_entry(self, order: dict | None) -> bool:
+        """Whether `order` is one of the desk's entries: its client_order_id is the one the desk gives an entry
+        decided at one of the bars that closed just before it was placed (rebuilt, no saved state needed)."""
+        if not order or not order.get("clientOrderId"):
+            return False
+        bar = self.bar_ms
+        t = int(order.get("timestamp") or self.clock())
+        bars = {(t // bar - 1 - k) * bar for k in range(CB_ENTRY_BARS)}
+        if self.bar_ts is not None:
+            bars.add(int(self.bar_ts))
+        return any(self.ex.client_order_id("entry", b) == order["clientOrderId"] for b in bars)
+
+    def _cb_adopt(self, side: Side, qty: float, entry: float) -> None:
+        """A position on the product this desk's state doesn't know. The desk's own entry (its state was lost after
+        the order went): adopted, with the stop resting for it if there is one (else the runner gives it one now).
+        Anything else (opened by a stop, a close, by hand): closed at market, and entry_kill is asked for."""
+        try:
+            order = self.ex.opened_by(side.value, self.clock() - CB_ADOPT_LOOKBACK_MS)
+            known = True
+        except Exception as exc:
+            order, known = None, False
+            self.log(f"{self.coin}: could not read what opened the position: {type(exc).__name__}: {exc}")
+        mine = self._is_desk_entry(order)
+        ts = int((order or {}).get("timestamp") or self.clock())
+        self.position = Position(side, qty, entry, ts, stop=0.0, best_close=entry,
+                                 setup="adopted" if mine or not known else "not the desk's")
+        self.stop_order_id = self.stop_px = None
+        self.entry_order_id = str(order["id"]) if order else None
+        stops = self._resting_stops(self._closing_side(side))
+        if stops:
+            self.position.stop = self.stop_px = _trigger(stops[0])
+            self.stop_order_id = str(stops[0]["id"])
+        if mine:
+            self.alert(f"Coinbase holds a {side.value} {qty:g} {self.coin} the desk opened (its entry order "
+                       f"{order['id']}) that its saved state didn't have: adopted, with "
+                       + (f"its stop at {self.stop_px:,.2f}" if self.stop_px else "a stop placed now"))
+            self._save_local()
+            return
+        if not known:
+            self.entry_kill_why = (f"Coinbase holds a {side.value} {qty:g} {self.coin} the desk's state doesn't know, "
+                                   f"and its fills can't be read to tell who opened it: kept and given a stop, "
+                                   f"entry_kill is on. Check it in Coinbase")
+            self.alert(self.entry_kill_why)
+            self._save_local()
+            return
+        what = f"order {order['id']} ({order.get('type')})" if order else "no order the fills show"
+        self.entry_kill_why = (f"Coinbase holds a {side.value} {qty:g} {self.coin} opened by {what}, not one of the "
+                               f"desk's entries (a stop left resting, a close, or by hand): closing it at market. "
+                               f"entry_kill is on")
+        self.alert(self.entry_kill_why)
+        self._save_local()
+        try:
+            self._close(self.last_price, self.clock(), "not_the_desks")
+        except Exception as exc:     # kept as close_wanted: sent again at the next check
+            self.log(f"{self.coin}: closing the position that isn't the desk's failed: {type(exc).__name__}: {exc}")
+
+    def _cb_limit_passed(self) -> None:
+        """A stop-limit the price is past the limit of can't fill (a gap): close at market rather than wait."""
+        pos, px = self.position, self.last_price
+        if pos is None or px is None:
+            return
+        for o in self._resting_stops(self._closing_side(pos.side)):
+            lim = o.get("price")
+            if lim is None:
+                continue
+            if (px - float(lim)) * pos.side.sign < 0:
+                self.alert(f"the stop at {_trigger(o):,.0f} is past its limit {float(lim):,.0f} ({self.coin} at "
+                           f"{px:,.2f}): a stop-limit can't fill there, so it's closing at market")
+                self._close(px, self.clock(), "stop")
+                return
+
+    def _cb_clear_strays(self) -> None:
+        """Flat: nothing may rest on the product. Coinbase has no reduce-only, so a stop left behind would open a
+        position if it fired. Cancelled now, retried; only if that fails, the urgent alert."""
+        from .coinbase import StopAlreadyFilled
+
+        try:
+            orders = [o for o in self.ex.fetch_open_orders(self.symbol) if o.get("status") == "open"]
+        except Exception as exc:
+            self.log(f"{self.coin}: could not list the orders resting with no position: {type(exc).__name__}: {exc}")
+            self.stops_to_clean = True
+            return
+        failed = []
+        for o in orders:
+            for attempt in range(STOP_ATTEMPTS):
+                if attempt:
+                    self.sleep(STOP_BACKOFF_S * 2 ** (attempt - 1))
+                try:
+                    self.ex.cancel_order(o["id"], self.symbol)
+                    break
+                except StopAlreadyFilled:
+                    break       # it filled with no position: the next sync finds what it opened
+                except Exception as exc:
+                    err = f"{type(exc).__name__}: {exc}"
+            else:
+                failed.append((o, err))
+        self.stops_to_clean = bool(failed)
+        if failed:
+            ids = ", ".join(str(o["id"]) for o, _ in failed)
+            self.entry_kill_why = (f"STOP WITH NO POSITION: an order is resting on {self.symbol} with no position "
+                                   f"(order {ids}): Coinbase has no reduce-only, so it would open a position if it "
+                                   f"fired. Cancel order {ids} in Coinbase now. ({failed[0][1]})")
+            self.alert(self.entry_kill_why)
+        self.stop_order_id = self.stop_px = None
+
+    def _cb_cancel_closing(self) -> bool | None:
+        """Cancel every order resting on the closing side and confirm they're gone. True: gone. False: one stays
+        (alerted; it still protects the position). None: one had already filled (sync to book it)."""
+        from .coinbase import StopAlreadyFilled
+
+        closing = self._closing_side(self.position.side)
+        try:
+            stops = [o for o in self.ex.fetch_open_orders(self.symbol) if o.get("side") == closing]
+        except Exception as exc:
+            self.log(f"{self.coin}: could not list the stops: {type(exc).__name__}: {exc}")
+            return False
+        for o in stops:
+            if o.get("status") == "canceling":
+                continue
+            try:
+                self.ex.cancel_order(o["id"], self.symbol)
+            except StopAlreadyFilled:
+                return None
+            except Exception as exc:
+                self.alert(f"could not cancel the stop {o['id']} ({type(exc).__name__}: {exc}); it stays and still "
+                           f"protects the position. Tried again at the next check")
+                return False
+        try:
+            left = [o for o in self.ex.fetch_open_orders(self.symbol) if o.get("side") == closing]
+        except Exception as exc:
+            self.log(f"{self.coin}: could not confirm the stop's cancel: {type(exc).__name__}: {exc}")
+            left = []       # the next placement reads the orders again itself and refuses a second stop
+        if left:
+            self.alert(f"the stop {left[0]['id']}'s cancel isn't confirmed yet (it reads "
+                       f"{left[0].get('coinbase_status') or left[0].get('status')}): no second stop on top of it; "
+                       f"tried again at the next check")
+            return False
+        self.stop_order_id = self.stop_px = None
+        return True
+
+    def _last_trade_px(self) -> float | None:
+        try:
+            got = self.ex.last_trade()
+        except Exception as exc:
+            self.log(f"{self.coin}: could not read the last trade: {type(exc).__name__}: {exc}")
+            return None
+        return got[0] if got else None
+
+    def _cb_replace_stop(self, stop: float) -> bool:
+        """Move the stop CANCEL-FIRST: the old one is cancelled and confirmed gone, then the new one placed. Never
+        while Coinbase is closed, never without the time for the whole sequence, and if the last trade is already
+        through the new level, that's the stop being hit: closed at market."""
+        pos = self.position
+        if pos is None:
+            return True
+        if self._closed_now():
+            self.log(f"{self.coin}: Coinbase is closed: the stop stays at {self.stop_px or 0:,.0f}; the move to "
+                     f"{stop:,.0f} waits for the reopen")
+            return False
+        if not self.ex.fits(CB_MOVE_WORST_S):
+            self.log(f"{self.coin}: not enough of the run left to move the stop safely; it stays, moved next run")
+            return False
+        last = self._last_trade_px()
+        if last is not None and (last - stop) * pos.side.sign <= 0:
+            self.alert(f"{self.coin} last traded {last:,.2f}, already through the stop's new level {stop:,.2f}: "
+                       f"closing at market")
+            self._close(last, self.clock(), "stop")
+            return False
+        gone = self._cb_cancel_closing()
+        if gone is None:            # the old stop filled first: book it
+            self.sync(self.last_price)
+            return False
+        if not gone:
+            return False
+        try:
+            side, qty, entry = self._exchange_position()
+        except Exception as exc:    # place it anyway: the adapter reads the position again before it sends a stop
+            self.log(f"{self.coin}: could not read the position after cancelling the stop: {type(exc).__name__}")
+            side, qty, entry = pos.side, pos.qty, pos.entry_price
+        if side is None or side is not pos.side:
+            self.sync(self.last_price)
+            return False
+        self._follow_size(qty, entry)
+        return self._cb_ensure_stop(stop, last or self.last_price, self.clock())
+
+    def _cb_place_until_rests(self, stop: float) -> tuple[bool, str]:
+        """Place the stop and read it back, STOP_ATTEMPTS times with backoff. (rested, last error). Raises
+        StopThroughMarket (the price is already through it)."""
+        from .coinbase import OrderRefused, StaleClientOrderId, StopThroughMarket
+
+        err = "not on Coinbase's open orders after placing it"
+        closing = self._closing_side(self.position.side)
+        for attempt in range(STOP_ATTEMPTS):
+            if attempt:
+                self.sleep(STOP_BACKOFF_S * 2 ** (attempt - 1))
+            oid = None
+            try:
+                oid = self._place_stop(stop)
+            except StopThroughMarket:
+                raise
+            except StaleClientOrderId as exc:
+                self.order_seq += 1
+                self._save_local()
+                err = str(exc)
+            except OrderRefused as exc:
+                err = str(exc)
+            except Exception as exc:
+                err = f"{type(exc).__name__}: {exc}"
+            try:
+                found = self._find_stop(oid, stop)
+                if found is None:       # a stop resting at another level (a race): it protects; moved next sync
+                    found = next((o for o in self._resting_stops(closing) if self._covers(o)), None)
+            except Exception as exc:
+                found, err = None, f"{type(exc).__name__}: {exc}"
+            if found is not None:
+                self.stop_order_id, self.stop_px = str(found["id"]), _trigger(found)
+                self._save_local()
+                return True, ""
+            try:
+                side, _, _ = self._exchange_position()
+            except Exception:
+                side = self.position.side
+            if side is None:
+                return False, "flat"
+            self.log(f"{self.coin}: stop at {stop:,.2f}, try {attempt + 1}/{STOP_ATTEMPTS}: {err}")
+        return False, err
+
+    def _cb_ensure_stop(self, stop: float, price: float | None, ts: int) -> bool:
+        """Get the stop resting (no other stop rests: the adapter refuses one that would). If it never rests the
+        position is closed at market, and entry_kill is asked for: the next entry would meet the same refusal."""
+        from .coinbase import StopThroughMarket
+
+        pos = self.position
+        if pos is None:
+            return True
+        if price is not None and (price - stop) * pos.side.sign <= 0:
+            self.alert(f"{self.coin} at {price:,.2f} is already through the stop {stop:,.2f}: closing at market")
+            self._close(price, ts, "stop")
+            return False
+        try:
+            ok, err = self._cb_place_until_rests(stop)
+        except StopThroughMarket as exc:
+            self.alert(f"{exc}: closing at market")
+            self._close(self.last_price, ts, "stop")
+            return False
+        if ok:
+            return True
+        if err == "flat" or self.position is None:
+            self.sync(self.last_price)
+            return False
+        self.entry_kill_why = (f"could not get a stop resting on Coinbase after {STOP_ATTEMPTS} tries ({err}): "
+                               f"closing the {pos.side.value} {pos.qty:g} {self.coin} at market rather than hold it "
+                               f"unprotected. entry_kill is on")
+        self.alert(self.entry_kill_why)
+        self._close(price, ts, "no_stop")
+        return False
+
+    def _cb_protect_remainder(self) -> None:
+        """After a close that failed or went part way: a stop back on what Coinbase still holds (never on more), with
+        no close-at-market fallback (a close is what just failed). Never resting: the urgent alert."""
+        from .coinbase import StopThroughMarket
+
+        pos = self.position
+        if pos is None or not pos.stop:
+            return
+        try:
+            ok, err = self._cb_place_until_rests(pos.stop)
+        except StopThroughMarket as exc:
+            ok, err = False, str(exc)
+        if not ok and err != "flat":
+            self.entry_kill_why = (f"the {pos.side.value} {pos.qty:g} {self.coin} on {self.symbol} has NO STOP resting "
+                                   f"on Coinbase after a close that didn't go through ({err}). Close it or place its "
+                                   f"stop in Coinbase now; the desk tries again at the next check")
+            self.alert(self.entry_kill_why)
+
+    def _cb_close(self, price: float | None, ts: int, reason: str) -> Trade | None:
+        """Close on Coinbase: cancel the stop first (confirmed gone), then close_position for the size Coinbase holds.
+        After any failure the position is read again: a stop goes back only on what's still open; flat, nothing may
+        rest. Nothing is sent while Coinbase is closed (market orders can't be queued) or without the time for the
+        whole sequence: the close stays wanted and goes at the next check."""
+        from .coinbase import StaleClientOrderId
+
+        pos = self.position
+        if pos is None:
+            return None
+        ex_side, ex_qty, entry = self._exchange_position()
+        if ex_side is None:
+            n = len(self.trades)
+            self.sync(price)
+            return self.trades[-1] if len(self.trades) > n else None
+        self.close_wanted = reason
+        self._save_local()
+        if self._closed_now():
+            self.log(f"{self.coin}: Coinbase is closed: market orders can't be queued, so the {reason} close goes at the "
+                     f"reopen (the stop stays meanwhile)")
+            return None
+        if not self.ex.fits(CB_CLOSE_WORST_S):
+            self.log(f"{self.coin}: not enough of the run left to close safely; the {reason} close goes next run")
+            return None
+        ref = price or self.last_price or pos.entry_price
+        side = self._closing_side(pos.side)
+        gone = self._cb_cancel_closing()
+        if gone is None:            # the stop filled first
+            n = len(self.trades)
+            self.sync(price)
+            if self.position is None:
+                return self.trades[-1] if len(self.trades) > n else None
+            pos = self.position     # it filled only in part: whatever of it still rests goes before the close
+            gone = self._cb_cancel_closing()
+            ex_side, ex_qty, entry = self._exchange_position()
+            if ex_side is None:
+                self.sync(price)
+                return self.trades[-1] if len(self.trades) > n else None
+        if not gone:
+            self.close_failures += 1
+            raise RuntimeError(f"close ({reason}) not sent: the stop couldn't be cancelled first, and with no "
+                               f"reduce-only a close with the stop resting could leave it to open a position. The stop "
+                               f"stays; the close is sent again at the next check")
+        res = None
+        for _ in range(2):
+            cid = self.ex.client_order_id("close", pos.entry_ts, self.order_seq)
+            self.order_seq += 1
+            self._save_local()      # written before it's sent: the next one never reuses this id
+            try:
+                res = self._accepted(self.ex.create_order(self.symbol, "market", side, self._amount(ex_qty), ref,
+                                                          {"reduceOnly": True, "clientOrderId": cid}),
+                                     f"close ({reason})")
+                break
+            except StaleClientOrderId:
+                continue
+            except Exception as exc:
+                self.close_failures += 1
+                self._cb_after_failed_close()
+                if self.position is None:       # it went through after all, and is booked
+                    return self.trades[-1] if self.trades else None
+                if self.close_failures == 1 or self.close_failures % 20 == 0:
+                    self.alert(f"could not close the {pos.side.value} {pos.qty:g} {self.coin} ({reason}): "
+                               f"{type(exc).__name__}: {exc}. A stop is back on the position; the close is sent "
+                               f"again at every check until it goes through")
+                raise
+        if res is None:
+            self._cb_after_failed_close()
+            raise RuntimeError(f"close ({reason}): Coinbase kept answering with an old order for its client id; a "
+                               f"stop is back on the position and the close is sent again at the next check")
+        after_side, after_qty, after_entry = self._exchange_position()
+        if after_side is not None:
+            self._follow_size(after_qty, after_entry)
+            self._save_local()
+            self._cb_protect_remainder()
+            raise RuntimeError(f"close ({reason}) left {after_qty:g} {self.coin} open; a stop is back on it and the "
+                               f"rest is sent again at the next check")
+        t = self._book_desk_close(pos, res, ts, ref, reason)
+        self._cb_clear_strays()
+        self.orders_filled += 1
+        self.cash = self._refresh_cash()
+        self._save_local()
+        return t
+
+    def _cb_after_failed_close(self) -> None:
+        try:
+            side, qty, entry = self._exchange_position()
+        except Exception as exc:
+            self.entry_kill_why = (f"a close failed and the position can't be read back ({type(exc).__name__}): it may "
+                                   f"have no stop. Check {self.symbol} in Coinbase now")
+            self.alert(self.entry_kill_why)
+            return
+        if side is None:
+            self.sync(self.last_price)      # the close went through: booked from its fills; nothing left resting
+            return
+        self._follow_size(qty, entry)
+        self._cb_protect_remainder()
+
+    def _cb_skip(self, o: Order, ts: int, why: str, qty: float | None = None, loud: bool = False) -> None:
+        self.skipped = {"ts": ts, "reason": o.reason, "qty": o.qty if qty is None else qty, "why": why}
+        if loud:
+            self._say_once(f"skip:{why}", f"entry not sent: {why}")
+        else:
+            self.log(f"{self.coin}: entry not sent: {why}")
+
+    def _cb_open(self, o: Order, price: float, ts: int) -> None:
+        """An entry on Coinbase: sized again at the best bid/ask now (not the close the desk decided at), on the part
+        of the balance that can be margin, whole contracts; sent with the entry's client_order_id; its stop placed
+        and read back before this returns. Its answer lost: the position is read, adopted and protected now."""
+        from .coinbase import OrderRefused, SessionClosed
+        from .coinbase_rest import CoinbaseRejected
+
+        why = self.ex.entry_block()
+        if why:
+            return self._cb_skip(o, ts, why, loud=True)
+        if self._closed_now():
+            return self._cb_skip(o, ts, "Coinbase is closed now (market orders can't be queued)")
+        if not self.ex.fits(CB_MOVE_WORST_S + CB_CLOSE_WORST_S):
+            return self._cb_skip(o, ts, "not enough of the run left to place the entry and its stop safely")
+        if not o.stop:
+            return self._cb_skip(o, ts, "it came with no stop")
+        try:
+            bba = self.ex.best_bid_ask()
+        except Exception as exc:
+            bba = None
+            self.log(f"{self.coin}: could not read the best bid/ask: {type(exc).__name__}: {exc}")
+        if bba is None:
+            return self._cb_skip(o, ts, "no fresh best bid/ask from Coinbase to size it at")
+        ref = bba[1] if o.side is Side.LONG else bba[0]
+        sign, qty = o.side.sign, o.qty
+        dist = (ref - o.stop) * sign
+        if dist <= 0:
+            return self._cb_skip(o, ts, f"{self.coin} at {ref:,.2f} is already through its stop {o.stop:,.2f}")
+        close_px = (o.meta or {}).get("notional", 0.0) / o.qty if o.qty else 0.0
+        stop_atr = (self.p.strategy.short_stop_atr if sign < 0 and self.p.strategy.short_stop_atr
+                    else self.p.strategy.stop_atr)
+        atr = abs(close_px - o.stop) / stop_atr if close_px and stop_atr else None
+        if atr and dist < 0.5 * atr:
+            return self._cb_skip(o, ts, f"{self.coin} at {ref:,.2f} is within half an ATR of its stop {o.stop:,.2f}")
+        usable = getattr(self.ex, "usable", None)
+        sizing = min(self.cash, usable) if usable is not None else self.cash
+        if self.rules is not None:      # the desk's own sizing (filter.py SIZE) at this price, then whole contracts
+            z = self.p.sizing
+            want = sizing * z.risk_per_trade / dist if sizing > 0 else 0.0
+            want = min(want, sizing * z.max_leverage / ref) if sizing > 0 else 0.0
+            q2, gates = self.rules.size(want, ref, o.stop, sizing, sign, z.risk_per_trade)
+            if q2 <= 0:
+                return self._cb_skip(o, ts, f"sized again at {ref:,.2f}: {gates[-1].note if gates else 'nothing fits'}")
+            qty = min(qty, q2)
+        if self.max_notional_usd is not None:
+            qty = min(qty, self.max_notional_usd / (ref * (1 + self.p.costs.slippage_bps / 1e4)))
+        amount = self._amount(qty)
+        if amount < max(1.0, self.min_amount):
+            return self._cb_skip(o, ts, f"under one contract at {ref:,.2f} after the cap and the size step", qty)
+        qty = amount * self.contract_size
+        side = "buy" if o.side is Side.LONG else "sell"
+        bar = self.bar_ts if self.bar_ts is not None else (ts // self.bar_ms - 1) * self.bar_ms
+        cid = self.ex.client_order_id("entry", bar)
+        try:
+            res = self._accepted(self.ex.create_order(self.symbol, "market", side, amount, ref,
+                                                      {"clientOrderId": cid}), "entry order")
+        except (OrderRefused, SessionClosed) as exc:     # refused before anything was done
+            return self._cb_skip(o, ts, str(exc), loud=True)
+        except CoinbaseRejected:
+            raise
+        except Exception as exc:
+            if self._cb_recover_entry(o, cid, ts, ref, exc):
+                return
+            raise
+        filled = float(res.get("filled") or 0.0)
+        if filled <= 0:
+            ex_side, ex_qty, _ = self._exchange_position()
+            filled = ex_qty / self.contract_size if ex_side is o.side else 0.0
+        if filled <= 0:
+            self.alert(f"entry order {res['id']} for {amount:g} contracts did not fill; no position")
+            return
+        qty = filled * self.contract_size
+        fill, fee, _ = self._order_fill(res, ts, ref, qty)
+        self.fees_total += fee
+        self.position = Position(o.side, qty, fill, ts, stop=o.stop, best_close=fill, fees_paid=fee, setup=o.reason)
+        self.entry_order_id = str(res["id"])
+        self.orders_filled += 1
+        self.last_fill = {"action": "open", "side": o.side.value, "qty": qty, "price": fill, "fee": fee, "ts": ts,
+                          "reason": o.reason}
+        self._save_local()
+        self._cb_check_units(res, filled)
+        self._ensure_stop(o.stop, ref, ts)
+
+    def _cb_check_units(self, res: dict, filled: float) -> None:
+        """The entry's fills, its order's filled size and the position Coinbase reports must agree, in contracts. If
+        they don't (sizes in BTC somewhere, say), nothing is guessed: alerted, and entry_kill is asked for."""
+        try:
+            fills = [t for t in self._fills_since(int(res.get("timestamp") or self.clock()) - FILL_LOOKBACK_MS) or []
+                     if str(t.get("order")) == str(res["id"])]
+            side, qty, _ = self._exchange_position()
+        except Exception as exc:
+            self.log(f"{self.coin}: could not check the entry's sizes: {type(exc).__name__}: {exc}")
+            return
+        held = qty / self.contract_size
+        summed = sum(float(t["amount"]) for t in fills) if fills else filled
+        if abs(summed - filled) > 1e-6 or abs(held - filled) > 1e-6:
+            self.entry_kill_why = (f"the entry's sizes don't agree: its fills add up to {summed:g}, the order says "
+                                   f"{filled:g} filled, and Coinbase holds {held:g} contracts. The units may not be "
+                                   f"what the desk thinks (contracts vs BTC): not guessed at, entry_kill is on")
+            self.alert(self.entry_kill_why)
+
+    def _cb_recover_entry(self, o: Order, cid: str, ts: int, ref: float, exc: Exception) -> bool:
+        """The entry went out but its answer didn't come back. If Coinbase holds the position, it's this entry: adopt
+        it and put its stop on now, in this same check (the next run is 15 minutes or more away)."""
+        try:
+            side, qty, entry = self._exchange_position()
+        except Exception as e2:
+            self.entry_kill_why = (f"an entry's answer was lost ({type(exc).__name__}) and the position can't be read "
+                                   f"back ({type(e2).__name__}): it may be open with no stop. Check {self.symbol} in "
+                                   f"Coinbase now")
+            self.alert(self.entry_kill_why)
+            return False
+        if side is None:
+            return False
+        order = None
+        try:
+            order = self.ex.find_order(cid, ts - FILL_LOOKBACK_MS)
+        except Exception as e2:
+            self.log(f"{self.coin}: could not look the entry order up: {type(e2).__name__}: {e2}")
+        if side is not o.side:
+            return False
+        fee, px = qty * entry * self.p.costs.taker_fee_bps / 1e4, entry or ref
+        if order is not None:
+            px = float(order.get("average") or px)
+            if (order.get("fee") or {}).get("cost") is not None:
+                fee = float(order["fee"]["cost"])
+        self.fees_total += fee
+        self.position = Position(o.side, qty, px, ts, stop=o.stop, best_close=px, fees_paid=fee, setup=o.reason)
+        self.entry_order_id = str(order["id"]) if order else None
+        self.orders_filled += 1
+        self.last_fill = {"action": "open", "side": o.side.value, "qty": qty, "price": px, "fee": fee, "ts": ts,
+                          "reason": o.reason}
+        self._save_local()
+        self.alert(f"the entry's answer was lost ({type(exc).__name__}), but Coinbase holds the {o.side.value} "
+                   f"{qty:g} {self.coin}: adopted as the desk's entry, and its stop goes on now")
+        self._ensure_stop(o.stop, ref, ts)
+        return True
+
+    def _read_flows_stable(self, base: "_Read", alert: bool = True) -> "_Read | None":
+        """The exchange's ledger when each entry keeps its id through its status changes (Coinbase's v2 transactions):
+        one read covers the window. A completed entry is a flow, counted once (its id is then seen). A pending one is
+        only a candidate: it explains a move only if it matches it to the cent (_refresh_cash), and isn't marked seen
+        until it's used or completed. Canceled, failed and expired ones never count. A flow's time is when it was
+        made, or the last read before this one if that's later: it landed after the last balance that didn't have it.
+        The cursor is this read's time."""
+        try:
+            page = self.ex.fetch_ledger(None, base.cursor)
+        except Exception as exc:
+            self._ledger_failures += 1
+            text = (f"could not read deposits and withdrawals ({type(exc).__name__}: {exc}); the brakes keep the "
+                    f"last confirmed balance and new candles wait until it reads again")
+            if alert and (self._ledger_failures == 1 or self._ledger_failures % LEDGER_ALERT_EVERY == 0):
+                self.alert(text)
+            else:
+                self.log(f"{self.coin}: {text}")
+            return None
+        now = self.clock()
+        seen, seen_list, out = set(base.seen), list(base.seen), list(base.flows)
+        cands = []
+        for e in sorted(page, key=lambda e: e.get("timestamp") or 0):
+            fid = str(e["id"])
+            if fid in seen:
+                continue
+            status = e.get("status") or self.ex.flow_status(e.get("info") or {})
+            if status == "void":
+                continue
+            if status not in ("final", "candidate"):
+                if alert and fid not in self._alerted:
+                    self._alerted.add(fid)
+                    self.alert(f"a Coinbase transaction ({fid}) with a status the desk doesn't know: not recorded; "
+                               f"if it moved the account, it's alerted as a move nothing explains")
+                continue
+            try:
+                got = self.ex.parse_flow(e.get("info") or {})
+            except UnknownLedgerEntry as exc:
+                if status == "final":
+                    seen.add(fid)
+                    seen_list.append(fid)
+                if alert and fid not in self._alerted:
+                    self._alerted.add(fid)
+                    self.alert(f"{exc}. Not recorded as a deposit or withdrawal: check it on Coinbase; if it moved the "
+                               f"account, it's alerted as a move nothing explains")
+                continue
+            if got is None:     # inside the account (spot <-> futures)
+                if status == "final":
+                    seen.add(fid)
+                    seen_list.append(fid)
+                continue
+            rec = {"id": fid, "ts": max(int(e.get("timestamp") or 0), int(base.cursor or 0)),
+                   "amount": round(got[0], 6), "what": got[1], "type": e.get("type")}
+            if status == "final":
+                seen.add(fid)
+                seen_list.append(fid)
+                out.append(rec)
+            else:
+                cands.append(rec)
+        self._ledger_failures = 0
+        return _Read(out, now, seen_list[-1000:], cands)
+
+    @staticmethod
+    def _match_candidates(left: float, cands: list[dict]) -> list[dict] | None:
+        """The pending entries that explain `left` to the cent: one of them, or all of them together."""
+        for c in cands:
+            if abs(c["amount"] - left) < 0.005:
+                return [c]
+        if len(cands) > 1 and abs(sum(c["amount"] for c in cands) - left) < 0.005:
+            return list(cands)
+        return None
+
     # ---- local mirror ------------------------------------------------------
     def _save_local(self) -> None:
+        """Written whole or not at all (a temporary file, then a rename): a process killed mid-write leaves the last
+        complete state, never half of one."""
         pos = self.position
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        self.state_path.write_text(json.dumps({
+        tmp = self.state_path.with_name(self.state_path.name + ".tmp")
+        tmp.write_text(json.dumps({
             "coin": self.coin, "venue": self.venue, "symbol": self.symbol,
             "stop_order_id": self.stop_order_id, "stop_px": self.stop_px, "stops_to_clean": self.stops_to_clean,
             "entry_order_id": self.entry_order_id, "close_wanted": self.close_wanted, "provisional": self.provisional,
             "bar_ts": self.bar_ts,
             "flows": self.flows, "flows_cursor": self.flows_cursor, "flows_seen": self.flows_seen,
-            "recon": self._recon,
+            "recon": self._recon, "unexplained_since": self._unexplained_since, "order_seq": self.order_seq,
             "position": None if pos is None else {
                 "side": pos.side.value, "qty": pos.qty, "entry_price": pos.entry_price, "entry_ts": pos.entry_ts,
                 "stop": pos.stop, "best_close": pos.best_close, "fees_paid": pos.fees_paid,
                 "funding_paid": pos.funding_paid, "setup": pos.setup},
             "trades": [t.as_dict() for t in self.trades[-500:]],
         }))
+        tmp.replace(self.state_path)
 
     def _load_local(self) -> None:
         if not self.state_path.exists():
@@ -1308,6 +2038,9 @@ class LiveBroker:
         self.flows_cursor = d.get("flows_cursor")
         self.flows_seen = list(d.get("flows_seen") or [])
         self._recon = d.get("recon")
+        if self._cb:        # a one-shot run (Coinbase on Actions) waits across runs, so the wait's start is kept
+            self._unexplained_since = d.get("unexplained_since")
+        self.order_seq = int(d.get("order_seq") or 0)
         pd = d.get("position")
         if pd:
             self.position = Position(Side(pd["side"]), pd["qty"], pd["entry_price"], pd["entry_ts"], pd["stop"],
