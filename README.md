@@ -73,7 +73,7 @@ python3 -m desk vt-backtest                  # the VT basket: reports/backtest-V
 python3 -m desk replay                       # watch it trade 2024→now at http://127.0.0.1:8787
 python3 -m desk paper                        # a $500 BTC paper account ($150 with --coin ETH or SOL), board at :8787
 python3 -m desk step                         # one step for every account (BTC, ETH, SOL, VT), the way the Action runs it
-python3 -m pytest                            # 485 tests, incl. "paper ledger == backtest" for the desk, for BTC on
+python3 -m pytest                            # 539 tests, incl. "paper ledger == backtest" for the desk, for BTC on
                                              # Coinbase rules and for VT, live mode against a fake exchange
                                              # (tests/test_live.py), and SHADOW and the locked Coinbase LIVE path
                                              # against a local fake Coinbase (tests/test_coinbase_shadow.py)
@@ -329,28 +329,33 @@ Perpetual futures are restricted in some countries, including for US persons on 
   - Simulated fills are at Coinbase's best ask (buys) or bid (sells) when the run looked, with the fee estimate max($0.20 a contract, 5 bps). The real fee tier is read and shown, but Coinbase's per-contract futures fee isn't in it.
   - Stops are simulated from Coinbase's 5-minute candles as stop-limits. One fills at the stop, or at the open past it, only within its limit; a gap past the limit leaves it unfilled, as on Coinbase, and the next run closes at market.
   - Funding on the simulated position is an estimate from the hourly rates SHADOW logs (Coinbase publishes no funding history).
-- **Deposits and withdrawals are read from Coinbase** (the USD wallet's transactions): money in or out, never profit or loss. `deposits.json` drives the paper accounts only.
+- **Deposits and withdrawals are read from Coinbase** (the transactions of the USD account in the key's own portfolio, found through v3 `/accounts`): money in or out, never profit or loss. `deposits.json` drives the paper accounts only.
   - The first deposit opens the account: it is the start, not profit. On day one at $0 the desk reads and decides but sizes nothing, and says how big an account the current setup needs for one contract.
   - A withdrawal that empties the account closes it, with no drawdown halt; the next deposit opens it again.
-  - USDC turned into USD for margin counts as money in from your USDC. A transfer type the desk doesn't know is alerted, never booked.
-  - Every run checks that the balance moved by what P&L, fees, funding and those flows explain. A move nothing explains waits 3 hours for its ledger entry, then alerts and sets `entry_kill`, as LIVE would.
+  - USDC turned into USD for margin counts as money in from your USDC. A transfer between your portfolios, a Coinbase subscription charge, a payout or a clawback is money in or out too.
+  - Every run checks that the balance moved by what P&L, fees, funding and those flows explain. A move nothing explains (a type Coinbase adds later, spot trading in the portfolio) waits 3 hours for an entry, then is booked as **money in or out**: SHADOW never trades the real account, so a move in it can't be SHADOW's profit or loss. It is listed on the board as unexplained, alerted, and sets `entry_kill`, as LIVE would.
+  - A drawdown halt can be cleared from the branch: add `"reset_halt_at": "<any new text>"` to `BTC/kills.json` on `coinbase-state` (docs/coinbase-setup.md).
 - **It's compared with paper.** The paper BTC account's board is handed to the SHADOW job. At the same close, the gates that rest on the candles alone (the setup, the trend, the volatility band) must agree; a disagreement is alerted. The gates that differ by design are named: the account's own balance and brakes, the moment each read the book, each one's own funding log.
-- **Entries.** An entry goes out at most 30 minutes after its close (runs land 7 to 9 minutes after a close on Actions), at market, sized again at the best ask then, and only while Coinbase is open. The weekly break and maintenance come from paper's rules and Coinbase's own session flag.
+- **Entries.** An entry goes out at most 30 minutes after its close (runs land 7 to 9 minutes after a close on Actions), at market, sized again at the best ask then, and only while Coinbase is open. The weekly break and maintenance come from paper's rules and Coinbase's own session: open only when `is_session_open` is true and `session_state` is `FCM_TRADING_SESSION_STATE_OPEN` (HALTED, PRE_OPEN, PRE_OPEN_NO_CANCEL and the rest read as closed).
+- **Orders the desk didn't place.** Coinbase lists only API (RETAIL_ADVANCED) orders unless asked, so the desk also reads the app's (RETAIL_SIMPLE). An order is the desk's only if it carries one of its client ids; any other order on BIP-20DEC30-CDE is never touched, blocks entries, and counts against the position when the desk places its own stop (no reduce-only). Don't place BIP orders yourself while SHADOW or LIVE runs.
 - **The repository is public, so:**
   - SHADOW's state and board are encrypted (PBKDF2 + AES-256-GCM, `desk/statebox.py`) and saved on their own branch, `coinbase-state`, never `paper-ledger`.
-  - The public `BTC/status.json` has no amounts and no ids.
+  - The public `BTC/status.json` has no amounts and no ids. A run refused over its secrets (`DESK_STATE_KEY` too short, or not opening the saved state) still writes it, naming which secret, so the dashboard says what's wrong.
   - The Actions log gets one fixed line plus GitHub's masks for the key: the run captures everything else it prints.
   - The dashboard's **BTC SHADOW** bar links to `shadow.html`, which opens the encrypted board on your device with `DESK_STATE_KEY` (WebCrypto; nothing is sent). It's never one of the paper tabs or in the ALL total, and nothing shows until SHADOW has published a status.
-- **Pushes** (ntfy): `BTC SHADOW: connected (read only)` once; `would BUY (no order sent)`, `would SELL (no order sent)` and `would SELL (stop, simulated)`; `DEPOSIT`, `WITHDRAWAL` and `account opened`; `ALERT` (each kind at most every 6 hours); `not working` (the first failure, then every 6 hours).
+- **Pushes** (ntfy): `BTC SHADOW: connected (read only)` once; `would BUY (no order sent)`, `would SELL (no order sent)` and `would SELL (stop, simulated)` (only when a simulated stop filled); `DEPOSIT`, `WITHDRAWAL` and `account opened`; `ALERT` (each kind at most every 6 hours; an alert about the simulated book starts "Simulated book (nothing rests on Coinbase)"); `not working` (the first failure, then every 6 hours).
+  - **They go to ntfy.sh in plain text: anyone who knows your topic's name can read them.** So they leave every amount out ("…") unless the secret `NTFY_TOKEN` holds an ntfy access token for a reserved topic. The encrypted board has the amounts.
 - **The job can't hurt paper.**
   - It runs after the paper job (`needs: step`) and installs its two pinned, hashed libraries (PyJWT 2.14.0, cryptography 50.0.1) only for itself.
   - It holds only `contents: write` and pushes only `coinbase-state`, one commit replaced each save with `--force-with-lease`, after a check that refuses a younger or plain-text state (`desk/coinbase_state.py`).
   - It's `continue-on-error`: a SHADOW failure never fails the run.
   - Without both secrets it skips, green.
-- **Not yet known** (the docs couldn't be read verbatim from where this was built):
-  - whether Coinbase's balance fields mean exactly what the formula assumes (ACH holds, the daily settlement);
+- **Checked against Coinbase's current spec.** The Advanced Trade OpenAPI spec's enums (order statuses, refusal codes, session states, placement sources) are in `tests/fixtures/coinbase_spec/enums.json`, dated, and `tests/test_coinbase_spec.py` checks the code and the tests' fake against them. Re-fetch it before LIVE is armed.
+- **The key must be ECDSA.** Coinbase's API key page: "Do NOT select Ed25519 as it is not supported by Coinbase App APIs" (the deposits and withdrawals are read through those). The desk refuses an Ed25519 key before calling Coinbase.
+- **Not yet known** (checked at runtime, never assumed):
+  - whether Coinbase's balance fields mean exactly what the formula assumes (the daily settlement). If the balance comes to more than available margin and holds, that's an ACH hold only when the USD account's own hold says so; otherwise entries stop;
   - how quickly deposits show up in the v2 transactions for a View key;
-  - whether Ed25519 keys work (use ECDSA).
+  - which placement source Coinbase gives API orders (assumed RETAIL_ADVANCED; any other is learned from the desk's own orders and read too).
   
   SHADOW exists to find these out before any money moves. Every inferred fact is checked at runtime: SHADOW refuses or alerts rather than guess.
 
@@ -361,6 +366,8 @@ Perpetual futures are restricted in some countries, including for US persons on 
 - A protective stop-limit rests on Coinbase at all times, its limit 5% past the trigger; Coinbase has no stop-market and no reduce-only.
 - The stop is trailed cancel-first at each run: two full-size stops at once could open a short.
 - Exits cancel the stop, then close the position.
+
+Each LIVE run starts with a **safety pass**, right after arming and before the product, candles or balance are read: the position and open orders, read fresh; a stop put back on a position with none (at the saved level, else the stop distance from the entry at the last ATR seen); any desk order left resting with no position cancelled; `flat_kill` honoured. A stop moved cancel-first starts only with the time for the move and a fallback close; once the old stop is cancelled, the new one (and if it won't rest, the close at market) goes on past the run's deadline, falling back to what it read just before if a read fails. A cancel or an entry whose answer is lost is read back before anything is decided. Anything that leaves a position without a stop, or a stop without a position, is pushed urgently (`BTC LIVE: NO STOP`, `BTC LIVE: STOP WITH NO POSITION`), and a run's "not working" push says how many order requests it sent.
 
 It has only ever run against the tests' local fake Coinbase (`tests/fake_coinbase.py`). `arm()` prints every check as PASS or FAIL and sends nothing unless all of them pass: the go-live gate, `DESK_LIVE_CONFIRM`, `DESK_LIVE_COINBASE=BIP-20DEC30-CDE`, a `--max-notional` that buys one contract, SHADOW's 14 clean days with a deposit reconciled to the cent, a View + Trade key that can't move money on SHADOW's portfolio, no USDC, and a flat start. Off GitHub Actions it also needs `--local`. The steps to arm it, and to disarm it, are in [`docs/coinbase-setup.md`](docs/coinbase-setup.md#part-2-the-trade-key-and-live-later-not-armed). This is the workflow edit they describe, for when you decide, not before. In the `shadow` job, add `environment: coinbase-live` (a GitHub Environment limited to the `main` branch, holding the secrets below), and replace the SHADOW run step with this one, never with `--force-unproven`:
 
@@ -376,6 +383,7 @@ It has only ever run against the tests' local fake Coinbase (`tests/fake_coinbas
           DESK_LIVE_COINBASE: ${{ vars.DESK_LIVE_COINBASE }}
           DESK_LIVE_MAX_NOTIONAL: ${{ vars.DESK_LIVE_MAX_NOTIONAL }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
           DESK_COINBASE_KILL: ${{ vars.DESK_COINBASE_KILL }}
         run: |
           git fetch --depth=1 origin paper-ledger && git checkout FETCH_HEAD -- ledger/BTC/paper.json

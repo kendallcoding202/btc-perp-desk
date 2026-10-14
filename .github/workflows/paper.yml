@@ -236,6 +236,8 @@ jobs:
           COINBASE_CDP_KEY: ${{ secrets.COINBASE_CDP_KEY }}
           DESK_STATE_KEY: ${{ secrets.DESK_STATE_KEY }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          # optional: an ntfy access token for a reserved topic; without it SHADOW's pushes leave amounts out
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
           DESK_COINBASE_KILL: ${{ vars.DESK_COINBASE_KILL }}
         run: python -m desk shadow --coin BTC --state-dir "$RUNNER_TEMP/cb" --paper-board "$RUNNER_TEMP/paper-btc/board.json"
 

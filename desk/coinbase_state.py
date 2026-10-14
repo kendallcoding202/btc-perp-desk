@@ -11,13 +11,15 @@ The branch holds one orphan commit, replaced at every save (encrypted blobs ever
     BTC/state-shadow.prev.enc.json   the one before it
     BTC/board-shadow.enc.json        SHADOW's board, encrypted: the dashboard opens it with DESK_STATE_KEY
     BTC/status.json                  public, no amounts and no ids: mode, runs, ok, the problem, the decision
-    BTC/kills.json                   the kill switches: yours to edit here (flat_kill, entry_kill, jev_kill)
+    BTC/kills.json                   the kill switches: yours to edit here (flat_kill, entry_kill, jev_kill), and
+                                     reset_halt_at: any new text (a date, say) clears a drawdown halt once
 
 check refuses (exit 1, an ::error:: naming the file) a file not on that list, an encrypted file that isn't an envelope,
 a status or kills file that isn't what the desk writes (status keys and values are whitelisted, so a bug can't put an
 amount in it), and a younger state: the same start time as the branch's, and more runs, or as many runs with the very
-same state file. stage copies the allowed files into a fresh tree, keeps the branch's kills.json (your edits) with any
-kill this run set added (kills.set.json), and moves the branch's last state to .prev.
+same state file. A run refused over its secrets (problem "key") saves its status alone: the state file as loaded, or
+none yet on a first save. stage copies the allowed files into a fresh tree, keeps the branch's kills.json (your edits)
+with any kill this run set added (kills.set.json), and moves the branch's last state to .prev.
 """
 
 from __future__ import annotations
@@ -36,6 +38,7 @@ ENCRYPTED = {f"{kind}-{m}{suffix}" for m in MODES for kind, suffix in
              (("state", ".enc.json"), ("state", ".prev.enc.json"), ("board", ".enc.json"))}
 ALLOWED = ENCRYPTED | {"status.json", "kills.json", "kills.set.json"}
 KILL_KEYS = ("flat_kill", "entry_kill", "jev_kill")
+RESET_KEYS = ("reset_halt_at",)         # one-shot: a new value clears the drawdown halt once (desk/coinbase_run.py)
 STATUS_KEYS = {"v": int, "mode": str, "coin": str, "product": str, "updated": int, "started_ts": int, "runs": int,
                "failed_runs": int, "ok": bool, "problem": (str, type(None)), "key_view_only": (bool, type(None)),
                "decision": (str, type(None)), "would_send_last_24h": (int, type(None)), "alerts_open": int,
@@ -97,8 +100,12 @@ def check_status(d, name: str = "status.json") -> dict:
 
 
 def check_kills(d, name: str) -> dict:
-    if not isinstance(d, dict) or set(d) - set(KILL_KEYS) or not all(isinstance(v, bool) for v in d.values()):
-        raise StateCheckError(f"{name} isn't a kill-switch file: only {', '.join(KILL_KEYS)}, each true or false")
+    ok = isinstance(d, dict) and not set(d) - set(KILL_KEYS) - set(RESET_KEYS) and \
+        all(isinstance(v, bool) for k, v in d.items() if k in KILL_KEYS) and \
+        all(v is None or (isinstance(v, str) and len(v) <= 40) for k, v in d.items() if k in RESET_KEYS)
+    if not ok:
+        raise StateCheckError(f"{name} isn't a kill-switch file: only {', '.join(KILL_KEYS)}, each true or false, "
+                              f"and {', '.join(RESET_KEYS)} (a short text)")
     return d
 
 
@@ -132,7 +139,11 @@ def check(state_dir: str | Path, remote_ref: str) -> list[str]:
     new = check_status(_json(files["status.json"], f"{COIN}/status.json"))
     mode = new["mode"].lower()
     state = f"state-{mode}.enc.json"
+    status_only = new.get("problem") == "key" and new.get("ok") is False
     if state not in files:
+        if status_only and new["runs"] == 0 and _git_show(remote_ref, f"{COIN}/{state}") is None:
+            said.append(f"a status-only save: {new['mode']} was refused over its secrets before it had a state")
+            return said
         raise StateCheckError(f"{COIN}/{state} is missing next to a {new['mode']} status")
     old_raw = _git_show(remote_ref, f"{COIN}/status.json")
     if old_raw is None:
@@ -155,6 +166,9 @@ def check(state_dir: str | Path, remote_ref: str) -> list[str]:
                               f"not saving")
     if new["runs"] == old["runs"] and files[state] != (_git_show(remote_ref, f"{COIN}/{state}") or b""):
         raise StateCheckError(f"{COIN}/{state} changed but its run count didn't: not saving")
+    if status_only and new["runs"] == old["runs"]:
+        said.append(f"a status-only save: {new['mode']} was refused over its secrets; its state is as loaded")
+        return said
     said.append(f"{new['mode']} state: {old['runs']} -> {new['runs']} runs, same start")
     return said
 
@@ -177,7 +191,7 @@ def stage(state_dir: str | Path, work: str | Path, remote_ref: str) -> list[str]
         (out / f"state-{mode}.prev.enc.json").write_bytes(old_state)
     elif old_prev is not None:
         (out / f"state-{mode}.prev.enc.json").write_bytes(old_prev)
-    kills = {k: False for k in KILL_KEYS}
+    kills: dict = {k: False for k in KILL_KEYS}
     raw = _git_show(remote_ref, f"{COIN}/kills.json")
     if raw is not None:
         try:
@@ -188,7 +202,8 @@ def stage(state_dir: str | Path, work: str | Path, remote_ref: str) -> list[str]
         kills.update(check_kills(_json(files["kills.json"], "kills.json"), "kills.json"))
     if "kills.set.json" in files:
         for k, v in check_kills(_json(files["kills.set.json"], "kills.set.json"), "kills.set.json").items():
-            kills[k] = kills[k] or v
+            if k in KILL_KEYS:
+                kills[k] = kills[k] or v
     (out / "kills.json").write_text(json.dumps(kills, indent=1) + "\n")
     return sorted(p.name for p in out.iterdir())
 

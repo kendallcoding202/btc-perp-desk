@@ -19,7 +19,8 @@ from desk.brokers.live import LiveBroker, LiveSetupError
 from desk.models import Order, Side
 from desk.thresholds import COINBASE, params_for
 from desk.venue import Rules
-from fake_coinbase import ARM_ENV, PRODUCT, V3, FakeCoinbase, Pos, arm_rest, good_proof, make_ec_key, view_rest
+from fake_coinbase import (ARM_ENV, PRODUCT, V3, FakeCoinbase, Pos, arm_rest, dcid, good_proof, make_ec_key,
+                           view_rest)
 
 ATR = 1_000.0
 
@@ -440,7 +441,7 @@ def test_a_stop_that_fills_while_away_is_booked_at_its_fill(fake, tmp_path):
 
 def test_a_stop_left_resting_with_no_position_is_cancelled_now(fake, tmp_path):
     b = broker(fake, tmp_path)
-    fake._order({"product_id": PRODUCT, "side": "SELL", "client_order_id": "left-behind"}, "stop",
+    fake._order({"product_id": PRODUCT, "side": "SELL", "client_order_id": dcid("left-behind")}, "stop",
                 {"stop_limit_stop_limit_gtc": {"base_size": "1", "stop_price": "80000", "limit_price": "76000",
                                                "stop_direction": "STOP_DIRECTION_STOP_DOWN"}}, "OPEN")
     b.sync(fake.last)
@@ -449,7 +450,7 @@ def test_a_stop_left_resting_with_no_position_is_cancelled_now(fake, tmp_path):
 
 def test_a_stray_stop_that_cant_be_cancelled_is_the_urgent_alert(fake, tmp_path):
     b = broker(fake, tmp_path)
-    fake._order({"product_id": PRODUCT, "side": "SELL", "client_order_id": "left-behind"}, "stop",
+    fake._order({"product_id": PRODUCT, "side": "SELL", "client_order_id": dcid("left-behind")}, "stop",
                 {"stop_limit_stop_limit_gtc": {"base_size": "1", "stop_price": "80000", "limit_price": "76000",
                                                "stop_direction": "STOP_DIRECTION_STOP_DOWN"}}, "OPEN")
     fake.fail_next("POST", f"{V3}/orders/batch_cancel", status=503, times=50)
@@ -462,6 +463,7 @@ def test_a_position_opened_by_something_other_than_a_desk_entry_is_closed_and_en
     o = fake._order({"product_id": PRODUCT, "side": "SELL", "client_order_id": "by-hand"}, "market",
                     {"market_market_ioc": {"base_size": "2"}}, "OPEN")
     fake._fill(o, 2, fake.bid)                       # a short the desk never opened
+    o["status"] = "FILLED"
     b.sync(fake.last)
     assert fake.position() is None and b.trades[-1].reason == "not_the_desks"
     assert "not one of the desk's entries" in b.entry_kill_why

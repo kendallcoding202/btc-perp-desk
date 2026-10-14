@@ -7,9 +7,14 @@ coinbase_live.arm() unlocked. Units: LiveBroker's quantities are BTC; Coinbase's
 this adapter speaks contracts to LiveBroker (market contractSize 0.01) and to Coinbase.
 
 What this adapter adds because Coinbase isn't Hyperliquid:
-  * The product is the desk's alone. Every open order on BIP-20DEC30-CDE counts as the desk's, as protection and for
-    cancelling (LIVE starts only on a flat account with no orders, coinbase_live.arm). A position or an open order on
-    any other product is someone else's: it's never touched, and it blocks entries (entry_block) until it's gone.
+  * The product is the desk's alone (LIVE starts only on a flat account with no orders, coinbase_live.arm). An open
+    order on BIP-20DEC30-CDE is the desk's when it carries a desk client_order_id (a version-5 UUID,
+    coinbase_orders.is_desk_cid) and was placed through the Advanced Trade API: as protection and for cancelling. Any
+    other order (one placed in the Coinbase app or by hand, on any product) and any position on another product is
+    someone else's: never touched, it blocks entries (entry_block) until it's gone, and on BIP its closing contracts
+    count against the position in the guard below. Coinbase lists only RETAIL_ADVANCED orders unless asked
+    (order_placement_source, "By default, returns RETAIL_ADVANCED placement source"): the open orders are read for
+    RETAIL_SIMPLE (the app) too, and for any source the desk's own orders turn out to carry.
   * No reduce-only on Coinbase. Before every stop or close, the position and the open orders are read again, in the
     same step; a stop that would make the resting closing-side contracts more than the position holds is refused here
     (it would open a position if it fired), and so is a close bigger than the position, and an entry while a position or
@@ -21,31 +26,60 @@ What this adapter adds because Coinbase isn't Hyperliquid:
     (usable).
   * Deposits and withdrawals: the v2 USD wallet's transactions (coinbase_orders.parse_flow), with stable ids.
   * A changed product (contract size, order sizes, venue, type, no funding rate) refuses to start, except with a
-    position or an order resting: then entries are blocked and the stop and exits are still managed.
+    position or an order resting: then entries are blocked and the stop and exits are still managed (the product is
+    read leniently so the run goes on).
+  * The session: open only when is_session_open says so and session_state is FCM_TRADING_SESSION_STATE_OPEN (the
+    spec's FcmTradingSessionState also has PRE_OPEN, PRE_OPEN_NO_CANCEL, CLOSE, HALTED, UNDEFINED). HALTED: nothing
+    is sent. PRE_OPEN_NO_CANCEL: no cancel.
+  * A cancel is a request (pending_cancel, "not yet completed"): a cancelled order is gone only once Coinbase reads it
+    CANCELLED (or CANCEL_QUEUED while closed); one whose cancel is in flight still rests and could still fill.
 """
 
 from __future__ import annotations
 
+import contextlib
+import copy
 import math
 
 from ..feeds.coinbase import CoinbaseFeed, FeedError
 from ..thresholds import COINBASE
 from . import coinbase_orders as co
-from .coinbase_rest import CoinbaseDataError, CoinbaseError, CoinbaseRejected
+from .coinbase_rest import (CoinbaseDataError, CoinbaseError, CoinbaseRejected, CoinbaseUnavailable,
+                            CoinbaseUncertain)
 from .live import LiveSetupError
 
 V3 = "/api/v3/brokerage"
 READBACK_TRIES = 5
 READBACK_WAIT_S = 1.0
+CANCEL_READS = 10                       # a cancel is read back up to this many times (1 s apart) until it's done
 FILL_PAGES = 10
 LEDGER_WINDOW_MS = 14 * 86400_000       # deposits and withdrawals are read back this far
 PRICE_FRESH_MS = 60_000                 # a price older than this (a cached answer, a quiet book) isn't acted on
 BALANCE_TOL_USD = 1.0                   # the balance cross-check: the larger of $1...
 BALANCE_TOL_FRACTION = 0.005            # ...and 0.5%
+# Coinbase's refusals of a stop-limit (NewOrderFailureReason / PreviewFailureReason in the spec;
+# new_order_failure_reason is the one to read: error and preview_failure_reason are marked Deprecated in
+# NewOrderErrorResponse). A band: the limit is too far from the market, so a tighter one is tried. Through: the price
+# is already through the trigger.
 BAND_CODES = ("LIMIT_PRICE_TOO_FAR_FROM_MARKET", "PREVIEW_LIMIT_PRICE_TOO_FAR_FROM_MARKET",
+              "LIMIT_ORDER_PRICE_EXCEEDS_PRICE_BAND_ON_BUY", "LIMIT_ORDER_PRICE_EXCEEDS_PRICE_BAND_ON_SELL",
+              "PREVIEW_LIMIT_ORDER_PRICE_EXCEEDS_PRICE_BAND_ON_BUY",
+              "PREVIEW_LIMIT_ORDER_PRICE_EXCEEDS_PRICE_BAND_ON_SELL",
               "STOP_TRIGGER_PRICE_OUT_OF_BOUNDS", "PREVIEW_STOP_TRIGGER_PRICE_OUT_OF_BOUNDS",
               "PREVIEW_BREACHED_PRICE_LIMIT", "INVALID_LIMIT_PRICE", "PREVIEW_INVALID_LIMIT_PRICE")
-THROUGH_CODES = ("PREVIEW_STOP_PRICE_ABOVE_LAST_TRADE_PRICE", "PREVIEW_STOP_PRICE_BELOW_LAST_TRADE_PRICE")
+THROUGH_CODES = ("PREVIEW_STOP_PRICE_ABOVE_LAST_TRADE_PRICE", "PREVIEW_STOP_PRICE_BELOW_LAST_TRADE_PRICE",
+                 "STOP_ALREADY_TRIGGERED", "PREVIEW_STOP_TRIGGERED")
+# Refusals that mean Coinbase isn't taking this order now (its session), not that the order is wrong
+SESSION_CODES = ("INVALID_FCM_TRADING_SESSION", "PREVIEW_INVALID_FCM_TRADING_SESSION",
+                 "FUTURES_AFTER_HOUR_INVALID_ORDER_TYPE", "PREVIEW_FUTURES_AFTER_HOUR_INVALID_ORDER_TYPE",
+                 "FUTURES_AFTER_HOUR_INVALID_TIME_IN_FORCE", "PREVIEW_FUTURES_AFTER_HOUR_INVALID_TIME_IN_FORCE")
+# Cancel refusals (CancelOrderFailureReason) cancel_order acts on by name; every other one is CancelFailed
+CANCEL_CODES = ("ORDER_IS_FULLY_FILLED", "INVALID_CANCEL_FCM_TRADING_SESSION", "UNKNOWN_CANCEL_ORDER",
+                "DUPLICATE_CANCEL_REQUEST")
+SESSION_OPEN_STATE = "FCM_TRADING_SESSION_STATE_OPEN"
+SESSION_HALTED = "FCM_TRADING_SESSION_STATE_HALTED"
+SESSION_NO_CANCEL = "FCM_TRADING_SESSION_STATE_PRE_OPEN_NO_CANCEL"
+OTHER_SOURCES = ("RETAIL_SIMPLE",)      # order_placement_source read besides the default (RETAIL_ADVANCED): the app
 
 
 class OrderRefused(CoinbaseError):
@@ -73,6 +107,15 @@ class CancelFailed(CoinbaseError):
     pass
 
 
+class CancelPending(CancelFailed):
+    """Coinbase took the cancel but the order still reads as resting (its cancel in flight) after CANCEL_READS reads:
+    it's going, not gone, and could still fill. Neither protection nor safe to place a second stop beside."""
+
+
+class CancelUnknown(CancelFailed):
+    """The cancel got no clear answer and the order can't be read back: whether it still rests isn't known."""
+
+
 class _AuthedFeed(CoinbaseFeed):
     """CoinbaseFeed's product parse and checks, on the authenticated product read (the public one is cached by a CDN,
     hours at a time on some answers)."""
@@ -81,8 +124,11 @@ class _AuthedFeed(CoinbaseFeed):
         super().__init__(venue)
         self.rest = rest
         self.raw: dict[str, dict] = {}
+        self._override: dict[str, dict] = {}
 
     def _get(self, path: str, params: dict | None = None, retries: int = 3):
+        if path in self._override:
+            return self._override[path]
         try:
             out = self.rest.get(f"{V3}/{path}", params)
         except CoinbaseRejected as exc:
@@ -93,6 +139,24 @@ class _AuthedFeed(CoinbaseFeed):
             out = {"pricebook": {}}
         self.raw[path] = out
         return out
+
+    def product_lenient(self) -> dict:
+        """The product parsed with the desk's contract size and order sizes in place of the ones its answer now gives (a
+        product that changed while a position or an order rests on it: managed in whole contracts, never traded on).
+        Raises if it isn't a futures product at all."""
+        path = f"products/{self.product_id}"
+        d = copy.deepcopy(self.raw.get(path) or self._get(path))
+        if not isinstance(d.get("future_product_details"), dict):
+            raise FeedError(f"Coinbase's answer for {self.product_id} isn't a futures product")
+        v = self.venue
+        d["future_product_details"]["contract_size"] = f"{v.contract_size:g}"
+        d.update({"base_increment": "1", "base_min_size": str(v.min_contracts), "base_max_size": str(v.max_contracts)})
+        self._override[path] = d
+        try:
+            return self.product()
+        finally:
+            self._override.pop(path, None)
+            self.raw[path] = d
 
 
 def _ccxt_side(side: str) -> str:
@@ -123,6 +187,8 @@ class CoinbaseExchange:
         self.on_alert = on_alert
         self.memo = memo if memo is not None else {}
         self.memo.setdefault("alerted", [])
+        self.memo.setdefault("sources", [])     # placement sources the desk's own orders turned out to carry
+        self._quick = False                     # reads without retries (a protective step that has a fallback)
         self.sleep = sleep or rest.sleep
         self.options: dict = {}
         self.markets: dict | None = None
@@ -134,6 +200,7 @@ class CoinbaseExchange:
         self.balance_block: str | None = None
         self.product_block: str | None = None
         self.usd_account: str | None = None
+        self.usd_hold: float | None = None      # the USD account's hold (v3 accounts): money not usable as margin yet
         self.usdc: float | None = None
         self.permissions: dict | None = None
         self.fees: dict | None = None
@@ -153,6 +220,11 @@ class CoinbaseExchange:
 
     def fits(self, seconds: float) -> bool:
         return self.rest.fits(seconds)
+
+    def protecting(self):
+        """A protective sequence may run past the run's deadline (CoinbaseREST.protecting)."""
+        p = getattr(self.rest, "protecting", None)
+        return p() if p is not None else contextlib.nullcontext()
 
     def milliseconds(self) -> int:
         return int(self.rest.now_s() * 1000)
@@ -198,6 +270,11 @@ class CoinbaseExchange:
             self.product_block = why
             self._alert_once(f"product:{exc}", f"{why}. A position or an order rests on it, so the stop and exits are "
                                                f"still managed; no new entries")
+            if self.details is None:
+                try:
+                    self.details = self.feed.product_lenient()
+                except FeedError:
+                    pass        # not even a futures product: the run can't read its candles, the safety pass still ran
         self.markets = {self.product: self._market()}
         return self.markets
 
@@ -208,9 +285,27 @@ class CoinbaseExchange:
             return True         # can't tell: assume something rests, keep managing it
         return pos is not None or bool(orders)
 
+    def session_state(self) -> str | None:
+        return None if self.details is None else self.details.get("session_state")
+
     def session_open(self) -> bool | None:
-        """Whether Coinbase takes orders on the product now, as its product answer this run said (None: it didn't)."""
-        return None if self.details is None else self.details.get("session_open")
+        """Whether Coinbase takes orders on the product now, as its product answer this run said (None: it didn't).
+        Open only when is_session_open says so and session_state, when given, is OPEN: HALTED, PRE_OPEN,
+        PRE_OPEN_NO_CANCEL, CLOSE and UNDEFINED read as closed, whatever is_session_open says."""
+        if self.details is None:
+            return None
+        st = self.details.get("session_state")
+        if st and st != SESSION_OPEN_STATE:
+            return False
+        return self.details.get("session_open")
+
+    def halted(self) -> bool:
+        """Coinbase's session reads HALTED: nothing is sent, not even a stop."""
+        return self.session_state() == SESSION_HALTED
+
+    def cancels_refused(self) -> bool:
+        """The session takes no cancels now (PRE_OPEN_NO_CANCEL, HALTED)."""
+        return self.session_state() in (SESSION_NO_CANCEL, SESSION_HALTED)
 
     def amount_to_precision(self, symbol, amount) -> str:
         n = math.floor(float(amount) + 1e-9)
@@ -236,12 +331,22 @@ class CoinbaseExchange:
             self.balance_block = ("Coinbase's balance doesn't add up (available margin + holds is more than spot + "
                                   "futures + open and unsettled P&L): no entries on a number that doesn't")
         elif b["equity"] - b["cross"] > tol:
-            self.usable = b["cross"]        # e.g. a deposit on hold: in the balance, not usable as futures margin yet
+            # More in the balance than available margin + holds: money that can't be margin yet (a deposit's ACH
+            # hold) only when the USD account says it holds that much; otherwise the formula counts something twice
+            # (today's realised P&L, say), and nothing is sized on it.
+            gap = b["equity"] - b["cross"]
+            hold = self._usd_hold()
+            if hold is not None and abs(hold - gap) <= tol:
+                self.usable = b["cross"]
+            else:
+                self.balance_block = ("Coinbase's balance doesn't add up (spot + futures + open and unsettled P&L is "
+                                      "more than available margin + holds, and no hold on the USD account explains "
+                                      "it): no entries on a number that doesn't")
         return {"info": b, "total": {"USD": b["equity"]}, "free": {"USD": b["available_margin"]},
                 "USD": {"total": b["equity"], "free": b["available_margin"]}}
 
     def _positions(self) -> list[dict]:
-        rows = self.rest.get(f"{V3}/cfm/positions").get("positions")
+        rows = self._get(f"{V3}/cfm/positions").get("positions")
         if not isinstance(rows, list):
             raise CoinbaseDataError("Coinbase's positions answer has no positions list")
         return [p for p in (co.parse_position(r) for r in rows) if p is not None]
@@ -258,12 +363,42 @@ class CoinbaseExchange:
         self.foreign["positions"] = foreign
         return out
 
+    def _get(self, path: str, params=None):
+        return self.rest.get(path, params, retries=0) if self._quick else self.rest.get(path, params)
+
+    def _pages(self, path: str, params, items: str, max_pages: int = 10) -> list:
+        if self._quick:
+            return self.rest.get_pages(path, params, items, max_pages, retries=0)
+        return self.rest.get_pages(path, params, items, max_pages)
+
+    @contextlib.contextmanager
+    def quick(self):
+        """Reads with no retries: a protective step that has a fallback for a read that fails."""
+        prev, self._quick = self._quick, True
+        try:
+            yield
+        finally:
+            self._quick = prev
+
+    def _sources(self) -> list[str | None]:
+        """The placement sources to list: the default (RETAIL_ADVANCED, the API's), the app's, and any other the desk's
+        own orders turned out to carry."""
+        out: list[str | None] = [None, *OTHER_SOURCES]
+        out += [x for x in self.memo.get("sources") or [] if x not in out and x != co.DESK_SOURCE]
+        return out
+
     def _open_orders_all(self) -> list[dict]:
-        """Every open order on every product: OPEN (which can't be combined with other statuses and leaves out
-        PENDING and QUEUED orders that can still be cancelled), then PENDING, QUEUED and CANCEL_QUEUED."""
-        rows = self.rest.get_pages(f"{V3}/orders/historical/batch", {"order_status": "OPEN", "limit": 100}, "orders")
-        rows += self.rest.get_pages(f"{V3}/orders/historical/batch",
-                                    {"order_status": ["PENDING", "QUEUED", "CANCEL_QUEUED"], "limit": 100}, "orders")
+        """Every open order on every product, from every placement source read (_sources): OPEN (which can't be combined
+        with other statuses and leaves out PENDING and QUEUED orders that can still be cancelled), then PENDING, QUEUED,
+        CANCEL_QUEUED and EDIT_QUEUED."""
+        rows = []
+        for src in self._sources():
+            extra = {} if src is None else {"order_placement_source": src}
+            rows += self._pages(f"{V3}/orders/historical/batch", {"order_status": "OPEN", "limit": 100, **extra},
+                                "orders")
+            rows += self._pages(f"{V3}/orders/historical/batch",
+                                {"order_status": ["PENDING", "QUEUED", "CANCEL_QUEUED", "EDIT_QUEUED"], "limit": 100,
+                                 **extra}, "orders")
         out, seen = [], set()
         for r in rows:
             o = co.parse_order(r)
@@ -273,18 +408,44 @@ class CoinbaseExchange:
             out.append(o)
         return out
 
+    def is_desks(self, o: dict) -> bool:
+        """Whether an open order is the desk's: on its product, with a desk client_order_id, placed through the API (or
+        from a source the desk's own orders carry)."""
+        src = o.get("placement")
+        return o.get("symbol") == self.product and co.is_desk_cid(o.get("clientOrderId")) and \
+            (src in (None, "", co.DESK_SOURCE) or src in (self.memo.get("sources") or []))
+
     def fetch_open_orders(self, symbol=None, since=None, limit=None, params=None) -> list[dict]:
-        """The open orders on the product (every one of them is the desk's); the rest go to foreign."""
+        """The desk's open orders on the product; every other open order goes to foreign (never touched)."""
         mine, foreign = [], []
         for o in self._open_orders_all():
-            (mine if o["symbol"] == self.product else foreign).append(o)
-        self.foreign["orders"] = [{"product_id": o["symbol"], "id": o["id"], "side": o["side"]} for o in foreign]
+            (mine if self.is_desks(o) else foreign).append(o)
+        self.foreign["orders"] = [{"product_id": o["symbol"], "id": o["id"], "side": o["side"],
+                                   "contracts": o["remaining"] if o.get("remaining") is not None else o.get("amount"),
+                                   "stop": o.get("triggerPrice"), "status": o["status"]} for o in foreign]
         return mine
+
+    def foreign_on_product(self, side: str | None = None) -> list[dict]:
+        """Orders resting on the desk's product that aren't the desk's (on `side`, if given), as of the last read."""
+        return [o for o in self.foreign["orders"] if o["product_id"] == self.product and (side is None or
+                                                                                         o["side"] == side)]
 
     def _fresh(self) -> tuple[dict | None, list[dict]]:
         """The product's position (or None) and its open orders, read now."""
         pos = next((p for p in self.fetch_positions([self.product])), None)
         return pos, self.fetch_open_orders(self.product)
+
+    def _fresh_or(self, known: dict | None) -> tuple[dict | None, list[dict]]:
+        """_fresh(), read once with no retries when `known` is given; if that read fails, `known`: what the caller
+        read itself just before, after confirming the cancel of the old stop (the position, the desk's orders)."""
+        if known is None:
+            return self._fresh()
+        try:
+            with self.quick():
+                return self._fresh()
+        except CoinbaseUnavailable:
+            pos = None if not known.get("side") else {"side": known["side"], "contracts": int(known["contracts"])}
+            return pos, list(known.get("orders") or [])
 
     def fetch_my_trades(self, symbol=None, since=None, limit=None, params=None) -> list[dict]:
         q = {"product_ids": self.product, "limit": 100}
@@ -307,10 +468,12 @@ class CoinbaseExchange:
 
     def find_order(self, client_order_id: str, since_ms: int) -> dict | None:
         """The product's order with this client_order_id, placed since `since_ms` (any status), or None."""
-        q = {"product_ids": self.product, "start_date": co.iso(int(since_ms)), "limit": 100}
-        for r in self.rest.get_pages(f"{V3}/orders/historical/batch", q, "orders"):
-            if r.get("client_order_id") == client_order_id:
-                return co.parse_order(r)
+        for src in self._sources():
+            q = {"product_ids": self.product, "start_date": co.iso(int(since_ms)), "limit": 100,
+                 **({} if src is None else {"order_placement_source": src})}
+            for r in self.rest.get_pages(f"{V3}/orders/historical/batch", q, "orders"):
+                if r.get("client_order_id") == client_order_id:
+                    return co.parse_order(r)
         for o in self.fetch_open_orders(self.product):
             if o.get("clientOrderId") == client_order_id:
                 return o
@@ -327,21 +490,49 @@ class CoinbaseExchange:
 
     # ---- money in and out (the v2 USD wallet)
     def wallets(self) -> dict:
-        """The USD wallet's id and the USDC balance (USDC in the portfolio can be pulled into futures margin)."""
-        rows = self.rest.get_v2_pages("/v2/accounts", {"limit": 100})
-        usd, usdc = None, 0.0
+        """The key's portfolio's USD account (its id, its hold) and the USDC in that portfolio (Coinbase can pull USDC
+        into futures margin). Read from v3 GET /accounts, whose rows say their portfolio (retail_portfolio_id) and
+        platform: the spot USD account (ACCOUNT_PLATFORM_CONSUMER) in the key's portfolio
+        (key_permissions.portfolio_uuid). v2 /accounts (whose rows say no portfolio) must list that same account: its
+        transactions are the deposits and withdrawals. Anything else raises: the flows aren't read from a wallet
+        that may be another portfolio's."""
+        if self.permissions is None:
+            self.key_permissions()
+        mine = self.permissions.get("portfolio_uuid")
+        if not mine:
+            raise CoinbaseDataError("the key's permissions don't name its portfolio: not guessing which USD wallet is "
+                                    "the account's")
+        rows = self.rest.get_pages(f"{V3}/accounts", {"limit": 250}, "accounts")
+        usd, usdc, hold = None, 0.0, 0.0
         for a in rows:
-            cur = a.get("currency")
-            code = (cur.get("code") if isinstance(cur, dict) else cur) or (a.get("balance") or {}).get("currency")
-            if code == "USD" and usd is None:
-                usd = a.get("id")
-            elif code == "USDC":
-                bal = a.get("balance") if isinstance(a.get("balance"), dict) else {}
-                usdc += co.amount(bal.get("amount"), "USDC balance", required=False) or 0.0
-        if not usd:
-            raise CoinbaseDataError("Coinbase lists no USD wallet for this key's portfolio")
-        self.usd_account, self.usdc = str(usd), usdc
-        return {"usd_account": self.usd_account, "usdc": usdc}
+            if a.get("retail_portfolio_id") != mine or a.get("deleted_at"):
+                continue
+            plat = a.get("platform")
+            if a.get("currency") == "USD" and plat in (None, "", "ACCOUNT_PLATFORM_CONSUMER"):
+                if usd is not None:
+                    raise CoinbaseDataError("the key's portfolio lists two spot USD accounts: not guessing which one")
+                usd = a
+            elif a.get("currency") == "USDC":
+                usdc += (co.amount(a.get("available_balance"), "USDC balance", required=False) or 0.0) + \
+                    (co.amount(a.get("hold"), "USDC hold", required=False) or 0.0)
+        if usd is None or not usd.get("uuid"):
+            raise CoinbaseDataError("Coinbase lists no spot USD account in this key's portfolio")
+        uid = str(usd["uuid"])
+        v2 = self.rest.get_v2_pages("/v2/accounts", {"limit": 100})
+        if not any(str(a.get("id")) == uid for a in v2):
+            raise CoinbaseDataError("the portfolio's USD account isn't among the Coinbase App's (v2) accounts: its "
+                                    "deposits and withdrawals can't be read")
+        hold = co.amount(usd.get("hold"), "USD hold", required=False) or 0.0
+        self.usd_account, self.usdc, self.usd_hold = uid, usdc, hold
+        return {"usd_account": self.usd_account, "usdc": usdc, "usd_hold": hold}
+
+    def _usd_hold(self) -> float | None:
+        """The USD account's hold, read now (None if it can't be)."""
+        try:
+            self.wallets()
+        except CoinbaseError:
+            return None
+        return self.usd_hold
 
     def fetch_ledger(self, code=None, since=None, limit=None, params=None) -> list[dict]:
         """The USD wallet's transactions from LEDGER_WINDOW_MS before `since` (newest first from Coinbase, paged
@@ -451,6 +642,9 @@ class CoinbaseExchange:
                                      + (f", stop {o['triggerPrice']:,.0f}" if o.get("triggerPrice") else "") +
                                      f") rests on {self.product} with no position: Coinbase has no reduce-only, so it "
                                      f"would open a position if it fired. Cancel it in Coinbase now"))
+            for o in self.foreign_on_product():
+                out.append(("stray", f"order {o['id']} ({o['side']}, not the desk's) rests on {self.product} with no "
+                                     f"position: it would open one if it fired. Cancel it in Coinbase now"))
         else:
             if not any(o["side"] == closing and o.get("triggerPrice") and o["status"] == "open" for o in orders):
                 out.append(("unprotected", f"the {pos['side']} {pos['contracts']:g} contracts on {self.product} have "
@@ -458,6 +652,8 @@ class CoinbaseExchange:
         for p in self.foreign["positions"]:
             out.append(("foreign", f"a {p['side']} {p['contracts']} on {p['product_id']} (not the desk's)"))
         for o in self.foreign["orders"]:
+            if pos is None and o["product_id"] == self.product:
+                continue        # said above, as a stray
             out.append(("foreign", f"order {o['id']} on {o['product_id']} (not the desk's)"))
         return out
 
@@ -483,14 +679,18 @@ class CoinbaseExchange:
         if o is None:
             return {"id": oid, "status": None, "filled": None, "average": None, "fee": None}
         self.last_readback = o
+        src = o.get("placement")
+        if src and src != co.DESK_SOURCE and src not in self.memo["sources"]:
+            self.memo["sources"] = self.memo["sources"] + [src]
+            self._alert_once(f"source:{src}", f"Coinbase lists the desk's own orders under placement source {src}, "
+                                              f"not {co.DESK_SOURCE}: the open orders are read under it too from now")
         return o
 
     def _post(self, path: str, body: dict) -> dict:
         try:
             return self.rest.post(path, body)
         except CoinbaseRejected as exc:
-            if exc.has("INVALID_FCM_TRADING_SESSION", "FUTURES_AFTER_HOUR_INVALID_ORDER_TYPE",
-                       "PREVIEW_FUTURES_AFTER_HOUR_INVALID_ORDER_TYPE", "FUTURES_AFTER_HOUR_INVALID_TIME_IN_FORCE"):
+            if exc.has(*SESSION_CODES):
                 raise SessionClosed(f"{exc}: Coinbase isn't taking this order type now") from None
             raise
 
@@ -513,10 +713,13 @@ class CoinbaseExchange:
         if abs(n - round(n)) > 1e-9 or n < 1:
             raise OrderRefused(f"{amount} isn't a whole number of contracts")
         n = int(round(n))
+        if self.halted():
+            raise OrderRefused("not sent: Coinbase's session reads HALTED")
+        known = params.get("known")
         if params.get("stopLossPrice") is not None:
-            return self._stop(cid, side, n, float(params["stopLossPrice"]))
+            return self._stop(cid, side, n, float(params["stopLossPrice"]), known)
         if params.get("reduceOnly"):
-            return self._close(cid, side, n)
+            return self._close(cid, side, n, known)
         return self._entry(cid, side, n)
 
     def _entry(self, cid: str, side: str, n: int) -> dict:
@@ -532,8 +735,8 @@ class CoinbaseExchange:
         o = self._readback(oid, lambda o: o["status"] in ("closed", "canceled"))
         return {**o, "id": oid, "clientOrderId": cid}
 
-    def _stop(self, cid: str, side: str, n: int, trigger: float) -> dict:
-        pos, orders = self._fresh()
+    def _stop(self, cid: str, side: str, n: int, trigger: float, known: dict | None = None) -> dict:
+        pos, orders = self._fresh_or(known)
         if pos is None:
             raise OrderRefused("stop not sent: the account holds no position on the product, and a stop with no "
                                "position would open one if it fired")
@@ -542,9 +745,12 @@ class CoinbaseExchange:
             raise OrderRefused(f"stop not sent: a {side} stop doesn't close a {pos['side']} position")
         resting = sum(float(o["remaining"] if o.get("remaining") is not None else (o.get("amount") or 0))
                       for o in orders if o["side"] == closing)
-        if resting + n > pos["contracts"] + 1e-9:
-            raise OrderRefused(f"stop not sent: {resting:g} closing contracts already rest against the "
-                               f"{pos['contracts']} held; {n} more would open a position if they all fired")
+        others = sum(float(o.get("contracts") or 0) for o in self.foreign_on_product(closing))
+        if resting + others + n > pos["contracts"] + 1e-9:
+            raise OrderRefused(f"stop not sent: {resting + others:g} closing contracts already rest against the "
+                               f"{pos['contracts']} held" + (f" ({others:g} of them in orders that aren't the desk's)"
+                                                             if others else "")
+                               + f"; {n} more would open a position if they all fired")
         last = None
         for k, offset in enumerate(co.STOP_LIMIT_FALLBACKS):
             body = co.stop_limit(cid if k == 0 else co.client_order_id("stop-offset", self.coin, cid, offset),
@@ -574,8 +780,8 @@ class CoinbaseExchange:
             return {**o, "id": oid, "clientOrderId": body["client_order_id"]}
         raise last      # pragma: no cover (the loop either returns or raises)
 
-    def _close(self, cid: str, side: str, n: int) -> dict:
-        pos, _ = self._fresh()
+    def _close(self, cid: str, side: str, n: int, known: dict | None = None) -> dict:
+        pos, _ = self._fresh_or(known)
         if pos is None:
             raise OrderRefused("close not sent: the account holds no position on the product")
         closing = "sell" if pos["side"] == "long" else "buy"
@@ -587,16 +793,46 @@ class CoinbaseExchange:
         o = self._readback(oid, lambda o: o["status"] in ("closed", "canceled"))
         return {**o, "id": oid, "clientOrderId": cid}
 
+    @staticmethod
+    def _cancel_done(o: dict) -> bool:
+        """A cancel is done when the order reads cancelled or filled, or its cancel is queued for the reopen
+        (CANCEL_QUEUED). An open order whose cancel is in flight (pending_cancel) isn't done: it can still fill."""
+        return o.get("status") in ("canceled", "closed") or str(o.get("coinbase_status")) == "CANCEL_QUEUED"
+
+    def _cancel_readback(self, oid: str) -> dict:
+        o = None
+        for k in range(CANCEL_READS):
+            if k:
+                if not self.fits(READBACK_WAIT_S + 1):
+                    break
+                self.sleep(READBACK_WAIT_S)
+            try:
+                o = self.fetch_order(oid)
+            except CoinbaseRejected:
+                o = None
+                continue
+            if self._cancel_done(o):
+                break
+        return o or {"id": oid, "status": None}
+
     def cancel_order(self, id, symbol=None, params=None) -> dict:
-        """Cancel one order and confirm it: done when Coinbase says so, or when a read shows it cancelled (or its
-        cancel queued for the reopen: 'canceling'). Raises StopAlreadyFilled, SessionClosed or CancelFailed."""
+        """Cancel one order and confirm it: done only when a read shows it cancelled (or its cancel queued for the
+        reopen: 'canceling'). A cancel Coinbase took but hasn't finished (pending_cancel) is read again, CANCEL_READS
+        times. A cancel with no clear answer is read back before anything is decided. Raises StopAlreadyFilled,
+        SessionClosed, CancelPending (still going), CancelUnknown (can't tell) or CancelFailed."""
         oid = str(id)
-        res = self._post(f"{V3}/orders/batch_cancel", co.batch_cancel([oid]))
-        rows = [r for r in res.get("results") or [] if str(r.get("order_id")) == oid] or res.get("results") or []
+        try:
+            res = self._post(f"{V3}/orders/batch_cancel", co.batch_cancel([oid]))
+        except CoinbaseUncertain:
+            res = None          # it may have reached Coinbase: what the order reads now decides
+        rows = [] if res is None else \
+            [r for r in res.get("results") or [] if str(r.get("order_id")) == oid] or res.get("results") or []
         r = rows[0] if rows else {}
         reason = str(r.get("failure_reason") or "")
-        if r.get("success") is True:
-            o = self._readback(oid, lambda o: o["status"] in ("canceled", "canceling", "closed"))
+        if res is None or r.get("success") is True:
+            o = self._cancel_readback(oid)
+            if o.get("status") is None:
+                raise CancelUnknown(f"the cancel of order {oid} got no clear answer and the order can't be read back")
         elif reason == "ORDER_IS_FULLY_FILLED":
             raise StopAlreadyFilled(f"order {oid} had already filled")
         elif reason == "INVALID_CANCEL_FCM_TRADING_SESSION":
@@ -611,6 +847,9 @@ class CoinbaseExchange:
         st = o.get("status")
         if st == "closed":
             raise StopAlreadyFilled(f"order {oid} had already filled")
+        if st == "canceling" and not self._cancel_done(o):
+            raise CancelPending(f"order {oid}'s cancel was taken but it still reads {o.get('coinbase_status')} "
+                                f"(its cancel not completed)")
         if st not in ("canceled", "canceling"):
             raise CancelFailed(f"order {oid} still reads {o.get('coinbase_status') or 'unknown'} after its cancel")
         return {"id": oid, "status": st}

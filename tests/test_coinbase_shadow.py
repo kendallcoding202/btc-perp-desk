@@ -464,14 +464,22 @@ def test_the_state_round_trips_and_a_wrong_or_missing_key_refuses_without_touchi
     out = tmp_path / "gh_output"
     sh.env["GITHUB_OUTPUT"] = str(out)
     sh.env["DESK_STATE_KEY"] = "another-key-" + "z" * 30
+    runs = sh.status()["runs"]
     code, r = sh.run()
     assert code == 2 and r.problem == "key" and path.read_bytes() == second
-    assert len(fake.requests) == n and out.read_text() == "changed=false\n"
-    assert r.public_line().startswith("SHADOW BTC: refused before reading the account: key")
-    # too short, or missing: refused before any network call
-    for bad in ("short", ""):
+    # the state stays as it was; only the public status says what's wrong (the save step saves it alone)
+    assert len(fake.requests) == n and out.read_text() == "changed=true\n"
+    st = sh.status()
+    assert st["ok"] is False and st["problem"] == "key" and st["runs"] == runs
+    assert st["note"] == "DESK_STATE_KEY doesn't open the saved state"
+    assert r.public_line() == ("SHADOW BTC: refused before reading the account: DESK_STATE_KEY doesn't open the saved "
+                               "state (nothing read or sent; the state is unchanged)")
+    # too short, or missing: refused before any network call, and the status names which
+    for bad, note in (("short", "DESK_STATE_KEY is too short (it needs thirty-two characters or more)"),
+                      ("", "DESK_STATE_KEY is not set")):
         sh.env["DESK_STATE_KEY"] = bad
-        assert sh.run()[0] == 2 and len(fake.requests) == n
+        assert sh.run()[0] == 2 and len(fake.requests) == n and path.read_bytes() == second
+        assert sh.status()["note"] == note and sh.status()["runs"] == runs
     sh.env["DESK_STATE_KEY"] = KEY
     sh.env["COINBASE_CDP_KEY"] = ""
     assert sh.run()[0] == 2 and len(fake.requests) == n

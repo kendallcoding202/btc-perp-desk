@@ -1,7 +1,9 @@
 """A local fake of Coinbase's Advanced Trade API (US futures) and the Coinbase App v2 reads the desk makes, on
-127.0.0.1. Nothing here is Coinbase's: the answers are SYNTHETIC, shaped from Coinbase's API spec types (the sample
-TypeScript SDK's generated models: FCMBalanceSummary, FCMPosition, Order, Fill, NewOrderResponse, CancelOrderResponse,
-GetApiKeyPermissionsResponse, ...) and the public answers recorded in tests/fixtures/coinbase/.
+127.0.0.1. Nothing here is Coinbase's: the answers are SYNTHETIC, shaped from Coinbase's Advanced Trade OpenAPI spec
+(FCMBalanceSummary, FCMPosition, Order, Fill, NewOrderResponse, CancelOrderResponse, GetApiKeyPermissionsResponse,
+Account, ...; its enums in tests/fixtures/coinbase_spec/enums.json, and every status, reason and session state this
+fake answers is checked against them by tests/test_coinbase_spec.py) and the public answers recorded in
+tests/fixtures/coinbase/.
 
 What it checks and models, so the desk's client and broker are tested against Coinbase's documented behaviour:
   * auth: every private call's JWT is verified with the test key's public key (ES256 or EdDSA): kid = sub = the key
@@ -16,7 +18,12 @@ What it checks and models, so the desk's client and broker are tested against Co
     resting with no position opens one when it fires, two stops can flip a position;
   * sessions: while closed nothing trades and no stop triggers, market orders are refused
     (FUTURES_AFTER_HOUR_INVALID_ORDER_TYPE), stop-limits queue (QUEUED), cancels queue (CANCEL_QUEUED), and in the last
-    30 s before a reopen cancels are refused (INVALID_CANCEL_FCM_TRADING_SESSION);
+    30 s before a reopen cancels are refused (INVALID_CANCEL_FCM_TRADING_SESSION); session_state is the spec's
+    FCM_TRADING_SESSION_STATE_OPEN / _CLOSE (any other can be set);
+  * a cancel is a request: with cancel_delay_s, batch_cancel answers success and the order reads OPEN with
+    pending_cancel until the delay has passed (it can still fill meanwhile);
+  * List Orders returns only the RETAIL_ADVANCED placement source unless asked for another (the spec's default);
+  * the Coinbase App (v2) reads refuse an Ed25519 token (401): Coinbase's key page says Ed25519 isn't supported there;
   * the account: spot USD (CBI, part of it maybe on an ACH hold), futures USD (CFM), P&L realised today and not yet
     settled (daily_realized_pnl), open P&L against a basis that re-bases at the daily settlement, money in transit
     between the two accounts (a sweep), holds, and the USD wallet's v2 transactions (deposits, withdrawals, USDC sold
@@ -78,6 +85,11 @@ class FakeKey:
     def file_json(self, **extra) -> str:
         """The key file as the CDP portal's download looks (name + privateKey)."""
         return json.dumps({"name": self.name, "privateKey": self.private_text, **extra})
+
+
+def dcid(label: str) -> str:
+    """A client_order_id in the desk's form (a version-5 UUID): an order the tests treat as one the desk placed."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://github.com/kendallcoding202/btc-perp-desk/tests/{label}"))
 
 
 def key_name(label: str = "test-key-not-real") -> str:
@@ -173,6 +185,8 @@ class FakeCoinbase:
         self.transactions: list[dict] = []
         self.sweeps: list[dict] = []
         self.usd_account = "aaaaaaaa-0000-4000-8000-000000000001"
+        self.extra_accounts: list[dict] = []    # more v3 accounts (another portfolio's, say)
+        self.extra_v2_accounts: list[dict] = [] # more v2 accounts, listed first (v2 rows don't say their portfolio)
         self.usdc_account = "aaaaaaaa-0000-4000-8000-000000000002"
         self._seq = 0
         self._product = json.loads((FIX / "product.json").read_text())["calls"][0]["response"]
@@ -181,6 +195,11 @@ class FakeCoinbase:
         self.bars2h: dict[int, tuple] = {}      # TWO_HOUR candles: start (s) -> (open, high, low, close, volume)
         self.book_levels = 30                   # levels each side of the book, 100 contracts each, $5 apart
         self.book_404_when_closed = False       # Coinbase may answer no book at all while closed
+        self.session_state: str | None = None   # set: the product answers this session_state (else OPEN / CLOSE)
+        self.cancel_delay_s = 0.0               # > 0: a cancel completes this long after it's asked (pending_cancel)
+        self.band_side_codes = True             # a price-band refusal answers the spec's ..._PRICE_BAND_ON_SELL/BUY
+        self.band_fields = ("error", "new_order_failure_reason", "preview_failure_reason")   # where its code goes
+        self.realized_in_cfm = False            # the other reading of the balance: today's P&L booked into cfm at once
         self.server: ThreadingHTTPServer | None = None
 
     # ---- lifecycle
@@ -226,6 +245,15 @@ class FakeCoinbase:
     def sleep(self, s: float) -> None:
         with self.lock:
             self.now_s += max(0.0, float(s))
+            self._tick()
+
+    def _tick(self) -> None:
+        """Cancels asked for cancel_delay_s ago complete now."""
+        for o in self.orders.values():
+            if o.get("pending_cancel") and o["status"] in ("OPEN", "QUEUED") and "_cancel_at" in o and \
+                    self.now_s >= o["_cancel_at"]:
+                o["pending_cancel"] = False
+                o["status"] = "CANCELLED" if self.session_open else "CANCEL_QUEUED"
 
     def add_key(self, key: FakeKey) -> FakeKey:
         self.keys[key.name] = key
@@ -263,7 +291,7 @@ class FakeCoinbase:
 
     def equity(self) -> float:
         """The account's true value: what the desk's formula must come to."""
-        return self.cbi + self.cfm + self.upnl() + self.realized + self.pending
+        return self.cbi + self.cfm + self.upnl() + (0.0 if self.realized_in_cfm else self.realized) + self.pending
 
     def _tx(self, kind: str, amount: float, status: str = "completed", created_s: float | None = None) -> dict:
         self._seq += 1
@@ -416,7 +444,10 @@ class FakeCoinbase:
             p.n = tot
         else:
             closed = min(n, p.n)
-            self.realized += p.sign * closed * CS * (px - p.basis)
+            pnl = p.sign * closed * CS * (px - p.basis)
+            self.realized += pnl
+            if self.realized_in_cfm:
+                self.cfm += pnl
             p.n -= closed
             rest = n - closed
             if p.n == 0:
@@ -424,6 +455,8 @@ class FakeCoinbase:
             if rest > 0:                                    # through flat and out the other side
                 self.positions[o["product_id"]] = Pos("LONG" if sign > 0 else "SHORT", rest, px, px)
         self.realized -= fee
+        if self.realized_in_cfm:
+            self.cfm -= fee
         self._seq += 1
         size = f"{n * CS:.2f}" if self.fill_units == "btc" else str(n)
         self.fills.append({
@@ -462,13 +495,20 @@ class FakeCoinbase:
         return o
 
     # ---- the API
-    def _reject(self, code: str, message: str, cfg=None, preview: str | None = None):
+    ALL_FIELDS = ("error", "new_order_failure_reason", "preview_failure_reason")
+
+    def _reject(self, code: str, message: str, cfg=None, preview: str | None = None, fields=None):
+        """A refusal, as NewOrderErrorResponse: new_order_failure_reason (the current field), and the deprecated error
+        and preview_failure_reason (`preview`, else UNKNOWN_PREVIEW_FAILURE_REASON). `fields`: which of the three
+        carry their code; the others say UNKNOWN_..."""
+        fields = self.ALL_FIELDS if fields is None else fields
+        er = {"message": message, "error_details": message,
+              "error": code if "error" in fields else "UNKNOWN_FAILURE_REASON",
+              "new_order_failure_reason": code if "new_order_failure_reason" in fields else "UNKNOWN_FAILURE_REASON",
+              "preview_failure_reason": (preview or "UNKNOWN_PREVIEW_FAILURE_REASON") if "preview_failure_reason" in
+              fields else "UNKNOWN_PREVIEW_FAILURE_REASON"}
         return self.reject_status, {"success": False, "failure_reason": "UNKNOWN_FAILURE_REASON", "order_id": "",
-                                    "error_response": {"error": code, "message": message, "error_details": message,
-                                                       "preview_failure_reason": preview or
-                                                       "UNKNOWN_PREVIEW_FAILURE_REASON",
-                                                       "new_order_failure_reason": code},
-                                    "order_configuration": cfg or {}}
+                                    "error_response": er, "order_configuration": cfg or {}}
 
     def _ok_order(self, o: dict):
         return 200, {"success": True, "success_response": {"order_id": o["order_id"], "product_id": o["product_id"],
@@ -540,8 +580,10 @@ class FakeCoinbase:
                     return self._reject("INVALID_REQUEST", "limit below stop", cfg,
                                         "PREVIEW_STOP_PRICE_ABOVE_LIMIT_PRICE")
             if self.band is not None and abs(limit - self.last) / self.last > self.band:
-                return self._reject("LIMIT_PRICE_TOO_FAR_FROM_MARKET", "limit too far from market", cfg,
-                                    "PREVIEW_LIMIT_PRICE_TOO_FAR_FROM_MARKET")
+                code = (f"LIMIT_ORDER_PRICE_EXCEEDS_PRICE_BAND_ON_{body['side']}" if self.band_side_codes
+                        else "LIMIT_PRICE_TOO_FAR_FROM_MARKET")
+                return self._reject(code, "limit too far from market", cfg, "PREVIEW_" + code,
+                                    fields=self.band_fields)
             o = self._order(body, "stop", cfg, "OPEN" if self.session_open else "QUEUED")
             self._watch()
             return self._ok_order(o)
@@ -605,6 +647,10 @@ class FakeCoinbase:
             elif not self.session_open:
                 o["status"] = "CANCEL_QUEUED"
                 out.append({"success": True, "failure_reason": "UNKNOWN_CANCEL_FAILURE_REASON", "order_id": oid})
+            elif self.cancel_delay_s > 0:
+                o["pending_cancel"] = True          # taken, not done: it still rests (and could fill) meanwhile
+                o["_cancel_at"] = self.now_s + self.cancel_delay_s
+                out.append({"success": True, "failure_reason": "UNKNOWN_CANCEL_FAILURE_REASON", "order_id": oid})
             else:
                 o["status"] = "CANCELLED"
                 out.append({"success": True, "failure_reason": "UNKNOWN_CANCEL_FAILURE_REASON", "order_id": oid})
@@ -613,7 +659,7 @@ class FakeCoinbase:
     def _balance(self):
         a = self._amt
         upnl, holds = self.upnl(), self.holds()
-        avail = (self.cbi - self.cbi_hold) + self.cfm + upnl + self.realized - holds
+        avail = (self.cbi - self.cbi_hold) + self.cfm + upnl + (0.0 if self.realized_in_cfm else self.realized) - holds
         im = sum(p.n * CS * self.last * 0.21 for p in self.positions.values())
         s = {"futures_buying_power": a(max(0.0, avail - im)), "total_usd_balance": a(self.cbi + self.cfm),
              "cbi_usd_balance": a(self.cbi), "cfm_usd_balance": a(self.cfm),
@@ -646,6 +692,8 @@ class FakeCoinbase:
             return 400, {"error": "INVALID_ARGUMENT", "error_details": "cannot pair OPEN orders with other order "
                                                                       "statuses", "message": "invalid"}
         rows = sorted(self.orders.values(), key=lambda o: o["created_time"], reverse=True)
+        src = (q.get("order_placement_source") or ["RETAIL_ADVANCED"])[0]     # "By default, returns RETAIL_ADVANCED"
+        rows = [o for o in rows if o.get("order_placement_source", "RETAIL_ADVANCED") == src]
         if statuses:
             rows = [o for o in rows if o["status"] in statuses]
         if q.get("product_ids"):
@@ -657,8 +705,12 @@ class FakeCoinbase:
         size = min(int((q.get("limit") or [self.page_size])[0]), self.page_size)
         page = rows[start:start + size]
         more = start + size < len(rows)
-        return 200, {"orders": copy.deepcopy(page), "sequence": "0", "has_next": more,
+        return 200, {"orders": [self._public_order(o) for o in page], "sequence": "0", "has_next": more,
                      "cursor": str(start + size) if more else ""}
+
+    @staticmethod
+    def _public_order(o: dict) -> dict:
+        return {k: v for k, v in copy.deepcopy(o).items() if not k.startswith("_")}
 
     def _fills_list(self, q: dict):
         rows = list(reversed(self.fills))
@@ -681,8 +733,8 @@ class FakeCoinbase:
         d["mid_market_price"] = f"{self.last:.0f}"
         d["trading_disabled"] = self.trading_disabled
         d["fcm_trading_session_details"]["is_session_open"] = self.session_open
-        d["fcm_trading_session_details"]["session_state"] = ("FCM_TRADING_SESSION_STATE_OPEN" if self.session_open
-                                                             else "FCM_TRADING_SESSION_STATE_CLOSED")
+        d["fcm_trading_session_details"]["session_state"] = self.session_state or (
+            "FCM_TRADING_SESSION_STATE_OPEN" if self.session_open else "FCM_TRADING_SESSION_STATE_CLOSE")
         if self.funding_now:
             d["future_product_details"]["funding_time"] = iso(self.now_s - self.now_s % 3600)
 
@@ -762,7 +814,7 @@ class FakeCoinbase:
             if o is None:
                 return 404, {"error": "NOT_FOUND", "error_details": "order with this orderID was not found",
                              "message": "order with this orderID was not found"}
-            return 200, {"order": copy.deepcopy(o)}
+            return 200, {"order": self._public_order(o)}
         if path == f"{V3}/transaction_summary":
             return 200, {"total_volume": 0, "total_fees": 0, "fee_tier": {
                 "pricing_tier": "Advanced 1", "usd_from": "0", "usd_to": "10000", "taker_fee_rate": "0.0005",
@@ -770,6 +822,27 @@ class FakeCoinbase:
                 "margin_rate": {"value": "0.21"}, "goods_and_services_tax": None,
                 "advanced_trade_only_volume": 0, "advanced_trade_only_fees": 0, "coinbase_pro_volume": 0,
                 "coinbase_pro_fees": 0, "total_balance": "0", "has_promo_fee": False}
+        if path == f"{V3}/accounts":
+            pid = key.portfolio_uuid
+            rows = [{"uuid": self.usd_account, "name": "Cash (USD)", "currency": "USD",
+                     "available_balance": {"value": f"{self.cbi - self.cbi_hold:.2f}", "currency": "USD"},
+                     "hold": {"value": f"{self.cbi_hold:.2f}", "currency": "USD"}, "default": True, "active": True,
+                     "type": "ACCOUNT_TYPE_FIAT", "ready": True, "retail_portfolio_id": pid,
+                     "platform": "ACCOUNT_PLATFORM_CONSUMER", "created_at": iso(T0 - 86400), "updated_at": iso(T0),
+                     "deleted_at": None},
+                    {"uuid": self.usdc_account, "name": "USDC Wallet", "currency": "USDC",
+                     "available_balance": {"value": f"{self.usdc:.2f}", "currency": "USDC"},
+                     "hold": {"value": "0", "currency": "USDC"}, "default": False, "active": True,
+                     "type": "ACCOUNT_TYPE_CRYPTO", "ready": True, "retail_portfolio_id": pid,
+                     "platform": "ACCOUNT_PLATFORM_CONSUMER", "created_at": iso(T0 - 86400), "updated_at": iso(T0),
+                     "deleted_at": None},
+                    {"uuid": "aaaaaaaa-0000-4000-8000-000000000003", "name": "Futures (USD)", "currency": "USD",
+                     "available_balance": {"value": f"{self.cfm:.2f}", "currency": "USD"},
+                     "hold": {"value": "0", "currency": "USD"}, "default": False, "active": True,
+                     "type": "ACCOUNT_TYPE_FIAT", "ready": True, "retail_portfolio_id": pid,
+                     "platform": "ACCOUNT_PLATFORM_CFM_CONSUMER", "created_at": iso(T0 - 86400),
+                     "updated_at": iso(T0), "deleted_at": None}] + copy.deepcopy(self.extra_accounts)
+            return 200, {"accounts": rows, "has_next": False, "cursor": "", "size": len(rows)}
         if path == f"{V3}/portfolios":
             return 200, {"portfolios": [{"name": "Default", "uuid": key.portfolio_uuid, "type": "DEFAULT",
                                          "deleted": False}]}
@@ -811,7 +884,7 @@ class FakeCoinbase:
                     {"id": self.usdc_account, "name": "USDC Wallet", "primary": False, "type": "wallet",
                      "currency": {"code": "USDC", "name": "USDC"},
                      "balance": {"amount": f"{self.usdc:.2f}", "currency": "USDC"}, "resource": "account"}]
-            return self._v2_page(rows, q, path)
+            return self._v2_page(copy.deepcopy(self.extra_v2_accounts) + rows, q, path)
         m = re.fullmatch(r"/v2/accounts/([^/]+)/transactions", path)
         if m:
             if m.group(1) != self.usd_account:
@@ -882,8 +955,9 @@ class FakeCoinbase:
                 status, out = self._route("GET", path.replace("/market", "", 1), q, None,
                                           FakeKey("public", "none", None, None))
                 return self._send(h, rec, status, out)
+            self._tick()
             key = self._auth(method, path, h.headers.get("Authorization", ""))
-            if key is None:
+            if key is None or (path.startswith("/v2/") and key.alg == "EdDSA"):
                 return self._send(h, rec, 401, b"Unauthorized\n")
             rec["key"] = key.name
             rule = next((r for r in self.fail if r.method == method and path.startswith(r.path) and r.times > 0),

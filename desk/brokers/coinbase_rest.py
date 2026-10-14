@@ -4,8 +4,8 @@ deposits and withdrawals). Standard-library urllib, like desk/feeds/coinbase.py;
 
 What it can't do is the point:
   * GET only on READ_ALLOWLIST: the futures account, positions, orders, fills, the fee tier, key permissions, sweeps
-    (read), the margin window, products, and the v2 USD wallet's transactions. Any other path is refused before
-    anything is sent (PathNotAllowed).
+    (read), the margin window, products, the portfolio's accounts (v3), and the v2 USD wallet's transactions. Any other
+    path is refused before anything is sent (PathNotAllowed).
   * POST only with a valid Armed token (desk/coinbase_live.py, the one place that makes one, after every arming
     check), and even then only to ORDER_PATHS: create an order, batch-cancel, close a position. Without it every POST
     raises OrdersLocked before a socket opens: SHADOW holds a client built with no token, so even a bug in its overlay
@@ -24,12 +24,18 @@ Errors (all CoinbaseError; no message carries a header, a token, a 2xx body or a
        (it may have reached Coinbase: the caller reads the account before deciding anything).
   JSON {error, error_details, message} or {success: false, error_response: {...}} with HTTP 200 or 4xx (which one
        Coinbase uses isn't documented): CoinbaseRejected, carrying the codes.
+       A rejection that answers a POST resent after a try with no clear answer is CoinbaseUncertain too (carrying the
+       codes): the first try may have done it.
 A run has a deadline (deadline_s): reads give up past it (DeadlineExceeded) and the broker starts no order sequence
-whose worst case doesn't fit in what's left (fits()).
+whose worst case doesn't fit in what's left (fits()). A protective sequence (a stop put back on a position after its old
+one was cancelled, a close at market because no stop would rest) runs inside protecting(), which lets it go on PROTECT_S
+past the deadline: cutting it off half way would leave a position with no stop. The workflow's step timeout is above
+deadline + PROTECT_S.
 """
 
 from __future__ import annotations
 
+import contextlib
 import http.client
 import json
 import math
@@ -49,6 +55,7 @@ GET_RETRIES = 3
 POST_RETRIES = 2
 BACKOFF_S = 2.0
 BACKOFF_CAP_S = 20.0
+PROTECT_S = 60.0            # how far past the run's deadline a protective sequence may go (protecting())
 ERROR_BODY_MAX = 64_000
 USER_AGENT = "btc-perp-desk"
 _V3 = "/api/v3/brokerage"
@@ -67,6 +74,7 @@ READ_ALLOWLIST = tuple(re.compile(p) for p in (
     rf"{_V3}/orders/historical/{_ID}",
     rf"{_V3}/transaction_summary",
     rf"{_V3}/portfolios",
+    rf"{_V3}/accounts",
     rf"{_V3}/products/{_ID}",
     rf"{_V3}/products/{_ID}/ticker",
     rf"{_V3}/products/{_ID}/candles",
@@ -121,7 +129,13 @@ class CoinbaseUnavailable(CoinbaseError):
 
 
 class CoinbaseUncertain(CoinbaseUnavailable):
-    """A POST whose outcome isn't known: it may have reached Coinbase. Read the account before deciding anything."""
+    """A POST whose outcome isn't known: it may have reached Coinbase. Read the account before deciding anything.
+    `codes`: what Coinbase answered a later try with, when it answered with a rejection (the first try may still have
+    done it: a funds check before the client_order_id dedupe, say)."""
+
+    def __init__(self, text: str, codes: tuple = ()):
+        super().__init__(text)
+        self.codes = tuple(codes)
 
 
 class DeadlineExceeded(CoinbaseUnavailable):
@@ -175,11 +189,14 @@ class CoinbaseREST:
         self.clock = clock
         self.sleep = sleep
         self.deadline_s = deadline_s
+        self.protect_s = PROTECT_S
+        self._protecting = 0
         self.min_gap_s = min_gap_s
         self._emit, self._env = emit, env
         self.skew_s: float | None = None        # Coinbase's clock minus this machine's, once measured
         self.requests = 0
-        self.posts_sent = 0                     # non-GET requests that left this process
+        self.posts_sent = 0                     # non-GET requests that left this process (each try)
+        self.posts_paths: list[str] = []        # each order call asked for (its path's last part), for the run's report
         self.last_latency_ms = 0.0
         self._last_call: float | None = None
         # The tests' fake runs on loopback: never through a proxy from the environment
@@ -195,11 +212,26 @@ class CoinbaseREST:
         return self.clock() + (self.skew_s or 0.0)
 
     def time_left(self) -> float:
-        return math.inf if self.deadline_s is None else self.deadline_s - self.clock()
+        if self.deadline_s is None:
+            return math.inf
+        return self.deadline_s + (self.protect_s if self._protecting else 0.0) - self.clock()
 
     def fits(self, seconds: float) -> bool:
         """Whether a sequence whose worst case is `seconds` can finish before the run's deadline."""
         return self.time_left() >= seconds
+
+    @contextlib.contextmanager
+    def protecting(self):
+        """A protective sequence: it may run PROTECT_S past the deadline (module docstring)."""
+        self._protecting += 1
+        try:
+            yield self
+        finally:
+            self._protecting -= 1
+
+    @property
+    def is_protecting(self) -> bool:
+        return self._protecting > 0
 
     def server_skew(self) -> float:
         """Coinbase's clock minus this machine's, from its public time endpoint (no key). Over MAX_SKEW_S refuses:
@@ -221,18 +253,19 @@ class CoinbaseREST:
         return skew
 
     # ---- calls
-    def get(self, path: str, params: dict | None = None) -> dict:
+    def get(self, path: str, params: dict | None = None, retries: int = GET_RETRIES) -> dict:
         if not _allowed(path):
             raise PathNotAllowed(f"GET {path} isn't on the desk's list of Coinbase calls; refused before anything was "
                                  f"sent")
-        return self._request("GET", path, params, None, auth=True, retries=GET_RETRIES)
+        return self._request("GET", path, params, None, auth=True, retries=retries)
 
-    def get_pages(self, path: str, params: dict | None, items: str, max_pages: int = 10) -> list:
+    def get_pages(self, path: str, params: dict | None, items: str, max_pages: int = 10,
+                  retries: int = GET_RETRIES) -> list:
         """A v3 list read to its end, cursor by cursor (orders: has_next + cursor; fills: a non-empty cursor). More
         than `max_pages` raises: a partial list would read as fewer orders or fills than there are."""
         out, params, seen = [], dict(params or {}), set()
         for _ in range(max_pages):
-            page = self.get(path, params)
+            page = self.get(path, params, retries=retries)
             rows = page.get(items)
             if not isinstance(rows, list):
                 raise CoinbaseDataError(f"Coinbase's answer to GET {path} has no {items} list")
@@ -292,6 +325,7 @@ class CoinbaseREST:
             raise PathNotAllowed(f"{method} isn't a method the desk uses")
         url = self.base_url + path + (f"?{urllib.parse.urlencode(params, doseq=True)}" if params else "")
         sent = False
+        unclear = False             # a POST try went out and got no clear answer: it may have reached Coinbase
         last = "no answer"
         for attempt in range(retries + 1):
             if self.time_left() <= 0:
@@ -312,6 +346,8 @@ class CoinbaseREST:
             status, body, ctype = None, b"", ""
             try:
                 if method == "POST":
+                    if not sent:
+                        self.posts_paths.append(path.rsplit("/", 1)[-1])
                     sent = True
                     self.posts_sent += 1
                 with self._opener.open(req, timeout=max(1.0, min(self.timeout, self.time_left()))) as resp:
@@ -329,10 +365,19 @@ class CoinbaseREST:
             self.requests += 1
             self.last_latency_ms = (self.clock() - t) * 1000
             if status is not None:
-                out = self._answer(method, path, status, body, ctype)
+                try:
+                    out = self._answer(method, path, status, body, ctype)
+                except CoinbaseRejected as exc:
+                    if method == "POST" and unclear:
+                        raise CoinbaseUncertain(f"POST {path}: a try got no clear answer ({last}) and the next was "
+                                                f"refused ({', '.join(exc.codes) or f'HTTP {exc.status}'}): the first "
+                                                f"may have reached Coinbase", exc.codes) from None
+                    raise
                 if out is not None:
                     return out
                 last = f"HTTP {status}"
+            if method == "POST":
+                unclear = True
             if attempt == retries:
                 break
             wait = min(BACKOFF_CAP_S, BACKOFF_S * 2 ** attempt)

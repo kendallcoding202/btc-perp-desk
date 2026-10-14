@@ -25,7 +25,14 @@ One run (run_shadow):
   8. state and board encrypted (desk/statebox.py), status.json, the kills this run set, pushes, ONE public log line.
 
 The repository is public: the CLI captures stdout and stderr from its first line and keeps them only in the encrypted
-board; what reaches the Actions log is the masks and one fixed line with no amount, id or Coinbase wording.
+board; what reaches the Actions log is the masks and one fixed line with no amount, id or Coinbase wording. Pushes go to
+ntfy.sh, where anyone who knows the topic's name can read them: without NTFY_TOKEN (an ntfy access token, for a
+reserved topic) their amounts are left out (redact_amounts); the encrypted board has them.
+
+LIVE also runs a safety pass first, right after its arming and the key's permissions, before any market read: the
+position and the open orders, read fresh; a stop put back on a position that has none, any desk order left resting
+with no position cancelled, flat_kill honoured. A run that then can't read the candles or the product still leaves the
+position protected; and a run that fails after it looks once more (the watchdog) and pushes urgently.
 """
 
 from __future__ import annotations
@@ -80,9 +87,10 @@ class Stop(Exception):
     """The run stops here: `problem` for status.json (auth, permissions, clock, read, state, refused, key), `code`
     the exit code (1 a read failed, 2 refused). The text goes to the private log, the board and the phone."""
 
-    def __init__(self, problem: str, text: str, code: int = 2):
+    def __init__(self, problem: str, text: str, code: int = 2, public: str | None = None):
         super().__init__(text)
         self.problem, self.text, self.code = problem, text, code
+        self.public = public            # a fixed phrase for the public log and status.json (no amount, no digit)
 
 
 def _utc(ms: int, fmt: str = "%Y-%m-%d %H:%M UTC") -> str:
@@ -97,13 +105,32 @@ def _usd(x: float | None, dp: int = 2) -> str:
     return "—" if x is None else f"${x:,.{dp}f}"
 
 
+# What a push may not say without NTFY_TOKEN: dollar amounts, and signed or currency-tagged two-decimal figures (a
+# balance move, a P&L). Prices without a $ (a stop level, BTC's price) and contract counts stay.
+_MONEY = re.compile(r"[-+]?\$\s?-?[\d,]+(?:\.\d+)?|(?<![\w.])[-+][\d,]*\d\.\d{2}\b|\b\d[\d,]*\.\d{2}\s?USDC?\b")
+REDACTED_NOTE = ("(amounts left out: anyone who knows an ntfy.sh topic's name can read it. They're on the {mode} "
+                 "board, encrypted; set NTFY_TOKEN for a reserved topic to get them here)")
+URGENT_TITLES = {"no_stop": "NO STOP", "stray": "STOP WITH NO POSITION", "stray-foreign": "STOP WITH NO POSITION",
+                 "foreign": "AN ORDER THAT ISN'T THE DESK'S", "unprotected": "NO STOP"}
+
+
+def redact_amounts(text: str) -> str:
+    """`text` with its money amounts taken out (see _MONEY)."""
+    return _MONEY.sub("…", text)
+
+
 def ntfy_push(title: str, body: str, priority: str = "default", tags: str = "robot", env=None) -> bool:
-    """To the owner's phone (ntfy.sh, NTFY_TOPIC), if set. A failed push never stops a run."""
-    topic = ((env if env is not None else os.environ).get("NTFY_TOPIC") or "").strip()
+    """To the owner's phone (ntfy.sh, NTFY_TOPIC), if set; with NTFY_TOKEN (an ntfy access token), authenticated. A
+    failed push never stops a run."""
+    e = env if env is not None else os.environ
+    topic = (e.get("NTFY_TOPIC") or "").strip()
     if not topic:
         return False
-    req = urllib.request.Request(f"https://ntfy.sh/{topic}", data=body.encode(), method="POST",
-                                 headers={"Title": title, "Priority": priority, "Tags": tags})
+    headers = {"Title": title, "Priority": priority, "Tags": tags}
+    token = (e.get("NTFY_TOKEN") or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(f"https://ntfy.sh/{topic}", data=body.encode(), method="POST", headers=headers)
     try:
         urllib.request.urlopen(req, timeout=10).read()
         return True
@@ -297,8 +324,12 @@ class OneShot:
         if b.position is not None and not b.position.stop:
             a = f.atr[-1] or 0.0
             b.update_stop(b.position.entry_price - b.position.side.sign * p.strategy.stop_atr * a)
-            if b.position is not None:
-                desk.say(now, "risk", f"position had no stop. placed one at {b.position.stop:,.0f}.")
+            if b.position is not None and b.stop_order_id:
+                desk.say(now, "risk", f"position had no stop. placed one at {b.position.stop:,.0f}"
+                                      + (" (simulated)." if self.mode == "shadow" else "."))
+            elif b.position is not None:
+                desk.say(now, "risk", f"position had no stop and none could be placed this run (wanted at "
+                                      f"{b.position.stop:,.0f}).")
         self.spy()
         if not self.meta["last_bar_ts"]:
             # day one: show the newest close, trade from the next one (as paper and live do)
@@ -412,6 +443,11 @@ def make_on_flow(desk, broker, meta: dict, recorded: list, account: dict, say_ba
         flows_mod.rescale_brakes(desk.risk, before, fl["amount"])
         recorded.append(rec)
         handled(fl["id"], fl["amount"], fl["what"])
+        if str(fl["id"]).startswith("unexplained-"):
+            meta["unexplained"] = (list(meta.get("unexplained") or []) +
+                                   [{"id": fl["id"], "ts": fl["ts"], "amount": fl["amount"],
+                                     "text": "booked as money in or out, not profit or loss: nothing the desk can read "
+                                             "explains it"}])[-50:]
         text = flows_mod.describe(rec)
         say_bank(text)
         push(f"{title}: {'DEPOSIT' if fl['amount'] > 0 else 'WITHDRAWAL'}", text, "default", "moneybag")
@@ -421,6 +457,11 @@ def make_on_flow(desk, broker, meta: dict, recorded: list, account: dict, say_ba
 
 
 # ---------------------------------------------------------------- the real account's reads, as a checklist
+
+ED25519_REFUSED = ("COINBASE_CDP_KEY is an Ed25519 key: Coinbase's API key page says Ed25519 isn't supported by the "
+                   "Coinbase App APIs (the deposits and withdrawals the desk reads). Create the key again with "
+                   "Advanced Settings, signature algorithm ECDSA (docs/coinbase-setup.md)")
+
 
 class Checklist:
     def __init__(self):
@@ -444,6 +485,7 @@ class Checklist:
 
 
 CHECKS = {
+    "answered": "Coinbase answered",
     "key": "Key accepted (signed request)",
     "view_only": "Key is View only (can't trade, can't move money)",
     "clock": "Clock within 30 s of Coinbase",
@@ -521,6 +563,7 @@ class Run:
         self.code = 0
         self.changed = False
         self.public_note = ""
+        self.public_why: str | None = None
         self.extras: dict = {}
         self.events_said: list[str] = []
         self.board_state: dict | None = None
@@ -538,6 +581,8 @@ class Run:
         self.recorded: list = []
         self.account = new_account()
         self.kills_set: dict = {}
+        self._urgent_texts: set[str] = set()
+        self.unexplained: list[dict] = []
         self.now = int(clock() * 1000)
 
     # ---- small things
@@ -545,10 +590,21 @@ class Run:
         self.lines.append(f"{_utc(int(self.clock() * 1000), '%H:%M:%S')} {text}")
 
     def push(self, title: str, body: str, priority: str = "default", tags: str = "robot") -> None:
+        """To the phone. Without NTFY_TOKEN the topic is readable by anyone who knows its name: no amounts."""
+        if not (self.env.get("NTFY_TOKEN") or "").strip():
+            clean = redact_amounts(body)
+            body = clean if clean == body else f"{clean}\n\n{REDACTED_NOTE.format(mode=self.mode.upper())}"
         if self._push is not None:
             self._push(title, body, priority, tags)
         else:
             ntfy_push(title, body, priority, tags, self.env)
+
+    def on_urgent(self, kind: str, text: str) -> None:
+        """The broker's urgent cases (a position with no stop, a stop with no position, an order on the product that
+        isn't the desk's). LIVE: an urgent push, every time (real money). SHADOW: an alert (a simulated book)."""
+        if self.mode == "live":
+            self._urgent_texts.add(text)
+            self.push(f"{COIN} LIVE: {URGENT_TITLES.get(kind, 'URGENT')}", text, "urgent", "rotating_light")
 
     def push_alert(self, text: str) -> None:
         memo = self.account.setdefault("pushed", {})
@@ -563,7 +619,8 @@ class Run:
         self.log(f"ALERT: {text}")
         if self.desk is not None:
             self.desk.say(self.now, "risk", f"ALERT: {text}")
-        self.push_alert(text)
+        if text not in self._urgent_texts:        # pushed already, urgently
+            self.push_alert(text)
 
     @property
     def paths(self) -> dict:
@@ -580,11 +637,13 @@ class Run:
         try:
             password = statebox.check_password(self.env.get("DESK_STATE_KEY"))
         except statebox.BoxError as exc:
-            raise Stop("key", str(exc)) from None
+            short = bool(self.env.get("DESK_STATE_KEY"))
+            raise Stop("key", str(exc), public="DESK_STATE_KEY is too short (it needs thirty-two characters or more)"
+                       if short else "DESK_STATE_KEY is not set") from None
         raw = self.env.get("COINBASE_CDP_KEY") or ""
         if not raw.strip():
             raise Stop("key", "COINBASE_CDP_KEY is not set: SHADOW needs the View-only key's file (README, Coinbase "
-                              "SHADOW)")
+                              "SHADOW)", public="COINBASE_CDP_KEY is not set")
         return password, raw
 
     def kills_now(self) -> Kills:
@@ -618,18 +677,26 @@ class Run:
             key = load_cdp_key(self.env.get("COINBASE_CDP_KEY"))
         except CdpKeyError as exc:
             self.checks.add("key", CHECKS["key"], False, str(exc))
-            raise Stop("key", str(exc)) from None
+            raise Stop("key", str(exc), public="COINBASE_CDP_KEY isn't a Coinbase key file") from None
         mask_for_actions(key, emit=self.mask_emit, env=self.env)
+        if key.alg != "ES256":
+            # https://docs.cdp.coinbase.com/coinbase-app/authentication-authorization/api-key-authentication: "Do NOT
+            # select Ed25519 as it is not supported by Coinbase App APIs" (the v2 deposits and withdrawals read here)
+            self.checks.add("key", CHECKS["key"], False, ED25519_REFUSED)
+            raise Stop("key", ED25519_REFUSED, public="COINBASE_CDP_KEY isn't an ECDSA key")
         self.rest = self.client_for(key)
         try:
             skew = self.rest.server_skew()
+            self.checks.add("answered", CHECKS["answered"], True)
             self.checks.add("clock", CHECKS["clock"], True, f"{-skew + 0.0:+.1f} s")
         except ClockSkewError as exc:
+            self.checks.add("answered", CHECKS["answered"], True)
             self.checks.add("clock", CHECKS["clock"], False, str(exc))
             raise Stop("clock", str(exc)) from None
         except CoinbaseError as exc:
-            self.checks.add("clock", CHECKS["clock"], False, type(exc).__name__)
-            raise Stop("read", f"Coinbase's clock couldn't be read ({type(exc).__name__})", code=1) from None
+            self.checks.add("answered", CHECKS["answered"], False, type(exc).__name__)
+            self.checks.add("clock", CHECKS["clock"], None, "not checked: Coinbase didn't answer")
+            raise Stop("read", f"Coinbase didn't answer ({type(exc).__name__})", code=1) from None
         self.now = int(self.rest.now_s() * 1000)
         self.real = CoinbaseExchange(self.rest, memo=self.account.setdefault("adapter", {}), on_alert=self.on_alert)
         try:
@@ -663,6 +730,29 @@ class Run:
         if perms.get("portfolio_type") != "DEFAULT":
             self.on_alert(f"the key's portfolio is {perms.get('portfolio_type') or 'not said'}, not DEFAULT: US futures "
                           f"live in the Default (Primary) portfolio. Create the key on that portfolio")
+
+    def safety_pass(self, work: Path) -> None:
+        """LIVE only (LiveRun): the position's protection, before any market read. SHADOW has nothing real to
+        protect."""
+
+    def reset_halt_if_asked(self) -> None:
+        """BTC/kills.json's reset_halt_at (any new value, written by you on the coinbase-state branch): clear the
+        drawdown halt once, as `python -m desk reset-halt` does for the other desks, and say so on the board."""
+        try:
+            raw = json.loads(self.paths["kills"].read_text())
+        except (OSError, ValueError):
+            return
+        want = raw.get("reset_halt_at") if isinstance(raw, dict) else None
+        if not want or want == self.meta.get("reset_halt_seen"):
+            return
+        self.meta["reset_halt_seen"] = want
+        r = self.desk.risk
+        was = r.halt_reason
+        self.desk.reset_halt(self.broker.cash)
+        r.day_locked = ""
+        self.desk.say(self.now, "risk", f"halt reset from kills.json (reset_halt_at {want})"
+                      + (f": it was halted ({was})" if was else ": it wasn't halted") +
+                      ". Peak equity restarts from the balance now.")
 
     # ---- the market: paper's venue rules, on the authenticated reads
     def market(self, work: Path):
@@ -724,7 +814,8 @@ class Run:
             bundle = open_bundle(paths["state"], password, self.mode)
         except statebox.WrongKey:
             return self.refused_early(Stop("key", f"DESK_STATE_KEY doesn't open the saved {self.mode.upper()} state; "
-                                                  f"not starting a new one over it"))
+                                                  f"not starting a new one over it",
+                                           public="DESK_STATE_KEY doesn't open the saved state"))
         except statebox.BoxError as exc:
             return self.refused_early(Stop("state", f"the saved {self.mode.upper()} state can't be opened: {exc}"))
         work = Path(tempfile.mkdtemp(prefix=f"desk-{self.mode}-"))
@@ -743,7 +834,10 @@ class Run:
                 ok = True
             except Stop as s:
                 self.problem, self.code = s.problem, s.code
+                self.public_why = s.public
                 self.log(f"stopped: {s.text}")
+                self.broker_flags()
+                self.after_failure()
                 self.stopped(s.text)
             except Exception as exc:     # anything else, mid-run: LIVE would be in entry_kill now; so is SHADOW
                 from .brokers.coinbase_rest import CoinbaseError, CoinbaseUncertain
@@ -754,22 +848,92 @@ class Run:
                 if not transient and self.broker is not None:
                     self.kills_set["entry_kill"] = True
                     self.account["entry_kill_reason"] = {"ts": self.now, "why": f"{type(exc).__name__}: {exc}"}
-                self.stopped(f"{type(exc).__name__} while it ran" + ("" if transient else "; entry_kill is on"))
+                self.broker_flags()
+                self.after_failure()
+                self.stopped(f"{type(exc).__name__} while it ran" + (
+                    "; entry_kill is on" if self.kills_set.get("entry_kill") else ""))
             self.finish(work, password, ok)
         finally:
             shutil.rmtree(work, ignore_errors=True)
         return self.code
 
     def refused_early(self, s: Stop) -> int:
-        """Refused before the state was opened: nothing is written (the saved state stays exactly as it was)."""
+        """Refused before the state was opened: the saved state stays exactly as it was. A setup slip with the secrets
+        (problem "key") still writes the public status (no amount, no digit), so the dashboard says what's wrong
+        instead of nothing: the save step then saves the status alone, the state file as loaded."""
         self.problem, self.code = s.problem, s.code
+        self.public_why = s.public
         self.log(f"refused: {s.text}")
-        github_output(False, self.env)
+        wrote = s.problem == "key" and self.status_only(s)
+        github_output(wrote, self.env)
+        self.changed = False
         self.public_note = s.text
         if self.now % PUSH_EVERY_MS < 15 * 60_000:     # no state to remember a push in: once every 6 hours by the clock
             self.push(f"{COIN} {self.mode.upper()}: not working", f"{self.mode.upper()} didn't run: {s.text}. Nothing "
                                                                   f"was sent. Paper is unaffected.", "high", "warning")
         return self.code
+
+    def status_only(self, s: Stop) -> bool:
+        """The public status of a run refused over the secrets, on the last status's counts (same start, same runs:
+        the save step's check takes it with the state file unchanged)."""
+        p = self.paths["status"]
+        old = {}
+        if p.exists():
+            try:
+                old = json.loads(p.read_text())
+            except ValueError:
+                old = {}
+            if not isinstance(old, dict) or old.get("mode") != self.mode.upper():
+                return False        # another mode's status: not overwritten from here
+        self.dir.mkdir(parents=True, exist_ok=True)
+        st = {"v": 1, "mode": self.mode.upper(), "coin": COIN, "product": PRODUCT, "updated": self.now,
+              "started_ts": int(old.get("started_ts") or self.now), "runs": int(old.get("runs") or 0),
+              "failed_runs": int(old.get("failed_runs") or 0), "ok": False, "problem": "key",
+              "key_view_only": None, "decision": None, "would_send_last_24h": None,
+              "alerts_open": int(old.get("alerts_open") or 0), "checks_passed": None, "checks_total": None,
+              "opened": bool(old.get("opened")), "note": s.public or "a secret isn't set right"}
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps(st, indent=1) + "\n")
+        tmp.replace(p)
+        return True
+
+    def sent_note(self) -> str:
+        """What this run sent, said plainly: SHADOW never sends; LIVE says how many order requests went out."""
+        sent = list(getattr(self.rest, "posts_paths", None) or [])
+        if self.mode != "live":
+            return "Nothing was sent."
+        if not sent:
+            return "No order request was sent this run."
+        return (f"{len(sent)} order request{'s' if len(sent) != 1 else ''} went to Coinbase this run "
+                f"({', '.join(sent)}).")
+
+    def broker_flags(self) -> None:
+        """What the broker asked entries to stop for before the run stopped (a position it couldn't protect, say)."""
+        b = self.broker
+        why = getattr(b, "entry_kill_why", None) or getattr(b, "flow_gap", None)
+        if why:
+            self.kills_set["entry_kill"] = True
+            self.account["entry_kill_reason"] = {"ts": self.now, "why": why}
+
+    def after_failure(self) -> None:
+        """LIVE, a run that stopped part way: one more read-only look at the protection (the watchdog), each problem
+        pushed urgently. SHADOW: nothing real to protect."""
+        if self.mode != "live" or self.real is None:
+            return
+        try:
+            with self.real.protecting():
+                found = self.real.watchdog()
+        except Exception as exc:
+            self.log(f"watchdog: {type(exc).__name__}")
+            found = [("unprotected", f"LIVE stopped part way and couldn't read {PRODUCT}'s position and orders "
+                                     f"back: check in Coinbase that the position (if any) has its stop")] \
+                if getattr(self.rest, "posts_paths", None) else []
+        for kind, text in found:
+            if kind in ("stray", "unprotected") and text not in self._urgent_texts:
+                self._urgent_texts.add(text)
+                self.push(f"{COIN} LIVE: {URGENT_TITLES[kind]}", f"{text}. LIVE stopped part way this run: "
+                                                                 f"{self.sent_note()}", "urgent", "rotating_light")
+            self.alerts.append(text)
 
     def stopped(self, why: str) -> None:
         memo = self.account.setdefault("pushed", {})
@@ -777,13 +941,14 @@ class Run:
         if first or self.now - int(memo.get("not_working") or 0) >= PUSH_EVERY_MS:
             memo["not_working"] = self.now
             self.push(f"{COIN} {self.mode.upper()}: not working",
-                      f"{self.mode.upper()} couldn't read your Coinbase account this run: {why}. Nothing was sent. "
-                      f"Paper is unaffected.", "high", "warning")
+                      f"{self.mode.upper()} stopped part way this run: {why}. {self.sent_note()} Paper is unaffected.",
+                      "high", "warning")
 
     def body(self, work: Path, password: str, saved_desk: dict) -> None:
 
         key, perms = self.connect()
         self.check_permissions(perms)
+        self.safety_pass(work)
         vstate, rules, feed, bars, funding, ctx = self.market(work)
         self.read_account()
         self.extras = read_extras(self.real, self.account, self.now, self.log)
@@ -800,8 +965,11 @@ class Run:
         cut, _ = _wait_for_holes(self.desk, vstate, bars, feed.bar_ms, self.now, self.meta["last_bar_ts"], self.log)
         ctx, _ = _venue_context(self.desk, vstate, ctx, self.now, COINBASE)
         f = ind.compute(bars, funding, self.p)
+        if f.atr and f.atr[-1]:
+            self.meta["last_atr"] = float(f.atr[-1])      # the safety pass's level for a stop with no saved one
         kills = self.kills_now()
         self.kills_loaded = Kills(**kills.__dict__)
+        self.reset_halt_if_asked()
         shot = OneShot(self.p, self.mode, self.broker, self.desk, feed, rules, vstate, self.meta, self.recorded, kills,
                        self.kills_set, self.log, self.on_alert, self.now)
         try:
@@ -897,8 +1065,8 @@ class Run:
                         f"didn't place: no entries while they're there")
         if self.shadow is not None:
             self.shadow.set_mark(mid, self.now)
-            for text in self.shadow.advance(self.now):
-                self.events_said.append(text)
+            for kind, text in self.shadow.advance(self.now):
+                self.events_said.append((kind, text))
         saved = _read(work, "live_position.json") or {}
         self.trades0 = len(saved.get("trades") or [])
         self.pos0 = (saved.get("position") or {}).get("entry_ts")
@@ -907,8 +1075,10 @@ class Run:
                                  max_notional_usd=self.max_notional(), log=self.log, sleep=self.sleep, clock=clock_ms,
                                  allow_empty=self.mode == "shadow", unexplained_wait_ms=UNEXPLAINED_WAIT_MS,
                                  provisional_tries=PROVISIONAL_TRIES, rules=rules,
-                                 market_closed=lambda: rules.sessions.closure(clock_ms()) is not None)
+                                 market_closed=lambda: rules.sessions.closure(clock_ms()) is not None,
+                                 unexplained_as_flow=self.mode == "shadow")
         b = self.broker
+        b.on_urgent = self.on_urgent
         if self.meta.get("runs", 0) == 0 and not self.meta.get("start_equity") and b.cash > 0:
             self.meta["start_equity"] = b.cash
             self.meta["opened"] = {"ts": self.now, "amount": b.cash, "what": f"the balance when {self.mode.upper()} "
@@ -917,13 +1087,16 @@ class Run:
         if saved_desk:
             desk.load_dict(saved_desk)
         self.desk = desk
-        for ev in self.events_said:
+        for _, ev in self.events_said:
             desk.say(self.now, "risk", f"while away: {ev}")
+        for ev in getattr(self, "safety_said", []):
+            desk.say(self.now, "risk", f"safety pass: {ev}")
         self.applied: list[dict] = []
         on_flow, self.open_account = make_on_flow(desk, b, self.meta, self.recorded, self.account,
                                                   lambda text: desk.say(self.now, "bank", text), self.log, self.push,
                                                   self.mode, self.applied)
         b.on_alert = self.on_alert
+        b.on_urgent = self.on_urgent
         b.on_flow = on_flow
         for _, text in b.alerts:
             self.on_alert(text)
@@ -1081,6 +1254,7 @@ class Run:
                 f"entry_kill is on (set {_utc(reason['ts'], '%H:%M UTC')}: {reason['why']}): set it to false in "
                 f"BTC/kills.json on the coinbase-state branch once you've looked."),
             "opened": self.meta.get("opened"), "paper_check": self.paper_check, "risk": risk,
+            "unexplained": list(self.meta.get("unexplained") or []),
             "book": None if self.shadow is None else self.shadow.summary(), "alerts": self.alerts[-20:],
             "notes": [
                 "SHADOW sends no order: its key can't, and its client refuses every POST before anything is sent.",
@@ -1175,8 +1349,8 @@ class Run:
             elif rec["kind"] == "close":
                 self.push(f"{COIN} SHADOW: would SELL (no order sent)", rec["text"] + bal, "high",
                           "chart_with_downwards_trend")
-        for ev in self.events_said:
-            if "filled" in ev:
+        for kind, ev in self.events_said:
+            if kind == "stop_filled":
                 self.push(f"{COIN} SHADOW: would SELL (stop, simulated)", ev + bal, "high", "chart_with_downwards_trend")
 
     def status(self, ok: bool) -> dict:
@@ -1202,7 +1376,8 @@ class Run:
                     False if any(r["key"] == "view_only" for r in self.checks.rows) else None),
                 "decision": decision, "would_send_last_24h": ws, "alerts_open": len(self.alerts),
                 "checks_passed": self.checks.passed, "checks_total": len(self.checks.rows),
-                "opened": bool(self.meta.get("start_equity", 0) > 0)}
+                "opened": bool(self.meta.get("start_equity", 0) > 0),
+                "note": None if ok else self.public_why}
 
     def public_line(self) -> str:
         """The one line the public log gets: no amounts, no ids, no Coinbase wording."""
@@ -1214,8 +1389,10 @@ class Run:
                     f"· reads ok · {done} close{'s' if done != 1 else ''} processed · {n} order"
                     f"{'s' if n != 1 else ''} it {'would send' if self.mode == 'shadow' else 'sent'} · state saved")
         if not self.changed:
-            return f"{m} BTC: refused before reading the account: {self.problem or 'error'} (nothing read, sent or saved)"
-        return f"{m} BTC: stopped: {self.problem or 'error'} (details on your phone and in the encrypted board)"
+            why = self.public_why or self.problem or "error"
+            return f"{m} BTC: refused before reading the account: {why} (nothing read or sent; the state is unchanged)"
+        why = self.public_why or self.problem or "error"
+        return f"{m} BTC: stopped: {why} (details on your phone and in the encrypted board)"
 
 
 def run_shadow(state_dir, env, **kw) -> tuple[int, Run]:
@@ -1236,6 +1413,7 @@ class LiveRun(Run):
         self.cap, self.gate, self.force = max_notional, list(gate or []), force_unproven
         self.password: str | None = None
         self.arm_lines: list[str] = []
+        self.safety_said: list[str] = []
 
     def max_notional(self):
         return self.cap
@@ -1305,6 +1483,147 @@ class LiveRun(Run):
         self.checks.add("view_only", "Key is View + Trade, not Transfer", ok)
         if not ok:
             raise Stop("permissions", "LIVE only runs with a View + Trade key that can't move money")
+
+    # ---- the safety pass: the position's protection first, before any market read
+    def _say_safe(self, text: str) -> None:
+        self.log(f"safety pass: {text}")
+        self.safety_said.append(text)
+
+    def safety_pass(self, work: Path) -> None:
+        """Right after arming and the key's permissions, before the product, the candles or the balance are read (any
+        of which can fail, or a product change refuse the market): the position and the open orders, read fresh.
+          flat      every desk order left resting is cancelled (Coinbase has no reduce-only: it would open a
+                    position); one that won't cancel, or one that isn't the desk's, is pushed urgently
+          flat_kill the stop cancelled (confirmed), then close_position
+          no stop   one placed: at the saved stop, else the stop distance from the entry at the last ATR seen; the
+                    price already through it: closed at market. None placed: the urgent push
+        It needs only the product's id. What it can't read, it leaves to the rest of the run (which reads it all)."""
+        from .brokers import coinbase_orders as co
+        from .brokers.coinbase import CancelFailed, StopAlreadyFilled, StopThroughMarket
+        from .brokers.coinbase_rest import CoinbaseError
+        from .brokers.live import STOP_ATTEMPTS, STOP_BACKOFF_S
+
+        real = self.real
+        path = work / COIN / "live_position.json"
+        saved = _read(work, "live_position.json") or {}
+        kills = self.kills_now()
+        try:
+            pos, orders = real._fresh()
+        except CoinbaseError as exc:
+            self._say_safe(f"the position and orders couldn't be read ({type(exc).__name__}); the run reads them again")
+            return
+
+        def save(**kw) -> None:
+            if not path.exists():
+                return
+            d = _read(work, "live_position.json") or {}
+            d.update(kw)
+            _write(work, "live_position.json", d)
+
+        def seq() -> int:
+            n = int((_read(work, "live_position.json") or {}).get("order_seq") or 0)
+            save(order_seq=n + 1)
+            return n
+
+        def cancel(o) -> bool:
+            for attempt in range(STOP_ATTEMPTS):
+                if attempt:
+                    self.sleep(STOP_BACKOFF_S * 2 ** (attempt - 1))
+                try:
+                    real.cancel_order(o["id"], PRODUCT)
+                    return True
+                except StopAlreadyFilled:
+                    return True
+                except (CoinbaseError, CancelFailed):
+                    continue
+            return False
+
+        others = real.foreign_on_product()
+        if pos is None:
+            left = [o for o in orders if o["status"] == "open" and not cancel(o)]
+            if left:
+                ids = ", ".join(str(o["id"]) for o in left)
+                self.on_urgent("stray", f"STOP WITH NO POSITION: order {ids} rests on {PRODUCT} with no position and "
+                                        f"won't cancel: Coinbase has no reduce-only, so it would open a position if it "
+                                        f"fired. Cancel order {ids} in Coinbase now")
+            elif orders:
+                self._say_safe(f"flat: cancelled {len(orders)} order(s) left resting")
+            for o in others:
+                self.on_urgent("stray-foreign", f"STOP WITH NO POSITION: order {o['id']} rests on {PRODUCT} with no "
+                                                f"position, and it isn't the desk's (the desk never touches it): "
+                                                f"Coinbase has no reduce-only, so it would open a position if it "
+                                                f"fired. Cancel it in Coinbase now")
+            return
+        sign = 1 if pos["side"] == "long" else -1
+        closing = "sell" if sign > 0 else "buy"
+        n = int(pos["contracts"])
+        sp = saved.get("position") or {}
+        ets = sp.get("entry_ts") if sp.get("side") == pos["side"] else "safety"
+        stops = [o for o in orders if o["side"] == closing and o.get("triggerPrice") and o["status"] == "open"]
+
+        def close(reason: str) -> None:
+            for o in [o for o in orders if o["side"] == closing and o["status"] == "open"]:
+                if not cancel(o):
+                    self._say_safe(f"the {reason} close isn't sent: the stop {o['id']} won't cancel first (no "
+                                   f"reduce-only); the rest of the run tries again")
+                    return
+            save(close_wanted=reason)
+            try:
+                real.create_order(PRODUCT, "market", closing, n, None,
+                                  {"reduceOnly": True, "clientOrderId": real.client_order_id("close-safety", ets,
+                                                                                             seq())})
+                self._say_safe(f"closed the {pos['side']} {n} contract(s) at market ({reason.replace('_', ' ')})")
+            except CoinbaseError as exc:
+                self.on_urgent("no_stop", f"NO STOP: the {pos['side']} {n} contract(s) on {PRODUCT} had their stop "
+                                          f"cancelled for a {reason.replace('_', ' ')} close, and the close didn't go "
+                                          f"through ({type(exc).__name__}). Close it or place its stop in Coinbase "
+                                          f"now")
+
+        with real.protecting():
+            if kills.flat_kill:
+                close("flat_kill")
+                return
+            if stops:
+                return
+            level = None
+            if sp.get("side") == pos["side"] and sp.get("stop"):
+                level = float(sp["stop"])
+            elif self.meta.get("last_atr") and pos.get("entry"):
+                level = float(pos["entry"]) - sign * self.p.strategy.stop_atr * float(self.meta["last_atr"])
+            if level is None or level <= 0:
+                self.on_urgent("no_stop", f"NO STOP: the {pos['side']} {n} contract(s) on {PRODUCT} have no stop "
+                                          f"resting and the desk has no level for one yet; it places one later this "
+                                          f"run if it can read the market. Check it in Coinbase")
+                return
+            try:
+                last = real.last_trade()
+            except CoinbaseError:
+                last = None
+            if last is not None and (last[0] - level) * sign <= 0:
+                self._say_safe(f"no stop resting, and {COIN} at {last[0]:,.2f} is already through its level "
+                               f"{level:,.2f}: closing at market")
+                close("stop")
+                return
+            trig = float(co.round_price(level))
+            err = ""
+            for attempt in range(STOP_ATTEMPTS):
+                if attempt:
+                    self.sleep(STOP_BACKOFF_S * 2 ** (attempt - 1))
+                try:
+                    real.create_order(PRODUCT, "market", closing, n, trig,
+                                      {"stopLossPrice": trig,
+                                       "clientOrderId": real.client_order_id("stop-safety", ets, trig, seq())})
+                    self._say_safe(f"no stop was resting on the {pos['side']} {n} contract(s): placed one at "
+                                   f"{trig:,.0f}")
+                    return
+                except StopThroughMarket:
+                    close("stop")
+                    return
+                except CoinbaseError as exc:
+                    err = f"{type(exc).__name__}: {exc}"
+            self.on_urgent("no_stop", f"NO STOP: the {pos['side']} {n} contract(s) on {PRODUCT} have no stop resting "
+                                      f"and one couldn't be placed ({err}). Place it or close the position in Coinbase "
+                                      f"now; the desk tries again later this run and at the next one")
 
     def exchange(self, rules, feed):
         return self.real

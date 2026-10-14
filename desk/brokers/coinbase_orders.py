@@ -37,8 +37,21 @@ STOP_LIMIT_OFFSET = 0.05            # the stop-limit's limit, past its trigger (
 STOP_LIMIT_FALLBACKS = (0.05, 0.02, 0.01)   # tighter limits tried if a price band refuses the 5% one
 CID_NS = uuid.uuid5(uuid.NAMESPACE_URL, "https://github.com/kendallcoding202/btc-perp-desk/coinbase-orders")
 
-OPEN_STATUSES = {"OPEN": "open", "PENDING": "open", "QUEUED": "open", "CANCEL_QUEUED": "canceling",
-                 "FILLED": "closed", "CANCELLED": "canceled", "EXPIRED": "canceled", "FAILED": "canceled"}
+# OrderExecutionStatus (the spec) -> the desk's view. EDIT_QUEUED: an edit waiting for the reopen (futures orders can't
+# be edited, so the desk never asks; it still rests). UNKNOWN_ORDER_STATUS isn't here: parse_order raises on it.
+OPEN_STATUSES = {"OPEN": "open", "PENDING": "open", "QUEUED": "open", "EDIT_QUEUED": "open",
+                 "CANCEL_QUEUED": "canceling", "FILLED": "closed", "CANCELLED": "canceled", "EXPIRED": "canceled",
+                 "FAILED": "canceled"}
+DESK_SOURCE = "RETAIL_ADVANCED"     # order_placement_source of orders sent through the Advanced Trade API
+
+
+def is_desk_cid(cid) -> bool:
+    """Whether a client_order_id has the desk's form (a version-5 UUID, client_order_id() below). An order placed in the
+    Coinbase app or by hand carries another (or none): never the desk's, whatever product it's on."""
+    try:
+        return uuid.UUID(str(cid)).version == 5
+    except (TypeError, ValueError, AttributeError):
+        return False
 
 
 def client_order_id(kind: str, coin: str, *parts) -> str:
@@ -222,11 +235,16 @@ def parse_position(p: dict) -> dict | None:
 def parse_order(o: dict) -> dict:
     """One order (GET /orders/historical/...), as a ccxt-shaped dict LiveBroker reads. Stop-limits carry triggerPrice
     (stop_price) and price (limit_price); reduceOnly is None, never False: Coinbase has no such field, so it says
-    nothing either way. CANCEL_QUEUED (a cancel waiting for the market to reopen) is 'canceling': still resting, not
-    counted as protection. UNKNOWN_ORDER_STATUS raises."""
+    nothing either way. CANCEL_QUEUED (a cancel waiting for the market to reopen), and an open order whose cancel has
+    been asked for and isn't done yet (pending_cancel, "Whether a cancel request has been initiated for the order, and
+    not yet completed"), are 'canceling': still resting, not counted as protection, and not gone either (it can still
+    fill until its cancel completes). UNKNOWN_ORDER_STATUS raises."""
     raw = str(o.get("status") or "")
     if raw not in OPEN_STATUSES:
         raise CoinbaseDataError(f"order {o.get('order_id')} has status {raw or 'missing'}: not acted on")
+    status = OPEN_STATUSES[raw]
+    if status == "open" and o.get("pending_cancel") is True:
+        status = "canceling"
     cfg = o.get("order_configuration") or {}
     typ, size, trig, limit, direction = "other", None, None, None, None
     if "market_market_ioc" in cfg or "market_market_fok" in cfg:
@@ -245,8 +263,9 @@ def parse_order(o: dict) -> dict:
     avg = amount(o.get("average_filled_price"), "average_filled_price", required=False)
     fee = amount(o.get("total_fees"), "total_fees", required=False)
     return {"id": str(o.get("order_id")), "clientOrderId": o.get("client_order_id"), "symbol": o.get("product_id"),
-            "side": str(o.get("side") or "").lower() or None, "type": typ, "status": OPEN_STATUSES[raw],
-            "coinbase_status": raw, "amount": size, "filled": filled,
+            "side": str(o.get("side") or "").lower() or None, "type": typ, "status": status,
+            "coinbase_status": raw + (" (cancel pending)" if status == "canceling" and raw != "CANCEL_QUEUED" else ""),
+            "placement": o.get("order_placement_source"), "amount": size, "filled": filled,
             "remaining": None if size is None else max(0.0, size - filled),
             "average": avg if avg else None, "price": limit, "triggerPrice": trig, "stopDirection": direction,
             "triggerStatus": o.get("trigger_status"), "reduceOnly": None,
@@ -284,7 +303,9 @@ def parse_permissions(resp: dict) -> dict:
 
 # The Coinbase App's transaction types (https://docs.cdp.coinbase.com/coinbase-app/track-apis/transactions). An amount
 # "can be positive (credit) or negative (debit)", but which types carry a sign isn't pinned down, so the direction
-# comes from the type alone and the size from abs(amount): +1 money in, -1 money out, 0 inside the account.
+# comes from the type and the size from abs(amount): +1 money in, -1 money out, 0 inside the account. A transfer
+# ("Transfer funds between two of your own accounts": another portfolio, say) can go either way, so its direction is
+# its amount's sign (None below). None of these is trading: the desk's own P&L never comes through the USD wallet.
 FLOW_TYPES = {
     "fiat_deposit": (+1, "bank deposit"),
     "fiat_withdrawal": (-1, "bank withdrawal"),
@@ -292,6 +313,13 @@ FLOW_TYPES = {
     "fcm_futures_usdc_sell_additional_encumberment_rollup":
         (+1, "USDC turned into USD for margin: money in from your USDC, not profit"),
     "derivatives_settlement": (0, "daily transfer between the futures and spot accounts"),
+    "transfer": (None, "transfer between your own Coinbase accounts or portfolios"),
+    "subscription": (-1, "Coinbase subscription charge (not trading)"),
+    "subscription_rebate": (+1, "Coinbase subscription rebate (not trading)"),
+    "clawback": (-1, "Coinbase clawback of money paid out before (not trading)"),
+    "incentives_shared_clawback": (-1, "Coinbase incentive clawback (not trading)"),
+    "earn_payout": (+1, "Coinbase earn payout (not trading)"),
+    "incentives_rewards_payout": (+1, "Coinbase rewards payout (not trading)"),
 }
 FINAL = {"completed"}
 CANDIDATE = {"pending", "waiting_for_clearing"}
@@ -324,6 +352,10 @@ def parse_flow(tx: dict) -> tuple[float, str] | None:
         raise UnknownLedgerEntry(f"a Coinbase {kind} without a readable amount") from None
     if not math.isfinite(v):
         raise UnknownLedgerEntry(f"a Coinbase {kind} without a readable amount")
+    if sign is None:            # a transfer: either way, as its amount says
+        if v == 0:
+            raise UnknownLedgerEntry(f"a Coinbase {kind} of zero: its direction isn't clear")
+        sign = 1 if v > 0 else -1
     if sign > 0 and v < 0:
         raise UnknownLedgerEntry(f"a Coinbase {kind} (money in) with a negative amount: its direction isn't clear")
     na = tx.get("native_amount") if isinstance(tx.get("native_amount"), dict) else {}

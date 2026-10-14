@@ -76,7 +76,7 @@ def test_a_key_without_the_permission_gets_403_missing_scopes(fake):
 
 def test_reads_off_the_allowlist_are_refused_before_anything_is_sent(fake):
     c = client(fake)
-    for path in (f"{V3}/accounts", f"{V3}/payment_methods", f"{V3}/orders/historical/../../v2/user",
+    for path in (f"{V3}/accounts/x", f"{V3}/payment_methods", f"{V3}/orders/historical/../../v2/user",
                  f"{V3}/cfm/positions/../sweeps", "/v2/user", f"{V3}/key_permissions?x=1", f"{V3}/orders%2fedit"):
         with pytest.raises(cr.PathNotAllowed):
             c.get(path)

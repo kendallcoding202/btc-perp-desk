@@ -9,7 +9,7 @@ import pytest
 from desk.brokers import coinbase as cb
 from desk.brokers.coinbase_rest import CoinbaseDataError, OrdersLocked
 from desk.brokers.live import LiveSetupError
-from fake_coinbase import PRODUCT, FakeCoinbase, Pos, arm_rest, view_rest
+from fake_coinbase import PRODUCT, FakeCoinbase, Pos, arm_rest, dcid, view_rest
 
 
 @pytest.fixture
@@ -132,14 +132,17 @@ def test_positions_and_orders_on_other_products_are_someone_elses_and_block_entr
 
 def test_open_orders_read_open_then_pending_queued_and_cancel_queued(fake):
     for status in ("OPEN", "QUEUED", "PENDING", "CANCEL_QUEUED", "CANCELLED", "FILLED"):
-        fake._order({"product_id": PRODUCT, "side": "SELL", "client_order_id": f"c-{status}"}, "stop",
+        fake._order({"product_id": PRODUCT, "side": "SELL", "client_order_id": dcid(f"c-{status}")}, "stop",
                     {"stop_limit_stop_limit_gtc": {"base_size": "1", "stop_price": "80000", "limit_price": "76000",
                                                    "stop_direction": "STOP_DIRECTION_STOP_DOWN"}}, status)
     ex = adapter(view_rest(fake))
     got = {o["coinbase_status"]: o["status"] for o in ex.fetch_open_orders(PRODUCT)}
     assert got == {"OPEN": "open", "QUEUED": "open", "PENDING": "open", "CANCEL_QUEUED": "canceling"}
-    reads = [r["query"].get("order_status") for r in fake.requests if r["path"].endswith("/batch")]
-    assert reads == [["OPEN"], ["PENDING", "QUEUED", "CANCEL_QUEUED"]]
+    reads = [(r["query"].get("order_status"), r["query"].get("order_placement_source"))
+             for r in fake.requests if r["path"].endswith("/batch")]
+    rest = ["PENDING", "QUEUED", "CANCEL_QUEUED", "EDIT_QUEUED"]
+    # the default source (RETAIL_ADVANCED, the API's), then the app's (RETAIL_SIMPLE): Coinbase lists one at a time
+    assert reads == [(["OPEN"], None), (rest, None), (["OPEN"], ["RETAIL_SIMPLE"]), (rest, ["RETAIL_SIMPLE"])]
 
 
 def test_fills_are_this_products_by_entry_id_and_adjusted_rows_are_alerted_once(fake):
@@ -147,7 +150,7 @@ def test_fills_are_this_products_by_entry_id_and_adjusted_rows_are_alerted_once(
     alerts: list[str] = []
     ex = adapter(rest, alerts)
     ex.load_markets()
-    res = ex.create_order(PRODUCT, "market", "buy", 2, 83_000, {"clientOrderId": "e-1"})
+    res = ex.create_order(PRODUCT, "market", "buy", 2, 83_000, {"clientOrderId": dcid("e-1")})
     assert res["status"] == "closed" and res["filled"] == 2.0 and res["average"] == pytest.approx(fake.ask)
     fake.fills.append({**fake.fills[-1], "entry_id": "adj-1", "trade_type": "CORRECTION"})
     t1 = ex.fetch_my_trades(PRODUCT, fake.clock_ms() - 60_000)
@@ -170,7 +173,7 @@ def test_the_ledger_is_the_usd_wallets_transactions_with_stable_ids_and_statuses
     fake.set_status(d, "completed", credit=500.0)
     again = ex.fetch_ledger(None, fake.clock_ms())
     assert again[0]["id"] == rows[0]["id"] and again[0]["status"] == "final"
-    assert ex.wallets() == {"usd_account": fake.usd_account, "usdc": 0.0}
+    assert ex.wallets() == {"usd_account": fake.usd_account, "usdc": 0.0, "usd_hold": 0.0}
 
 
 def test_the_ledger_reads_back_two_weeks_and_no_further(fake):
@@ -187,10 +190,10 @@ def test_without_an_armed_client_no_order_goes_out(fake):
     ex = adapter(view_rest(fake))
     ex.load_markets()
     with pytest.raises(OrdersLocked):
-        ex.create_order(PRODUCT, "market", "buy", 1, 83_000, {"clientOrderId": "x"})
+        ex.create_order(PRODUCT, "market", "buy", 1, 83_000, {"clientOrderId": dcid("x")})
     fake.positions[PRODUCT] = Pos("LONG", 1, 83_000.0, 83_000.0)
     with pytest.raises(OrdersLocked):
-        ex.create_order(PRODUCT, "market", "sell", 1, 80_000, {"clientOrderId": "y", "stopLossPrice": 80_000})
+        ex.create_order(PRODUCT, "market", "sell", 1, 80_000, {"clientOrderId": dcid("y"), "stopLossPrice": 80_000})
     assert fake.non_get() == []
 
 
@@ -199,17 +202,17 @@ def test_a_stop_that_would_be_more_than_the_position_or_with_no_position_is_refu
     ex = adapter(rest)
     ex.load_markets()
     with pytest.raises(cb.OrderRefused, match="no position"):
-        ex.create_order(PRODUCT, "market", "sell", 1, 80_000, {"clientOrderId": "s0", "stopLossPrice": 80_000})
-    ex.create_order(PRODUCT, "market", "buy", 2, 83_000, {"clientOrderId": "e1"})
+        ex.create_order(PRODUCT, "market", "sell", 1, 80_000, {"clientOrderId": dcid("s0"), "stopLossPrice": 80_000})
+    ex.create_order(PRODUCT, "market", "buy", 2, 83_000, {"clientOrderId": dcid("e1")})
     with pytest.raises(cb.OrderRefused, match="doesn't close"):
-        ex.create_order(PRODUCT, "market", "buy", 1, 85_000, {"clientOrderId": "s1", "stopLossPrice": 85_000})
-    ex.create_order(PRODUCT, "market", "sell", 2, 80_000, {"clientOrderId": "s2", "stopLossPrice": 80_000})
+        ex.create_order(PRODUCT, "market", "buy", 1, 85_000, {"clientOrderId": dcid("s1"), "stopLossPrice": 85_000})
+    ex.create_order(PRODUCT, "market", "sell", 2, 80_000, {"clientOrderId": dcid("s2"), "stopLossPrice": 80_000})
     with pytest.raises(cb.OrderRefused, match="would open a position"):
-        ex.create_order(PRODUCT, "market", "sell", 1, 79_000, {"clientOrderId": "s3", "stopLossPrice": 79_000})
+        ex.create_order(PRODUCT, "market", "sell", 1, 79_000, {"clientOrderId": dcid("s3"), "stopLossPrice": 79_000})
     with pytest.raises(cb.OrderRefused, match="already rests"):
-        ex.create_order(PRODUCT, "market", "buy", 1, 83_000, {"clientOrderId": "e2"})
+        ex.create_order(PRODUCT, "market", "buy", 1, 83_000, {"clientOrderId": dcid("e2")})
     with pytest.raises(cb.OrderRefused, match="it would open the other way"):
-        ex.create_order(PRODUCT, "market", "sell", 3, 83_000, {"clientOrderId": "c1", "reduceOnly": True})
+        ex.create_order(PRODUCT, "market", "sell", 3, 83_000, {"clientOrderId": dcid("c1"), "reduceOnly": True})
     with pytest.raises(cb.OrderRefused, match="clientOrderId"):
         ex.create_order(PRODUCT, "market", "sell", 1, 83_000, {"reduceOnly": True})
     assert len(fake.stops()) == 1 and len([r for r in fake.non_get()]) == 2
@@ -219,9 +222,9 @@ def test_a_stop_through_the_market_is_said_as_such(fake):
     rest = arm_rest(fake)
     ex = adapter(rest)
     ex.load_markets()
-    ex.create_order(PRODUCT, "market", "buy", 1, 83_000, {"clientOrderId": "e1"})
+    ex.create_order(PRODUCT, "market", "buy", 1, 83_000, {"clientOrderId": dcid("e1")})
     with pytest.raises(cb.StopThroughMarket):
-        ex.create_order(PRODUCT, "market", "sell", 1, 83_500, {"clientOrderId": "s1", "stopLossPrice": 83_500})
+        ex.create_order(PRODUCT, "market", "sell", 1, 83_500, {"clientOrderId": dcid("s1"), "stopLossPrice": 83_500})
 
 
 def test_a_price_band_refusing_the_5pct_limit_is_retried_at_2_then_1pct(fake):
@@ -229,9 +232,9 @@ def test_a_price_band_refusing_the_5pct_limit_is_retried_at_2_then_1pct(fake):
     alerts: list[str] = []
     ex = adapter(rest, alerts)
     ex.load_markets()
-    ex.create_order(PRODUCT, "market", "buy", 1, 83_000, {"clientOrderId": "e1"})
+    ex.create_order(PRODUCT, "market", "buy", 1, 83_000, {"clientOrderId": dcid("e1")})
     fake.band = 0.06            # a limit more than 6% from the last trade (83,000) is refused: 5% past 80,000 is 8.4%
-    o = ex.create_order(PRODUCT, "market", "sell", 1, 80_000, {"clientOrderId": "s1", "stopLossPrice": 80_000})
+    o = ex.create_order(PRODUCT, "market", "sell", 1, 80_000, {"clientOrderId": dcid("s1"), "stopLossPrice": 80_000})
     assert o["price"] == 78_400.0 and any("trying 2%" in a for a in alerts)
 
 
@@ -239,27 +242,27 @@ def test_a_reused_client_id_whose_order_is_gone_is_said_stale(fake):
     rest = arm_rest(fake)
     ex = adapter(rest)
     ex.load_markets()
-    ex.create_order(PRODUCT, "market", "buy", 1, 83_000, {"clientOrderId": "e1"})
-    s = ex.create_order(PRODUCT, "market", "sell", 1, 80_000, {"clientOrderId": "s1", "stopLossPrice": 80_000})
+    ex.create_order(PRODUCT, "market", "buy", 1, 83_000, {"clientOrderId": dcid("e1")})
+    s = ex.create_order(PRODUCT, "market", "sell", 1, 80_000, {"clientOrderId": dcid("s1"), "stopLossPrice": 80_000})
     ex.cancel_order(s["id"])
     with pytest.raises(cb.StaleClientOrderId):
-        ex.create_order(PRODUCT, "market", "sell", 1, 80_000, {"clientOrderId": "s1", "stopLossPrice": 80_000})
+        ex.create_order(PRODUCT, "market", "sell", 1, 80_000, {"clientOrderId": dcid("s1"), "stopLossPrice": 80_000})
 
 
 def test_cancel_outcomes_map_to_what_the_broker_does_next(fake):
     rest = arm_rest(fake)
     ex = adapter(rest)
     ex.load_markets()
-    ex.create_order(PRODUCT, "market", "buy", 1, 83_000, {"clientOrderId": "e1"})
-    s = ex.create_order(PRODUCT, "market", "sell", 1, 80_000, {"clientOrderId": "s1", "stopLossPrice": 80_000})
+    ex.create_order(PRODUCT, "market", "buy", 1, 83_000, {"clientOrderId": dcid("e1")})
+    s = ex.create_order(PRODUCT, "market", "sell", 1, 80_000, {"clientOrderId": dcid("s1"), "stopLossPrice": 80_000})
     assert ex.cancel_order(s["id"]) == {"id": s["id"], "status": "canceled"}
     assert ex.cancel_order(s["id"])["status"] == "canceled"            # DUPLICATE_CANCEL_REQUEST, read back
-    s2 = ex.create_order(PRODUCT, "market", "sell", 1, 80_000, {"clientOrderId": "s2", "stopLossPrice": 80_000})
+    s2 = ex.create_order(PRODUCT, "market", "sell", 1, 80_000, {"clientOrderId": dcid("s2"), "stopLossPrice": 80_000})
     fake.trade(79_990)                                                  # it fires and fills
     with pytest.raises(cb.StopAlreadyFilled):
         ex.cancel_order(s2["id"])
-    ex.create_order(PRODUCT, "market", "buy", 1, 80_000, {"clientOrderId": "e2"})
-    s3 = ex.create_order(PRODUCT, "market", "sell", 1, 78_000, {"clientOrderId": "s3", "stopLossPrice": 78_000})
+    ex.create_order(PRODUCT, "market", "buy", 1, 80_000, {"clientOrderId": dcid("e2")})
+    s3 = ex.create_order(PRODUCT, "market", "sell", 1, 78_000, {"clientOrderId": dcid("s3"), "stopLossPrice": 78_000})
     fake.close_market()
     fake.no_cancel_phase = True
     with pytest.raises(cb.SessionClosed):
@@ -274,11 +277,11 @@ def test_a_market_order_while_closed_is_said_closed_and_a_stop_queues(fake):
     rest = arm_rest(fake)
     ex = adapter(rest)
     ex.load_markets()
-    ex.create_order(PRODUCT, "market", "buy", 1, 83_000, {"clientOrderId": "e1"})
+    ex.create_order(PRODUCT, "market", "buy", 1, 83_000, {"clientOrderId": dcid("e1")})
     fake.close_market()
     with pytest.raises(cb.SessionClosed):
-        ex.create_order(PRODUCT, "market", "sell", 1, 83_000, {"clientOrderId": "c1", "reduceOnly": True})
-    o = ex.create_order(PRODUCT, "market", "sell", 1, 80_000, {"clientOrderId": "s1", "stopLossPrice": 80_000})
+        ex.create_order(PRODUCT, "market", "sell", 1, 83_000, {"clientOrderId": dcid("c1"), "reduceOnly": True})
+    o = ex.create_order(PRODUCT, "market", "sell", 1, 80_000, {"clientOrderId": dcid("s1"), "stopLossPrice": 80_000})
     assert o["coinbase_status"] == "QUEUED" and o["status"] == "open"
 
 

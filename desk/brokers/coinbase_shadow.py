@@ -137,6 +137,15 @@ class ShadowCoinbase:
     def session_open(self):
         return self.real.session_open()
 
+    def halted(self) -> bool:
+        return self.real.halted()
+
+    def cancels_refused(self) -> bool:
+        return self.real.cancels_refused()
+
+    def protecting(self):
+        return self.real.protecting()
+
     def client_order_id(self, kind: str, *parts) -> str:
         return self.real.client_order_id(kind, *parts)
 
@@ -559,20 +568,22 @@ class ShadowCoinbase:
         if (sell and c["high"] >= limit) or (not sell and c["low"] <= limit):
             self._fill(o, o["n"] - o["filled"], limit, ts)
 
-    def advance(self, now_ms: int) -> list[str]:
+    def advance(self, now_ms: int) -> list[tuple[str, str]]:
         """Play the time since the last run: every resting virtual stop against each closed 5-minute candle, in
-        order, and the funding hours. Returns what happened, for the board."""
+        order, and the funding hours. Returns what happened, for the board, as (kind, text): 'stop_filled' (a simulated
+        stop filled), 'stop_unfilled' (it triggered, its limit was passed: no fill), 'replay_gap'."""
         b = self.book
         start = b.get("checked_until_ts")
-        said: list[str] = []
+        said: list[tuple[str, str]] = []
         resting = [o for o in b["orders"].values() if o["status"] in ("OPEN", "QUEUED") and o["kind"] == "stop"]
         if start is None or (b["position"] is None and not resting):
             b["checked_until_ts"] = now_ms - now_ms % (FIVE_MIN_S * 1000)
             self._charge_funding(now_ms, self.mark)
             return said
         if now_ms - start > REPLAY_MAX_MS:
-            said.append(f"SHADOW last ran {(now_ms - start) / 3600_000:.0f} h ago: only the last "
-                        f"{REPLAY_MAX_MS // 3600_000} h of 5-minute candles are replayed against the virtual stop")
+            said.append(("replay_gap", f"SHADOW last ran {(now_ms - start) / 3600_000:.0f} h ago: only the last "
+                                       f"{REPLAY_MAX_MS // 3600_000} h of 5-minute candles are replayed against the "
+                                       f"virtual stop"))
             start = now_ms - REPLAY_MAX_MS
         rows = self._candles(start // 1000, now_ms // 1000)
         last_px = None
@@ -588,12 +599,14 @@ class ShadowCoinbase:
                 before = o["filled"]
                 self._play(o, c)
                 if o["filled"] > before:
-                    said.append(f"the virtual stop at {_usd(o['stop'], 0)} filled at {_usd(o['avg'])} "
-                                f"({time.strftime('%H:%M', time.gmtime(c['start']))} UTC 5-minute candle)")
+                    said.append(("stop_filled", f"the simulated stop at {_usd(o['stop'], 0)} filled at "
+                                                f"{_usd(o['avg'])} ({time.strftime('%H:%M', time.gmtime(c['start']))} "
+                                                f"UTC 5-minute candle)"))
                 elif o.get("trigger") == "STOP_TRIGGERED" and not o.get("said_unfilled"):
                     o["said_unfilled"] = True
-                    said.append(f"the virtual stop at {_usd(o['stop'], 0)} triggered but its limit "
-                                f"{_usd(o['limit'], 0)} was passed: unfilled, as a stop-limit on Coinbase would be")
+                    said.append(("stop_unfilled", f"the simulated stop at {_usd(o['stop'], 0)} triggered but its "
+                                                  f"limit {_usd(o['limit'], 0)} was passed: no simulated fill, as a "
+                                                  f"stop-limit on Coinbase wouldn't fill there"))
             last_px = c["close"]
             b["checked_until_ts"] = end_ms
         self._charge_funding(now_ms, self.mark or last_px)

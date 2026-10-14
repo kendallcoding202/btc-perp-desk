@@ -39,7 +39,7 @@
   function statusHtml(st, now) {
     if (!st) return "No SHADOW status yet: SHADOW starts once the COINBASE_CDP_KEY and DESK_STATE_KEY secrets are set (docs/coinbase-setup.md).";
     const stale = now - st.updated > STALE_MS;
-    const state = !st.ok ? `<b class="bad">NOT WORKING (${esc(st.problem || "error")})</b>` : stale ? `<b class="bad">NOT UPDATED for ${ago(st.updated, now)}</b>` : `<b class="ok">OK</b>`;
+    const state = !st.ok ? `<b class="bad">NOT WORKING (${esc(st.problem || "error")})</b>` + (st.note ? `: ${esc(st.note)}` : "") : stale ? `<b class="bad">NOT UPDATED for ${ago(st.updated, now)}</b>` : `<b class="ok">OK</b>`;
     return `${esc(st.mode)} ${state} · updated ${when(st.updated)} (${ago(st.updated, now)}) · run ${esc(st.runs)}` +
       (st.failed_runs ? ` (${esc(st.failed_runs)} failed)` : "") +
       ` · key ${st.key_view_only ? "View only" : st.key_view_only === false ? "<b class='bad'>NOT view only</b>" : "not checked"}` +

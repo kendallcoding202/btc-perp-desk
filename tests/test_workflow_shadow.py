@@ -57,7 +57,7 @@ def test_the_key_and_the_password_reach_one_step_only():
     holders = [s.get("name") for s in job["steps"] if "secrets." in str(s)]
     assert holders == ["SHADOW run (reads the real account, sends nothing)"]
     run = next(s for s in job["steps"] if s.get("id") == "shadow")
-    assert set(run["env"]) == {"COINBASE_CDP_KEY", "DESK_STATE_KEY", "NTFY_TOPIC", "DESK_COINBASE_KILL"}
+    assert set(run["env"]) == {"COINBASE_CDP_KEY", "DESK_STATE_KEY", "NTFY_TOPIC", "NTFY_TOKEN", "DESK_COINBASE_KILL"}
     assert run["run"].startswith("python -m desk shadow --coin BTC") and run["timeout-minutes"] <= 6
     assert TEXT.count("secrets.COINBASE_CDP_KEY") == 2 and TEXT.count("secrets.DESK_STATE_KEY") == 2   # SHADOW_ON too
 
