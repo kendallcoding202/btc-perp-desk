@@ -789,10 +789,10 @@
     el.hidden = !st;
     if (!st) return;
     const age = Math.round((Date.now() - st.updated) / 60000), stale = age > 60;
-    el.className = `panel shadow-link${!st.ok || stale ? " bad" : ""}`;
+    el.className = `panel shadow-link${!st.ok || stale || st.note ? " bad" : ""}`;
     el.innerHTML = `<b>BTC SHADOW</b><span class="mode shadow">SHADOW</span><span>real Coinbase account · read only · ` +
-      `no orders sent · ${st.ok && !stale ? `updated ${age} min ago` : !st.ok ? `not working (${esc(st.problem || "error")})` +
-      (st.note ? `: ${esc(st.note)}` : "") :
+      `no orders sent · ${st.ok && !stale ? `updated ${age} min ago` + (st.note ? ` · ${esc(st.note)}` : "") :
+      !st.ok ? `not working (${esc(st.problem || "error")})` + (st.note ? `: ${esc(st.note)}` : "") :
       `not updated for ${age} min`} · open →</span>`;
   }
 

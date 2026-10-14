@@ -30,6 +30,9 @@ const m = require(process.argv[2]);
   out.html = m.boardHtml(board, board.updated + 60000);
   out.status = m.statusHtml(JSON.parse(fs.readFileSync(process.argv[5])), board.updated + 60000);
   out.stale = m.statusHtml(JSON.parse(fs.readFileSync(process.argv[5])), board.updated + 3 * 3600000);
+  out.noted = m.statusHtml(Object.assign(JSON.parse(fs.readFileSync(process.argv[5])),
+    { note: "BTC/kills.json on the coinbase-state branch can't be read: read as entry_kill on, no new entries" }),
+    board.updated + 60000);
   out.none = m.statusHtml(null, Date.now());
   console.log(JSON.stringify(out));
 })().catch((e) => { console.log(JSON.stringify({ error: String(e) })); process.exit(1); });
@@ -69,6 +72,8 @@ def test_the_page_opens_the_encrypted_board_with_webcrypto_and_renders_it(tmp_pa
     assert "REAL ACCOUNT (COINBASE)" in out["html"] and "SHADOW (EST.)" in out["html"] and "NONE SENT" in out["html"]
     assert "View only" in out["status"] and "OK" in out["status"] and "NOT UPDATED" in out["stale"]
     assert "No SHADOW status yet" in out["none"]
+    # a run that's OK can still have something to say (an unreadable kills.json): the status shows it
+    assert "OK" in out["noted"] and "kills.json on the coinbase-state branch can't be read" in out["noted"]
 
 
 def test_the_main_board_links_the_shadow_page_only_once_it_has_a_status_and_never_as_a_tab():
@@ -77,6 +82,7 @@ def test_the_main_board_links_the_shadow_page_only_once_it_has_a_status_and_neve
     assert 'id="shadow-link" href="shadow.html" hidden' in html
     assert 'const ACCOUNTS = ["BTC", "ETH", "SOL", "VT"];' in app            # the tabs (and the ALL total) are as before
     assert "boards/BTC-SHADOW.status.json" in app and "el.hidden = !st;" in app
+    assert "`updated ${age} min ago` + (st.note ?" in app             # the note shows on an OK run too
     page = (ROOT / "dashboard" / "shadow.js").read_text()
     assert "sessionStorage" in page and 'BOARD_AAD = "btc-perp-desk:board-shadow:BTC"' in page
     assert "fetch(" in page and "method" not in page.split("async function fetchJson")[1].split("}")[0]  # GETs only

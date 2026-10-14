@@ -81,7 +81,8 @@ def _status(runs=1, started=1_000, mode="SHADOW", **kw):
             "would_send_last_24h": 0, "alerts_open": 0, "checks_passed": 10, "checks_total": 10, "opened": False, **kw}
 
 
-def _state_dir(path: Path, runs=1, started=1_000, mode="SHADOW", state=None, kills_set=None, extra=None) -> Path:
+def _state_dir(path: Path, runs=1, started=1_000, mode="SHADOW", state=None, kills_set=None, extra=None,
+               status_kw=None) -> Path:
     d = path / "BTC"
     d.mkdir(parents=True, exist_ok=True)
     m = mode.lower()
@@ -89,7 +90,7 @@ def _state_dir(path: Path, runs=1, started=1_000, mode="SHADOW", state=None, kil
                                             statebox.seal_json({"runs": runs}, PW, statebox.state_aad(m), iterations=IT))
     (d / f"board-{m}.enc.json").write_text(statebox.seal_json({"b": runs}, PW, statebox.board_aad(m), compress=False,
                                                               iterations=IT))
-    (d / "status.json").write_text(json.dumps(_status(runs, started, mode)))
+    (d / "status.json").write_text(json.dumps(_status(runs, started, mode, **(status_kw or {}))))
     (d / "kills.set.json").write_text(json.dumps(kills_set or {}))
     for name, text in (extra or {}).items():
         (d / name).write_text(text)
@@ -119,14 +120,14 @@ def test_check_takes_an_older_state_with_more_runs(repo, tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("case", ["fewer_runs", "other_start", "same_runs_other_bytes", "plaintext", "unknown_file",
-                                  "amount_in_status", "kills_not_bools", "live_over_shadow_live"])
+                                  "amount_in_status", "kills_set_not_bools", "live_over_shadow_live"])
 def test_check_refuses_a_younger_state_plain_text_and_anything_else(repo, tmp_path, monkeypatch, case):
     r, saved = repo
     monkeypatch.chdir(r)
     kw = {"fewer_runs": dict(runs=2), "other_start": dict(runs=5, started=999), "same_runs_other_bytes": dict(runs=3),
           "plaintext": dict(runs=4, state=json.dumps({"balance": 500})), "unknown_file": dict(runs=4, extra={
-              "notes.txt": "x"}), "amount_in_status": dict(runs=4), "kills_not_bools": dict(runs=4, extra={
-              "kills.json": json.dumps({"entry_kill": "yes"})}), "live_over_shadow_live": dict(runs=4)}[case]
+              "notes.txt": "x"}), "amount_in_status": dict(runs=4), "kills_set_not_bools": dict(runs=4, kills_set={
+              "entry_kill": "yes"}), "live_over_shadow_live": dict(runs=4)}[case]
     d = _state_dir(tmp_path / "new", **kw)
     if case == "amount_in_status":
         st = json.loads((d / "BTC" / "status.json").read_text())
@@ -145,7 +146,7 @@ def test_check_allows_a_first_save_and_the_first_live_save_over_shadow(repo, tmp
     monkeypatch.chdir(r)
     assert cs.check(_state_dir(tmp_path / "first", runs=1), "refs/remotes/origin/nothing-here") == \
         ["no saved state on the branch: a first save"]
-    live = _state_dir(tmp_path / "live", runs=1, started=5_000, mode="LIVE")
+    live = _state_dir(tmp_path / "live", runs=1, started=5_000, mode="LIVE", status_kw={"armed": True})
     assert "the first LIVE save" in cs.check(live, "refs/remotes/origin/coinbase-state")[0]
 
 

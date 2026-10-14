@@ -15,11 +15,17 @@ The branch holds one orphan commit, replaced at every save (encrypted blobs ever
                                      reset_halt_at: any new text (a date, say) clears a drawdown halt once
 
 check refuses (exit 1, an ::error:: naming the file) a file not on that list, an encrypted file that isn't an envelope,
-a status or kills file that isn't what the desk writes (status keys and values are whitelisted, so a bug can't put an
-amount in it), and a younger state: the same start time as the branch's, and more runs, or as many runs with the very
+a status or kills.set.json that isn't what the desk writes (status keys and values are whitelisted, so a bug can't put
+an amount in it), and a younger state: the same start time as the branch's, and more runs, or as many runs with the very
 same state file. A run refused over its secrets (problem "key") saves its status alone: the state file as loaded, or
 none yet on a first save. stage copies the allowed files into a fresh tree, keeps the branch's kills.json (your edits)
 with any kill this run set added (kills.set.json), and moves the branch's last state to .prev.
+
+kills.json is yours, so a typo in it never stops a save: read_kills is how the runs, check and stage all read it, and
+one it can't read (not JSON, a key it doesn't know, a switch that isn't true or false) is entry_kill on, and is saved
+back that way. LIVE counts on this branch only once it has armed: its status says "armed": true. A LIVE run that never
+armed saves nothing (desk/coinbase_run.py), check refuses a LIVE status that isn't armed, and a LIVE status without it
+(a LIVE attempt that never armed, before this rule) is no LIVE start: SHADOW saves over it and stage drops its files.
 """
 
 from __future__ import annotations
@@ -43,7 +49,7 @@ STATUS_KEYS = {"v": int, "mode": str, "coin": str, "product": str, "updated": in
                "failed_runs": int, "ok": bool, "problem": (str, type(None)), "key_view_only": (bool, type(None)),
                "decision": (str, type(None)), "would_send_last_24h": (int, type(None)), "alerts_open": int,
                "checks_passed": (int, type(None)), "checks_total": (int, type(None)), "opened": bool,
-               "note": (str, type(None))}
+               "note": (str, type(None)), "armed": (bool, type(None))}
 PROBLEMS = {None, "auth", "permissions", "clock", "read", "state", "refused", "key"}
 BRANCH_README = """# coinbase-state
 
@@ -109,6 +115,40 @@ def check_kills(d, name: str) -> dict:
     return d
 
 
+def read_kills(raw: bytes | str | None) -> tuple[dict, str | None]:
+    """BTC/kills.json as the SHADOW and LIVE runs, check and stage all read it: (the switches, None), or, for a file
+    that isn't one the desk can read, (entry_kill on, why). Failing closed: entry_kill on, any switch written exactly
+    true still on (flat_kill closes the position), nothing else in it acted on (reset_halt_at included). No file:
+    every switch off."""
+    kills: dict = {k: False for k in KILL_KEYS}
+    if raw is None:
+        return kills, None
+    try:
+        d = json.loads(raw)
+    except (ValueError, RecursionError):
+        kills["entry_kill"] = True
+        return kills, "it isn't JSON"
+    try:
+        check_kills(d, "kills.json")
+    except StateCheckError:
+        kills["entry_kill"] = True
+        if isinstance(d, dict):
+            kills.update({k: True for k in KILL_KEYS if d.get(k) is True})
+        return kills, (f"it isn't a kill-switch file: only {', '.join(KILL_KEYS)}, each true or false, and "
+                       f"{', '.join(RESET_KEYS)} (a short text)")
+    kills.update(d)
+    return kills, None
+
+
+def _never_armed(status: dict | None) -> bool:
+    """A LIVE status that isn't armed: the files of a LIVE attempt that never armed, which are no LIVE start."""
+    return bool(status) and status.get("mode") == "LIVE" and status.get("armed") is not True
+
+
+LIVE_FILES = tuple(f"{kind}-live{suffix}" for kind, suffix in
+                   (("state", ".enc.json"), ("state", ".prev.enc.json"), ("board", ".enc.json")))
+
+
 def _local(state_dir: Path) -> dict[str, bytes]:
     d = state_dir / COIN
     for p in state_dir.iterdir():
@@ -132,14 +172,22 @@ def check(state_dir: str | Path, remote_ref: str) -> list[str]:
         if name in ENCRYPTED:
             if not is_envelope(_json(data, f"{COIN}/{name}")):
                 raise StateCheckError(f"{COIN}/{name} isn't encrypted: never saving the real account in plain text")
-        elif name in ("kills.json", "kills.set.json"):
+        elif name == "kills.set.json":
             check_kills(_json(data, f"{COIN}/{name}"), f"{COIN}/{name}")
+    # kills.json is yours: stage saves the branch's (or, with none there yet, this one) as read_kills reads it
+    raw = _git_show(remote_ref, f"{COIN}/kills.json")
+    _, why = read_kills(raw if raw is not None else files.get("kills.json"))
+    if why:
+        said.append(f"{COIN}/kills.json isn't readable ({why}): saved as entry_kill on, as the run read it")
     if "status.json" not in files:
         raise StateCheckError(f"{COIN}/status.json is missing: nothing to save")
     new = check_status(_json(files["status.json"], f"{COIN}/status.json"))
     mode = new["mode"].lower()
     state = f"state-{mode}.enc.json"
     status_only = new.get("problem") == "key" and new.get("ok") is False
+    if new["mode"] == "LIVE" and new.get("armed") is not True:
+        raise StateCheckError(f"{COIN}/status.json is a LIVE status that isn't armed: a LIVE run that never armed "
+                              f"saves nothing (it isn't a LIVE start)")
     if state not in files:
         if status_only and new["runs"] == 0 and _git_show(remote_ref, f"{COIN}/{state}") is None:
             said.append(f"a status-only save: {new['mode']} was refused over its secrets before it had a state")
@@ -152,6 +200,22 @@ def check(state_dir: str | Path, remote_ref: str) -> list[str]:
         said.append("no saved state on the branch: a first save")
         return said
     old = check_status(_json(old_raw, f"saved {COIN}/status.json"), f"saved {COIN}/status.json")
+    if _never_armed(old):
+        # the files of a LIVE attempt that never armed (saved before LIVE saved only once armed): no LIVE start
+        if new["mode"] == "LIVE":
+            said.append("the first LIVE save: the branch's LIVE files were a LIVE attempt's that never armed, "
+                        "replaced")
+            return said
+        # SHADOW's own counts went with its status: this run must have loaded the branch (its LIVE file, as is)
+        left = _git_show(remote_ref, f"{COIN}/state-live.enc.json")
+        loaded = files.get("state-live.enc.json") == left if left is not None else \
+            _git_show(remote_ref, f"{COIN}/{state}") is None
+        if not loaded:
+            raise StateCheckError("the branch holds a LIVE attempt that never armed, and this SHADOW run didn't "
+                                  "load it: not saving a SHADOW state that may not be the branch's")
+        said.append("the branch's LIVE files were a LIVE attempt's that never armed (no LIVE start): SHADOW's "
+                    "state saved, they're dropped")
+        return said
     if old["mode"] != new["mode"]:
         if old["mode"] == "SHADOW" and new["mode"] == "LIVE" and _git_show(remote_ref, f"{COIN}/{state}") is None:
             said.append("the first LIVE save: SHADOW's files stay on the branch beside it")
@@ -182,24 +246,26 @@ def stage(state_dir: str | Path, work: str | Path, remote_ref: str) -> list[str]
         shutil.rmtree(out)
     out.mkdir(parents=True)
     (Path(work) / "README.md").write_text(BRANCH_README)
+    raw_status = _git_show(remote_ref, f"{COIN}/status.json")
+    try:
+        leftover = _never_armed(json.loads(raw_status)) if raw_status is not None else False
+    except ValueError:
+        leftover = False
     for n in sorted(ENCRYPTED | {"status.json"}):
         if n in files and n != f"state-{mode}.prev.enc.json":     # the other mode's files stay as loaded
+            if leftover and mode == "shadow" and n in LIVE_FILES:
+                continue        # a LIVE attempt that never armed: no LIVE start, its files go
             (out / n).write_bytes(files[n])
     old_state = _git_show(remote_ref, f"{COIN}/state-{mode}.enc.json")
     old_prev = _git_show(remote_ref, f"{COIN}/state-{mode}.prev.enc.json")
+    if leftover and mode == "live":
+        old_state = old_prev = None                                 # nothing of it becomes LIVE's .prev
     if old_state is not None and old_state != files.get(f"state-{mode}.enc.json"):
         (out / f"state-{mode}.prev.enc.json").write_bytes(old_state)
     elif old_prev is not None:
         (out / f"state-{mode}.prev.enc.json").write_bytes(old_prev)
-    kills: dict = {k: False for k in KILL_KEYS}
     raw = _git_show(remote_ref, f"{COIN}/kills.json")
-    if raw is not None:
-        try:
-            kills.update(check_kills(json.loads(raw), "the branch's kills.json"))
-        except (ValueError, StateCheckError):
-            kills["entry_kill"] = True      # unreadable: the safe side, and the run says so on the board
-    elif "kills.json" in files:
-        kills.update(check_kills(_json(files["kills.json"], "kills.json"), "kills.json"))
+    kills, _ = read_kills(raw if raw is not None else files.get("kills.json"))   # unreadable: entry_kill on
     if "kills.set.json" in files:
         for k, v in check_kills(_json(files["kills.set.json"], "kills.set.json"), "kills.set.json").items():
             if k in KILL_KEYS:

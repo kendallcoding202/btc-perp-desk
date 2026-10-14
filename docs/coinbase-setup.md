@@ -7,7 +7,7 @@ This page has two parts:
 
 ETH, SOL and VT stay paper accounts. Paper trading (all four accounts, their ledgers and boards) is unaffected by anything here.
 
-The menu names below come from Coinbase's own pages: its API key page (https://docs.cdp.coinbase.com/coinbase-app/authentication-authorization/api-key-authentication) and its key guide for agents (https://docs.cdp.coinbase.com/coinbase-for-agents/skill.md), both read on 2026-10-14. They couldn't be clicked through from here, and Coinbase renames things. If a label differs, look for the same idea nearby.
+The menu names below are quoted from Coinbase's own pages: its API key page (https://docs.cdp.coinbase.com/coinbase-app/authentication-authorization/api-key-authentication) and its key guide for agents (https://docs.cdp.coinbase.com/coinbase-for-agents/skill.md), both read on 2026-10-14. The two pages name the last button differently (step 8), so both names are given. The portal itself couldn't be clicked through from here, and Coinbase renames things: if a label differs, look for the same idea nearby.
 
 ---
 
@@ -15,16 +15,16 @@ The menu names below come from Coinbase's own pages: its API key page (https://d
 
 ### A. Create a View-only API key
 
-1. In a browser, sign in at **portal.cdp.coinbase.com** (the Coinbase Developer Platform) with your usual Coinbase login. Use the same account that was approved for derivatives on 2026-10-13.
-2. Open **API Keys**, choose the **Secret API Keys** tab, then **Create API key**.
-3. Name it `btc-perp-desk shadow (view only)`, and expand **API restrictions** and **Advanced Settings**.
-4. Under **Advanced Settings** → **Coinbase App & Advanced Trade**, set the permissions to **View** only (it's on by default). Leave **Trade** and **Transfer** unticked.
+1. In a browser, sign in at **portal.cdp.coinbase.com/api-keys/secret** (the Coinbase Developer Platform) with your usual Coinbase login. Use the same account that was approved for derivatives on 2026-10-13. Coinbase creates a project for you the first time you sign in.
+2. Under the **API Keys** tab, select **Secret API Keys**, then click **Create API key**.
+3. Enter an API key nickname, `btc-perp-desk shadow (view only)`, then expand **API restrictions** and **Advanced Settings**.
+4. Under **Advanced Settings** → **Coinbase App & Advanced Trade**, under **Accounts**, select your **Default** portfolio. Coinbase: "US Derivatives (Futures) only work in your **default** portfolio".
+5. In the same section, leave the permissions at **View** only. View is enabled by default; leave **Trade** and **Transfer** off.
    - SHADOW refuses a key that can trade or move money. A mix-up stops it instead of risking anything.
-5. **Accounts / portfolio:** choose your **Default** portfolio. Coinbase: US futures "only work in your default portfolio".
-6. **IP addresses:** tick **Allow requests from any IP address**. GitHub's runners use changing addresses, so an allowlist would block every run.
+6. Check **Allow requests from any IP address**, and configure no IP allowlist. GitHub's runners use changing addresses, so an allowlist would block every run.
 7. **Required: set the signature algorithm to ECDSA.** Coinbase's API key page says: "Do NOT select Ed25519 as it is not supported by Coinbase App APIs". The desk reads your deposits and withdrawals through those APIs, so it refuses an Ed25519 key before calling Coinbase, and says so.
-8. Click **Create**, and confirm with your 2FA.
-9. Click **Download** to save the key file. Coinbase no longer downloads it on its own, and the private key is shown only once.
+8. Click **Create & Download**. If your page shows **Create API key** instead, click it, then click **Download API key** in the window that opens: Coinbase no longer downloads the key file on its own.
+9. Save the downloaded JSON key file. You only need it for the next steps.
 10. Open the downloaded `.json` file in a plain text editor (TextEdit in plain-text mode, Notepad) and copy **all of it**, braces included. It looks like this (yours is longer):
 
     ```
@@ -78,9 +78,11 @@ The menu names below come from Coinbase's own pages: its API key page (https://d
     - **DESK_STATE_KEY doesn't open the saved state:** the secret changed. Put the old password back, or start over (below).
     - **DESK_STATE_KEY is too short**, or **is not set**: fix the secret. The SHADOW bar on the dashboard says the same, with no amount.
     - **an Ed25519 key, not ECDSA:** create the key again with ECDSA (step 7).
+    - **kills.json can't be read** (a typo, say): see step 24.
     - **Coinbase didn't answer:** a Coinbase or network outage. The clock check reads "not checked", not failed. The next run tries again.
 23. **To stop SHADOW:** delete the `COINBASE_CDP_KEY` secret. The job then skips and stays green. You can also revoke the key in the CDP portal.
 24. **Kill switches:** edit `BTC/kills.json` on the `coinbase-state` branch (`{"entry_kill": true}` or `{"flat_kill": true}`), or set the repository **variable** `DESK_COINBASE_KILL` to `entry` or `flat` (Settings → Secrets and variables → Actions → Variables). In SHADOW they stop the simulated trading, as they would stop LIVE's.
+    - **If the desk can't read the file** (it isn't JSON, like `{"entry_kill": true,}` with its trailing comma; a key it doesn't know; or a switch that isn't `true` or `false`), it reads it as **entry_kill on**: no new entries. A switch written exactly `true` stays on too, and nothing else in the file is acted on. The SHADOW page, the status bar and your phone say so. The run is still saved, and the save writes the file back as a valid one with `"entry_kill": true`. Put back what you meant, and set `entry_kill` to `false` once you've looked.
     - **To clear a drawdown halt** once you've looked: add `"reset_halt_at": "2026-11-02"` (any new text, a date is easiest) to the same `BTC/kills.json`. The next run clears the halt once, restarts the peak from the balance then, and says so on the board. Use a new text for the next reset.
 25. **To start SHADOW over:** delete the `coinbase-state` branch. The next run opens a new state.
 
@@ -100,28 +102,39 @@ LIVE places real orders on `BIP-20DEC30-CDE`:
 
 It has only ever run against the tests' local fake Coinbase.
 
-It refuses, with every check printed as PASS or FAIL and not one order request sent, unless **all** of these hold:
+It refuses, with every check printed as PASS or FAIL and not one order request sent, unless all of the checks below pass. Some are checked only at the **first LIVE start** (the first run that arms). Once LIVE has armed, the later runs don't check them again.
+
+At the first LIVE start only:
 
 1. The go-live gate passes: the backtest report, and 14+ days of paper that are up time-weighted. The BTC paper ledger restarted on 2026-10-13, so not before about 2026-10-27.
-2. `DESK_LIVE_CONFIRM` is set to exactly `I understand this trades real money and can lose all of it`.
-3. The variable `DESK_LIVE_COINBASE` is exactly `BIP-20DEC30-CDE`.
-4. `--max-notional` is given and buys at least one contract (about $830 at $83,000, plus slippage). Raise it by hand as BTC rises.
-5. SHADOW's record on this account, read from its encrypted state:
+2. SHADOW's record on this account, read from its encrypted state:
    - 14+ days of runs, the last under 2 hours ago;
    - over the last 7 days: no move nothing explained, no unknown ledger entry, no balance that didn't add up, no run that couldn't read deposits, no auth failure;
    - at least one bank deposit reconciled to the cent;
    - money in the account on 7 of the last 14 days;
    - the Default portfolio, with its id recorded.
-6. The key is **View + Trade and NOT Transfer**, on the same portfolio SHADOW read.
-7. The clock is within 30 s of Coinbase's, the balance adds up, and there's no USDC in the portfolio.
-8. At the first start, the account is flat with no open order on any product.
+3. The account is flat, with no open order on any product.
+
+At every LIVE run:
+
+4. `DESK_LIVE_CONFIRM` is set to exactly `I understand this trades real money and can lose all of it`.
+5. The variable `DESK_LIVE_COINBASE` is exactly `BIP-20DEC30-CDE`.
+6. `--max-notional` is given and buys at least one contract (about $830 at $83,000, plus slippage). Raise it by hand as BTC rises.
+7. The key is **View + Trade and NOT Transfer**, on the same portfolio SHADOW read.
+8. The clock is within 30 s of Coinbase's, the balance adds up, and there's no USDC in the portfolio.
+
+**A LIVE run that refuses before LIVE has ever armed saves nothing.** It writes no LIVE state, board, status or kill switch, so the `coinbase-state` branch and SHADOW's state stay as they were, and the next LIVE run is a first start again. Your phone gets **BTC LIVE: not armed** with the reason: at every such run while SHADOW's last run is under 2 hours old, then once every 6 hours.
+
+The LIVE step replaces SHADOW's in the workflow (step 4 below), so SHADOW stops running when you switch. Its last run has to be under 2 hours old at the first LIVE start, so the first start has to arm within 2 hours of SHADOW's last run. If it doesn't, put the SHADOW run step back until SHADOW has run again, then switch again.
+
+Once LIVE has armed, it counts as running on this account: SHADOW refuses to run beside it. From then on a LIVE run that refuses (after you delete `DESK_LIVE_CONFIRM` to disarm, say) is still saved.
 
 To arm it later, deliberately, when you choose:
 
-1. Create a new key in the same portal:
-   - name `btc-perp-desk live`;
-   - permissions **View + Trade**, **NOT Transfer** (the desk never moves money, and LIVE refuses a key that can);
-   - Default portfolio, **Allow requests from any IP address**, ECDSA.
+1. Create a new key in the same portal, as in Part 1 A:
+   - nickname `btc-perp-desk live`;
+   - under **Advanced Settings** → **Coinbase App & Advanced Trade**: under **Accounts**, the **Default** portfolio; **View** (on by default) and **Trade**, with **Transfer** off (the desk never moves money, and LIVE refuses a key that can);
+   - **Allow requests from any IP address**, signature algorithm **ECDSA**, then **Create & Download** (or **Create API key**, then **Download API key**).
 2. Store it as a **new** repository secret, `COINBASE_CDP_TRADE_KEY`. Don't overwrite `COINBASE_CDP_KEY`: SHADOW refuses a key that can trade, so a mix-up stops instead of trading.
 3. Add:
    - the secret `DESK_LIVE_CONFIRM` (the exact phrase);
@@ -141,4 +154,4 @@ The biggest real-money risks:
 
 - GitHub runs the job about every 15 minutes, best effort, late or skipped at busy times. Between runs, only the stop resting on Coinbase protects the position.
 - That stop is a stop-limit with its limit 5% past the trigger. A gap past the limit leaves it unfilled until the next run closes the position at market. The loss can then be bigger than the board's "5% risk": the board shows both figures.
-- Each trailing move leaves a few seconds with no stop resting. Up to about 30 s if Coinbase is slow.
+- Each trailing move cancels the old stop before it places the new one, which leaves a gap with no stop resting. It is usually a second or two. If Coinbase is slow it can last close to a minute: placing the new stop is one order request that waits up to 15 s for an answer and is tried 3 times, 2 s and then 4 s apart. If the new stop still won't rest, the desk closes the position at market. If Coinbase stops answering, the desk keeps trying until 60 s past the run's deadline, then pushes **NO STOP** urgently.

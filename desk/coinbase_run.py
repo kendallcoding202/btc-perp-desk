@@ -10,8 +10,10 @@ Nothing is sent: its client can't POST at all, and SHADOW refuses any key that c
 
 One run (run_shadow):
   1. refuse, before any network call, without COINBASE_CDP_KEY or DESK_STATE_KEY (32+ characters), when LIVE runs on
-     this account (state-live.enc.json), or when DESK_STATE_KEY doesn't open the saved state (never a new state over it);
-  2. from here every run saves (changed=true is written first): the state, the board and a public status;
+     this account (state-live.enc.json that has armed, or that DESK_STATE_KEY doesn't open), or when DESK_STATE_KEY
+     doesn't open the saved state (never a new state over it); a LIVE state that never armed is no LIVE start;
+  2. from here every run saves (changed=true is written first): the state, the board and a public status (LIVE: only
+     once it has armed; a LIVE run that stops before it ever armed saves nothing, so it changes nothing for SHADOW);
   3. the key, its masks on Actions, the clock against Coinbase's, and the key's permissions (View only, or refuse);
   4. the real account: balance, positions, open orders, fills, the fee tier, sweeps, the margin window, the USD wallet
      and its deposits and withdrawals; each read is one line of the checklist on the board;
@@ -48,9 +50,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import board as board_mod
+from . import coinbase_state, statebox
 from . import flows as flows_mod
 from . import indicators as ind
-from . import statebox
 from . import venue as venue_mod
 from .engine import Desk, Kills
 from .filter import evaluate_entry
@@ -110,6 +112,8 @@ def _usd(x: float | None, dp: int = 2) -> str:
 _MONEY = re.compile(r"[-+]?\$\s?-?[\d,]+(?:\.\d+)?|(?<![\w.])[-+][\d,]*\d\.\d{2}\b|\b\d[\d,]*\.\d{2}\s?USDC?\b")
 REDACTED_NOTE = ("(amounts left out: anyone who knows an ntfy.sh topic's name can read it. They're on the {mode} "
                  "board, encrypted; set NTFY_TOKEN for a reserved topic to get them here)")
+# the public status's note when BTC/kills.json can't be read (no digit, no amount: coinbase_state.check_status)
+KILLS_UNREADABLE = "BTC/kills.json on the coinbase-state branch can't be read: read as entry_kill on, no new entries"
 URGENT_TITLES = {"no_stop": "NO STOP", "stray": "STOP WITH NO POSITION", "stray-foreign": "STOP WITH NO POSITION",
                  "foreign": "AN ORDER THAT ISN'T THE DESK'S", "unprotected": "NO STOP"}
 
@@ -155,6 +159,15 @@ def open_bundle(path: Path, password: str, mode: str) -> dict | None:
     if not isinstance(d, dict) or d.get("v") != 1 or not isinstance(d.get("files"), dict):
         raise statebox.BoxError("the saved state isn't one the desk wrote")
     return d
+
+
+def armed_at(bundle: dict | None):
+    """When the LIVE state in `bundle` first armed (its desk meta's armed_at), or None: a LIVE state with none is the
+    leftover of a LIVE attempt that never armed, which is no LIVE start. Raises ValueError for a desk.json that isn't
+    JSON."""
+    meta = (json.loads(((bundle or {}).get("files") or {}).get("desk.json") or "null") or {})
+    meta = meta.get("meta") if isinstance(meta, dict) else None
+    return (meta or {}).get("armed_at") if isinstance(meta, dict) else None
 
 
 def unpack(bundle: dict | None, work: Path) -> None:
@@ -583,6 +596,10 @@ class Run:
         self.kills_set: dict = {}
         self._urgent_texts: set[str] = set()
         self.unexplained: list[dict] = []
+        self.kills_read: tuple[dict, str | None] | None = None
+        self.live_leftover = False          # SHADOW: a never-armed LIVE attempt's files are here (dropped on save)
+        self.replaces_leftover = False      # LIVE: the saved LIVE state is one, and this run doesn't carry on from it
+        self.refused_before_state = False
         self.now = int(clock() * 1000)
 
     # ---- small things
@@ -631,25 +648,51 @@ class Run:
 
     # ---- before anything: what refuses with no network call
     def preflight(self) -> tuple[str, str]:
-        if self.mode == "shadow" and (self.dir / "state-live.enc.json").exists():
-            raise Stop("refused", "LIVE runs on this account; SHADOW would read its trades as moves nothing explains. "
-                                  "Not running.")
+        live = self.mode == "shadow" and (self.dir / "state-live.enc.json").exists()
+        runs = "LIVE runs on this account; SHADOW would read its trades as moves nothing explains. Not running."
+        unsure = ("a LIVE state is on this account and {}, so SHADOW can't tell whether LIVE runs here; it doesn't run "
+                  "beside a LIVE that might (it would read its trades as moves nothing explains). Not running.")
         try:
             password = statebox.check_password(self.env.get("DESK_STATE_KEY"))
         except statebox.BoxError as exc:
+            if live:
+                raise Stop("refused", unsure.format("DESK_STATE_KEY isn't set right")) from None
             short = bool(self.env.get("DESK_STATE_KEY"))
             raise Stop("key", str(exc), public="DESK_STATE_KEY is too short (it needs thirty-two characters or more)"
                        if short else "DESK_STATE_KEY is not set") from None
+        if live:
+            # LIVE counts only once it has armed: a LIVE attempt that refused before it ever armed is no LIVE start
+            try:
+                armed = armed_at(open_bundle(self.dir / "state-live.enc.json", password, "live"))
+            except ValueError:          # statebox.BoxError and WrongKey included: a LIVE state SHADOW can't read
+                raise Stop("refused", unsure.format("DESK_STATE_KEY doesn't open it")) from None
+            if armed:
+                raise Stop("refused", runs)
+            self.live_leftover = True
+            self.log("the LIVE state here is a LIVE attempt's that never armed: no LIVE start, so SHADOW runs, and "
+                     "this save drops its files from coinbase-state")
         raw = self.env.get("COINBASE_CDP_KEY") or ""
         if not raw.strip():
             raise Stop("key", "COINBASE_CDP_KEY is not set: SHADOW needs the View-only key's file (README, Coinbase "
                               "SHADOW)", public="COINBASE_CDP_KEY is not set")
         return password, raw
 
+    def kills_file(self) -> tuple[dict, str | None]:
+        """BTC/kills.json (yours, on the coinbase-state branch), read once a run the way the save step reads it
+        (coinbase_state.read_kills): one the desk can't read is entry_kill on, never every switch off."""
+        if self.kills_read is None:
+            try:
+                raw = self.paths["kills"].read_bytes()
+            except FileNotFoundError:
+                raw = None
+            except OSError:
+                raw = b"\0"          # there but unreadable: the same safe side as a file that isn't JSON
+            self.kills_read = coinbase_state.read_kills(raw)
+        return self.kills_read
+
     def kills_now(self) -> Kills:
-        k = Kills.load(self.paths["kills"])
-        if not self.paths["kills"].exists():
-            k = Kills()
+        d, _ = self.kills_file()
+        k = Kills(**{n: bool(d.get(n)) for n in coinbase_state.KILL_KEYS})
         v = (self.env.get("DESK_COINBASE_KILL") or "").strip().lower()
         if v == "flat":
             k.flat_kill = True
@@ -738,11 +781,10 @@ class Run:
     def reset_halt_if_asked(self) -> None:
         """BTC/kills.json's reset_halt_at (any new value, written by you on the coinbase-state branch): clear the
         drawdown halt once, as `python -m desk reset-halt` does for the other desks, and say so on the board."""
-        try:
-            raw = json.loads(self.paths["kills"].read_text())
-        except (OSError, ValueError):
-            return
-        want = raw.get("reset_halt_at") if isinstance(raw, dict) else None
+        raw, why = self.kills_file()
+        if why:
+            return              # nothing in a kills.json the desk can't read is acted on but entry_kill
+        want = raw.get("reset_halt_at")
         if not want or want == self.meta.get("reset_halt_seen"):
             return
         self.meta["reset_halt_seen"] = want
@@ -818,6 +860,7 @@ class Run:
                                            public="DESK_STATE_KEY doesn't open the saved state"))
         except statebox.BoxError as exc:
             return self.refused_early(Stop("state", f"the saved {self.mode.upper()} state can't be opened: {exc}"))
+        bundle = self.counted(bundle)
         work = Path(tempfile.mkdtemp(prefix=f"desk-{self.mode}-"))
         try:
             unpack(bundle, work)
@@ -826,8 +869,8 @@ class Run:
             self.meta = {"started_ts": self.now, "start_equity": 0.0, "last_bar_ts": 0, "runs": 0, "failed_runs": 0,
                          "mode": self.mode, "product": PRODUCT, "opened": None, **(saved_desk.get("meta") or {})}
             self.recorded = list(saved_desk.get("flows") or [])
-            self.changed = True
-            github_output(True, self.env)       # written ahead: from here this run is saved, whatever happens
+            if self.saves_from_the_start():
+                self.begin_saving()             # written ahead: from here this run is saved, whatever happens
             ok = False
             try:
                 self.body(work, password, saved_desk)
@@ -852,15 +895,32 @@ class Run:
                 self.after_failure()
                 self.stopped(f"{type(exc).__name__} while it ran" + (
                     "; entry_kill is on" if self.kills_set.get("entry_kill") else ""))
-            self.finish(work, password, ok)
+            if self.changed:
+                self.finish(work, password, ok)
+            else:
+                github_output(False, self.env)      # LIVE that never armed: nothing to save, so nothing changes
+                self.public_note = self.problem or ""
         finally:
             shutil.rmtree(work, ignore_errors=True)
         return self.code
+
+    def counted(self, bundle: dict | None) -> dict | None:
+        """The saved state this run carries on from (LiveRun: not one from a LIVE attempt that never armed)."""
+        return bundle
+
+    def saves_from_the_start(self) -> bool:
+        """Whether this run saves whatever happens (SHADOW: always; LiveRun: once LIVE has armed)."""
+        return True
+
+    def begin_saving(self) -> None:
+        self.changed = True
+        github_output(True, self.env)
 
     def refused_early(self, s: Stop) -> int:
         """Refused before the state was opened: the saved state stays exactly as it was. A setup slip with the secrets
         (problem "key") still writes the public status (no amount, no digit), so the dashboard says what's wrong
         instead of nothing: the save step then saves the status alone, the state file as loaded."""
+        self.refused_before_state = True
         self.problem, self.code = s.problem, s.code
         self.public_why = s.public
         self.log(f"refused: {s.text}")
@@ -885,13 +945,16 @@ class Run:
                 old = {}
             if not isinstance(old, dict) or old.get("mode") != self.mode.upper():
                 return False        # another mode's status: not overwritten from here
+        if self.mode == "live" and old.get("armed") is not True:
+            return False            # a LIVE that never armed saves nothing, not even a status
         self.dir.mkdir(parents=True, exist_ok=True)
         st = {"v": 1, "mode": self.mode.upper(), "coin": COIN, "product": PRODUCT, "updated": self.now,
               "started_ts": int(old.get("started_ts") or self.now), "runs": int(old.get("runs") or 0),
               "failed_runs": int(old.get("failed_runs") or 0), "ok": False, "problem": "key",
               "key_view_only": None, "decision": None, "would_send_last_24h": None,
               "alerts_open": int(old.get("alerts_open") or 0), "checks_passed": None, "checks_total": None,
-              "opened": bool(old.get("opened")), "note": s.public or "a secret isn't set right"}
+              "opened": bool(old.get("opened")), "note": s.public or "a secret isn't set right",
+              **({"armed": True} if self.mode == "live" else {})}
         tmp = p.with_name(p.name + ".tmp")
         tmp.write_text(json.dumps(st, indent=1) + "\n")
         tmp.replace(p)
@@ -969,6 +1032,7 @@ class Run:
             self.meta["last_atr"] = float(f.atr[-1])      # the safety pass's level for a stop with no saved one
         kills = self.kills_now()
         self.kills_loaded = Kills(**kills.__dict__)
+        self.say_kills_unreadable()
         self.reset_halt_if_asked()
         shot = OneShot(self.p, self.mode, self.broker, self.desk, feed, rules, vstate, self.meta, self.recorded, kills,
                        self.kills_set, self.log, self.on_alert, self.now)
@@ -999,6 +1063,21 @@ class Run:
         self.board_state = self.board(f, ctx, vstate, feed, bars, rules)
         health(self.account, self.now, funded=bool((self.real_equity or 0) > 0 and self.real.balance_block is None
                                                    and self.broker.balance_confirmed))
+
+    def say_kills_unreadable(self) -> None:
+        """A kills.json the desk can't read is entry_kill on (failing closed), said on the board, in the status and on
+        the phone. The save step writes it back as a valid file with entry_kill true (coinbase_state.read_kills)."""
+        d, why = self.kills_file()
+        if not why:
+            return
+        extra = [k for k in ("flat_kill", "jev_kill") if d.get(k)]
+        text = (f"BTC/kills.json on the coinbase-state branch can't be read ({why}): read as entry_kill on, no new "
+                f"entries" + (f" ({', '.join(extra)} too: written exactly true)" if extra else "") +
+                ", and nothing else in it is acted on. This run's save writes it back as a valid file with entry_kill "
+                "true: fix what you meant there")
+        if not self.account.get("entry_kill_reason"):
+            self.account["entry_kill_reason"] = {"ts": self.now, "why": f"BTC/kills.json couldn't be read ({why})"}
+        self.on_alert(text)
 
     # ---- the real account's reads
     def read_account(self) -> None:
@@ -1091,6 +1170,9 @@ class Run:
             desk.say(self.now, "risk", f"while away: {ev}")
         for ev in getattr(self, "safety_said", []):
             desk.say(self.now, "risk", f"safety pass: {ev}")
+        if self.live_leftover:
+            desk.say(self.now, "chief", "a LIVE attempt that never armed had left its files on coinbase-state: they "
+                                        "aren't a LIVE start, so SHADOW runs on, and this save drops them")
         self.applied: list[dict] = []
         on_flow, self.open_account = make_on_flow(desk, b, self.meta, self.recorded, self.account,
                                                   lambda text: desk.say(self.now, "bank", text), self.log, self.push,
@@ -1310,6 +1392,8 @@ class Run:
         if board is None:
             # stopped before a board: the last one stays (its own "updated" says how old it is), with this run's checks
             try:
+                if self.replaces_leftover:
+                    raise FileNotFoundError("a never-armed LIVE attempt's board isn't this LIVE's")
                 board = statebox.open_json(paths["board"].read_text(), password, statebox.board_aad(self.mode))
             except (OSError, statebox.BoxError):
                 board = {"updated": None, "header": {"mode": self.mode.upper(), "coin": COIN,
@@ -1377,7 +1461,8 @@ class Run:
                 "decision": decision, "would_send_last_24h": ws, "alerts_open": len(self.alerts),
                 "checks_passed": self.checks.passed, "checks_total": len(self.checks.rows),
                 "opened": bool(self.meta.get("start_equity", 0) > 0),
-                "note": None if ok else self.public_why}
+                "note": self.public_why if not ok else KILLS_UNREADABLE if self.kills_file()[1] else None,
+                **({"armed": bool(self.meta.get("armed_at"))} if self.mode == "live" else {})}
 
     def public_line(self) -> str:
         """The one line the public log gets: no amounts, no ids, no Coinbase wording."""
@@ -1387,7 +1472,8 @@ class Run:
             done = getattr(getattr(self, "shot", None), "processed", 0)
             return (f"{m} BTC: run {self.meta.get('runs', 0)} · key {'View only' if self.mode == 'shadow' else 'armed'} "
                     f"· reads ok · {done} close{'s' if done != 1 else ''} processed · {n} order"
-                    f"{'s' if n != 1 else ''} it {'would send' if self.mode == 'shadow' else 'sent'} · state saved")
+                    f"{'s' if n != 1 else ''} it {'would send' if self.mode == 'shadow' else 'sent'} · state saved"
+                    + (" · kills.json can't be read: entry_kill on" if self.kills_read and self.kills_read[1] else ""))
         if not self.changed:
             why = self.public_why or self.problem or "error"
             return f"{m} BTC: refused before reading the account: {why} (nothing read or sent; the state is unchanged)"
@@ -1414,6 +1500,8 @@ class LiveRun(Run):
         self.password: str | None = None
         self.arm_lines: list[str] = []
         self.safety_said: list[str] = []
+        self.proof: dict | None = None
+        self.proof_read = False
 
     def max_notional(self):
         return self.cap
@@ -1423,7 +1511,28 @@ class LiveRun(Run):
         self.password = password
         return password, raw
 
+    def counted(self, bundle: dict | None) -> dict | None:
+        """A LIVE state with no armed_at is what a LIVE attempt that never armed left (before LIVE saved only once
+        armed): no LIVE start. This run starts LIVE as a first start (the go-live gate and SHADOW's record checked),
+        and its state replaces that one only if it arms."""
+        try:
+            armed = armed_at(bundle)
+        except ValueError:
+            return bundle               # the run's own read refuses it ("state")
+        if bundle is not None and not armed:
+            self.replaces_leftover = True
+            self.log("the saved LIVE state is a LIVE attempt's that never armed: no LIVE start, so this run is a first "
+                     "start")
+            return None
+        return bundle
+
+    def saves_from_the_start(self) -> bool:
+        return bool(self.meta.get("armed_at"))
+
     def read_shadow_proof(self) -> dict | None:
+        if self.proof_read:
+            return self.proof
+        self.proof_read = True
         try:
             b = open_bundle(self.dir / "state-shadow.enc.json", self.password, "shadow")
         except statebox.BoxError:
@@ -1436,7 +1545,8 @@ class LiveRun(Run):
             meta = (json.loads(files.get("desk.json") or "null") or {}).get("meta")
         except ValueError:
             return None
-        return shadow_proof(account, meta)
+        self.proof = shadow_proof(account, meta)
+        return self.proof
 
     def client_for(self, key):
         from . import coinbase_live
@@ -1455,7 +1565,39 @@ class LiveRun(Run):
                          if "Not going live on Coinbase:" in ln), "an arming check failed")
             raise Stop("refused", f"not armed: {fail}")
         self.meta["armed_at"] = self.meta.get("armed_at") or int(self.clock() * 1000)
+        if not self.changed:
+            self.begin_saving()         # LIVE's first start: from its arming on, the run is saved
         return got[0]
+
+    def stopped(self, why: str) -> None:
+        """A LIVE run that stopped before it ever armed saves nothing (no state, board, status or kill), so the branch
+        is as it was: SHADOW carries on and the next LIVE run is a first start again. With no state to remember a push
+        in, it pushes at every such run while SHADOW's record is fresh enough to arm on (under 2 hours), then once
+        every 6 hours by the clock."""
+        if self.changed:
+            return super().stopped(why)
+        from .coinbase_live import SHADOW_FRESH_MS
+
+        last = int((self.read_shadow_proof() or {}).get("last_run_ts") or 0)
+        fresh = last > 0 and 0 <= self.now - last < SHADOW_FRESH_MS
+        if not fresh and self.now % PUSH_EVERY_MS >= 15 * 60_000:
+            return
+        stale = "" if fresh else (
+            " SHADOW's last run is over 2 hours old, so LIVE can't arm until SHADOW has run again: put the SHADOW run "
+            "step back (docs/coinbase-setup.md, Part 2)." if last else
+            " SHADOW has no record here that DESK_STATE_KEY opens, so LIVE can't arm until SHADOW has run on this "
+            "account (docs/coinbase-setup.md, Part 1).")
+        self.push(f"{COIN} LIVE: not armed",
+                  f"LIVE didn't arm: {why.removeprefix('not armed: ')}. No order was sent, and nothing was saved: the "
+                  f"coinbase-state branch and SHADOW's state are as they were, and the next LIVE run is a first start "
+                  f"again.{stale} Paper is unaffected.", "high", "warning")
+
+    def public_line(self) -> str:
+        if self.code != 0 and not self.changed and not self.refused_before_state:
+            why = self.public_why or ("an arming check failed" if self.problem == "refused" else self.problem or "error")
+            return (f"LIVE BTC: not armed: {why} (no order sent; nothing saved: the branch and SHADOW's state are "
+                    f"as they were)")
+        return super().public_line()
 
     def watchdog(self, key) -> None:
         """A run that refuses still looks, read only: a stop resting with no position (it would open one: Coinbase has
