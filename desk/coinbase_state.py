@@ -31,19 +31,21 @@ isn't the desk's: notes, say; one you deleted since the load stays deleted; a .g
 change how git stores the desk's files; .github/ is kept exactly as it is), writes the branch's kills.json (your edits)
 with every kill the desk set added (kills.set.json, kills.desk.json), and moves the branch's last state to .prev.
 
-kills.json is yours, so a typo in it never stops a save, and never turns a switch off: kills_read is how the runs,
-check and stage all read it. One it can't read (not JSON, a key it doesn't know, a switch that isn't true or false, a
-key written twice, a symlink) fails closed: entry_kill on, and every switch it names on unless its value says off
-(false, null, 0, "false", "no", "off", "none", "nil", "", or a near-typo of false, null, off or no, like "fasle"; any
-other word, "now" or "flat" say, is on). Its switch words are DESK_COINBASE_KILL's: flat, close (close_all,
-close_position) and flatten for flat_kill, entry (entry_kill, no_entries) for entry_kill, anywhere in a name. The save
-keeps such a file exactly as you wrote it, so every run reads it the same way and says so until you fix it. A kill the
-desk sets while it can't read the file is kept in kills.desk.json and written into kills.json at the first save that
-can: fixing the typo never turns it off; setting it to false in a kills.json the desk can read, once it's there,
-does (kills_effective). A file of yours named like a kill switch anywhere on the branch (kill_like) turns entry_kill
-on, said so. LIVE counts on this branch only once it has armed: its status says "armed": true. A LIVE run that never
-armed saves nothing (desk/coinbase_run.py), check refuses a LIVE status that isn't armed, and a LIVE status without it
-(a LIVE attempt that never armed, before this rule) is no LIVE start: SHADOW saves over it and stage drops its files.
+kills.json is yours, so a typo in it never stops a save, and never turns a switch off: kills_read is how the runs, check
+and stage all read it. One it can't read (not JSON, a key it doesn't know, a switch that isn't true or false, a key
+written twice, a symlink) fails closed: entry_kill on, and every switch it names on unless its value says off (false,
+null, 0, "false", "no", "off", "none", "nil", "", or a near-typo of false, null, off or no, like "fasle"; any other
+word, "now" or "flat" say, is on). Its switch words are DESK_COINBASE_KILL's: flat, close (close_all, close_position)
+and flatten for flat_kill, entry (entry_kill, no_entries) for entry_kill, anywhere in a name. The save keeps such a file
+exactly as you wrote it, so every run reads it the same way and says so until you fix it. A kill the desk sets while it
+can't read the file is kept in kills.desk.json and written into kills.json at the first save that can: fixing the typo
+never turns it off, nor does deleting or renaming kills.json (the next save writes a new one with it on); setting it to
+false in a kills.json the desk can read, once it's there, does (kills_effective). A kills.json you delete while a run is
+under way stays deleted, your switches with it. A file of yours named like a kill switch anywhere on the branch
+(kill_like) turns entry_kill on, said so. LIVE counts on this branch only once it has armed: its status says "armed":
+true. A LIVE run that never armed saves nothing (desk/coinbase_run.py), check refuses a LIVE status that isn't armed,
+and a LIVE status without it (a LIVE attempt that never armed, before this rule) is no LIVE start: SHADOW saves over it
+and stage drops its files.
 
 check runs against the branch as git has it (GitBranch) or, inside a run, as the run loaded it (Loaded: the load step
 extracts the branch into the state dir), so a run can tell before the save step that its save would be refused.
@@ -415,13 +417,18 @@ def kills_effective(raw: bytes | str | None, plain: bool = True, desk_raw: bytes
     failing closed (kills_read), with every kill the desk set and you haven't cleared (BTC/kills.desk.json) on. You
     clear one on purpose by setting it to false in a kills.json the desk can read, once the desk has written it there
     (DESK_WRITTEN); one it couldn't write yet (DESK_PENDING: kills.json couldn't be read when it was set) stays on, so
-    fixing a typo never turns it off. Returns (switches, why kills.json can't be read or None, the record after)."""
+    fixing a typo never turns it off. With no kills.json at all (you deleted it, or renamed it) nothing says false: the
+    desk's kills stay on, pending, and the next save writes them into a new kills.json. Returns (switches, why
+    kills.json can't be read or None, the record after)."""
     got = kills_read(raw, plain)
     kills, record = dict(got.kills), {}
     for sw, st in desk_kills_read(desk_raw, desk_plain).items():
-        if got.why is None and not got.kills.get(sw) and st == DESK_WRITTEN:
+        if raw is None:
+            record[sw] = DESK_PENDING       # no file says false: still on, written into the next kills.json
+        elif got.why is None and not got.kills.get(sw) and st == DESK_WRITTEN:
             continue                        # you cleared it, in a kills.json the desk can read
-        record[sw] = DESK_WRITTEN if got.why is None and got.kills.get(sw) else st
+        else:
+            record[sw] = DESK_WRITTEN if got.why is None and got.kills.get(sw) else st
         kills[sw] = True
     return kills, got.why, record
 
@@ -469,18 +476,23 @@ def _local(state_dir: Path, branch, loaded=None) -> dict[str, bytes]:
     return out
 
 
-def _kills_here(files: dict, branch) -> tuple[bytes | None, bool]:
+def _kills_here(files: dict, branch, loaded=None) -> tuple[bytes | None, bool]:
+    """BTC/kills.json as this save takes it: the branch's now (your edits since the load win). None there: with the
+    load known, one it had is one you deleted since (gone: your switches with it, the desk's own kept by
+    kills_effective); otherwise the state dir's (a first save)."""
     raw, plain = branch_kills(branch)
     if raw is None and plain:
+        if loaded is not None and branch_kills(loaded)[0] is not None:
+            return None, True                       # you deleted it after the load
         return files.get("kills.json"), True        # none on the branch yet: the one loaded (a first save)
     return raw, plain
 
 
-def kills_staged(files: dict, branch) -> tuple[dict, str | None, dict]:
+def kills_staged(files: dict, branch, loaded=None) -> tuple[dict, str | None, dict]:
     """The switches as this save reads them (kills_effective, on the branch's kills.json and kills.desk.json), and the
     record with this run's own kills (kills.set.json) in it."""
     desk_raw, desk_plain = branch_file(branch, DESK_KILLS)
-    kills, why, record = kills_effective(*_kills_here(files, branch), desk_raw, desk_plain)
+    kills, why, record = kills_effective(*_kills_here(files, branch, loaded), desk_raw, desk_plain)
     if "kills.set.json" in files:
         for k, v in check_kills(_json(files["kills.set.json"], "kills.set.json"), "kills.set.json").items():
             if k in KILL_KEYS and v and k not in record:
@@ -501,7 +513,7 @@ def check(state_dir: str | Path, remote_ref: str | None = None, branch=None, loa
         elif name == "kills.set.json":
             check_kills(_json(data, f"{COIN}/{name}"), f"{COIN}/{name}")
     # kills.json is yours: stage saves the branch's (or, with none there yet, this one), as kills_effective reads it
-    kills, why, record = kills_staged(files, b)
+    kills, why, record = kills_staged(files, b, loaded)
     if why:
         on = ", ".join(k for k in KILL_KEYS if kills[k])
         said.append(f"{KILLS} can't be read ({why}): kept as you wrote it; every run reads it failing closed "
@@ -635,9 +647,9 @@ def stage(state_dir: str | Path, work: str | Path, remote_ref: str | None = None
         (out / f"state-{mode}.prev.enc.json").write_bytes(old_state)
     elif old_prev is not None:
         (out / f"state-{mode}.prev.enc.json").write_bytes(old_prev)
-    raw, plain = _kills_here(files, b)
+    raw, plain = _kills_here(files, b, loaded)
     got = kills_read(raw, plain)
-    _, _, record = kills_staged(files, b)
+    _, _, record = kills_staged(files, b, loaded)
     if got.why is None or any(not got.kills[k] for k in record):
         # read as written (or a desk kill the file can't carry): written valid, with every kill the desk set on, and
         # from then on the desk's record says it's in kills.json (DESK_WRITTEN: you clear it there)

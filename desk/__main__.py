@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import pickle
+import re
 import sys
 from pathlib import Path
 
@@ -383,6 +385,18 @@ def _live_confirmed() -> bool:
     return os.environ.get("DESK_LIVE_CONFIRM") == LIVE_CONFIRM_PHRASE
 
 
+def max_notional(text) -> float | None:
+    """--max-notional as given, read leniently: a number of USD, with any $, commas, underscores and spaces left out
+    ("1,000", "$1000"); blank, not a number, or not above 0: None. (A repository variable that's deleted or mistyped
+    must never stop Coinbase LIVE before its run starts: once armed, a missing cap is a protect-only run.)"""
+    t = re.sub(r"[\s$,_]", "", str(text or ""))
+    try:
+        v = float(t)
+    except ValueError:
+        return None
+    return v if math.isfinite(v) and v > 0 else None
+
+
 def cmd_shadow(args) -> int:
     """SHADOW (desk/coinbase_run.py): one check of the real Coinbase account, read only. stdout and stderr are
     captured from here on: the Actions log is public, so it gets the key's masks and one line, nothing else."""
@@ -390,10 +404,10 @@ def cmd_shadow(args) -> int:
 
     env = dict(os.environ)
     paper_board = None
-    if args.paper_board and Path(args.paper_board).exists():
+    if args.paper_board:
         try:
             paper_board = json.loads(Path(args.paper_board).read_text())
-        except ValueError:
+        except (OSError, ValueError):
             paper_board = None
 
     def go(mask_emit, buf):
@@ -409,7 +423,9 @@ COINBASE_LOOP = ("  Coinbase LIVE runs one check per call (--once), the way GitH
 
 
 def cmd_live_coinbase(args, p) -> int:
-    """LIVE on Coinbase: LOCKED behind coinbase_live.arm() (README: Going live on Coinbase). One check per call."""
+    """LIVE on Coinbase: LOCKED behind coinbase_live.arm() (README: Going live on Coinbase). One check per call. The
+    go-live gate is read inside the run (captured), and only at a first start: an unreadable report or ledger is a
+    gate that doesn't pass, never a traceback before the run's safety pass."""
     from . import coinbase_run as cr
 
     if not args.once:
@@ -422,10 +438,10 @@ def cmd_live_coinbase(args, p) -> int:
               "with the Actions job stopped.")
         return 2
     env = dict(os.environ)
-    gate = promotion_status(p)
 
     def go(mask_emit, buf):
-        return cr.run_live_once(args.state_dir, env, max_notional=args.max_notional, gate=gate,
+        return cr.run_live_once(args.state_dir, env, max_notional=max_notional(args.max_notional),
+                                max_notional_text=args.max_notional, gate=lambda: promotion_status(p),
                                 force_unproven=args.force_unproven, base_url=cr.base_url_from(env),
                                 mask_emit=mask_emit, stray=buf)
 
@@ -450,8 +466,9 @@ def cmd_live(args) -> int:
             print("\n  Not going live: the desk hasn't proven itself yet. Keep paper trading.")
             return 2
         print("\n  --force-unproven: you are overriding the go-live gate. This is your call, not the desk's.")
-    if args.max_notional is None:
-        print("  live requires --max-notional (start with something you can lose, e.g. 50)")
+    cap = max_notional(args.max_notional)
+    if cap is None:
+        print("  live requires --max-notional, a number of USD (start with something you can lose, e.g. 50)")
         return 2
     if not _live_confirmed():
         print(f'  set DESK_LIVE_CONFIRM="{LIVE_CONFIRM_PHRASE}" in .env to arm live trading.')
@@ -460,7 +477,7 @@ def cmd_live(args) -> int:
 
     try:
         runner.run(p, "live", poll_s=args.poll, host=args.host, port=args.port, dashboard=not args.no_dashboard,
-                   max_notional=args.max_notional, jev=_jev(p))
+                   max_notional=cap, jev=_jev(p))
     except LiveSetupError as exc:
         print(f"\n  Not going live: {exc}")
         return 2
@@ -574,7 +591,7 @@ def main(argv=None) -> int:
         if name == "paper":
             sp.add_argument("--ledger", default=None, help="default ledger/<COIN>")
         if name == "live":
-            sp.add_argument("--max-notional", type=float, default=None, help="hard USD cap per position")
+            sp.add_argument("--max-notional", default=None, help="hard USD cap per position (a number of USD)")
             sp.add_argument("--force-unproven", action="store_true", help="override the go-live gate (don't)")
             sp.add_argument("--once", action="store_true", help="BTC on Coinbase: one check, then exit (Actions)")
             sp.add_argument("--state-dir", default="state", help="BTC on Coinbase: where its encrypted state is")

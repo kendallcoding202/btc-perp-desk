@@ -6,17 +6,22 @@ What it can't do is the point:
   * GET only on READ_ALLOWLIST: the futures account, positions, orders, fills, the fee tier, key permissions, sweeps
     (read), the margin window, products, the portfolio's accounts (v3), and the v2 USD wallet's transactions. Any other
     path is refused before anything is sent (PathNotAllowed).
-  * POST only with a valid Armed token (desk/coinbase_live.py, the one place that makes one, after every arming
-    check), and even then only to ORDER_PATHS: create an order, batch-cancel, close a position. Without it every POST
-    raises OrdersLocked before a socket opens: SHADOW holds a client built with no token, so even a bug in its overlay
-    can't reach the exchange. A PROTECT-ONLY token (an armed LIVE whose new-risk check failed this run) lets through only
-    what can't add risk, checked here against the position read just before (_protect_check): a cancel; a close of at
-    most the contracts held; a stop-limit on the closing side that, with the closing contracts already resting, covers
-    at most the position, and is no wider than the saved stop. An entry, an add, a stop on the wrong side or one
-    further from the price: OrdersLocked, before anything is sent. Never: /orders/preview (it needs only view, but this desk doesn't preview with
-    credentials), /orders/edit (futures orders can't be edited: CANNOT_EDIT_FUTURES_ORDER), sweeps or any transfer
-    (they need the Transfer permission the desk's keys never have), the intraday margin setting, portfolio moves, any
-    v2 write. There is no delete() or put().
+  * POST only with a valid Armed token (desk/coinbase_live.py, the one place that makes one, after every arming check),
+    and even then only to ORDER_PATHS: create an order, batch-cancel, close a position. Without it every POST raises
+    OrdersLocked before a socket opens: SHADOW holds a client built with no token, so even a bug in its overlay can't
+    reach the exchange. A PROTECT-ONLY token (an armed LIVE whose new-risk check failed this run) lets through only what
+    can't add risk, checked here against the position and every open order on the product read just before
+    (_protect_check: every open status, a QUEUED one included, a CANCEL_QUEUED one counted for nothing since Coinbase
+    cancels it at the reopen before anything trades; and every placement source the desk reads, the app's included),
+    and only in the exact shapes coinbase_orders builds: a cancel; a close of at most the contracts
+    held that leaves no more closing contracts resting than the position it leaves; a stop-limit on the closing side
+    (its stop_direction that side's, its limit on the closing side of its trigger) that, with the closing contracts
+    already resting, covers at most the position, and is no wider than the saved stop. An entry, an add, a stop on the
+    wrong side or one further from the price, a body with a key the desk never sends: OrdersLocked, before anything is
+    sent. Never: /orders/preview (it needs only view, but this desk doesn't preview with credentials), /orders/edit
+    (futures orders can't be edited: CANNOT_EDIT_FUTURES_ORDER), sweeps or any transfer (they need the Transfer
+    permission the desk's keys never have), the intraday margin setting, portfolio moves, any v2 write. There is no
+    delete() or put().
 
 Errors (all CoinbaseError; no message carries a header, a token, a 2xx body or an amount):
   401  Coinbase answers text/plain "Unauthorized\\n" and nothing else, for a wrong key, a bad signature, an expired
@@ -60,6 +65,7 @@ POST_RETRIES = 2
 BACKOFF_S = 2.0
 BACKOFF_CAP_S = 20.0
 PROTECT_S = 60.0            # how far past the run's deadline a protective sequence may go (protecting())
+MIN_REQUEST_S = 2.0         # what one request is counted as, at least, in a sequence's worst case (worst_s)
 ERROR_BODY_MAX = 64_000
 USER_AGENT = "btc-perp-desk"
 _V3 = "/api/v3/brokerage"
@@ -90,6 +96,10 @@ READ_ALLOWLIST = tuple(re.compile(p) for p in (
 PUBLIC_TIME = f"{_V3}/time"           # Coinbase's clock: public, no key, answered no-store
 ORDER_PATHS = frozenset({f"{_V3}/orders", f"{_V3}/orders/batch_cancel", f"{_V3}/orders/close_position"})
 RETRY_STATUS = {429, 500, 502, 503, 504}
+# order_placement_source read besides the default (RETAIL_ADVANCED, the API's): the app's. Coinbase lists only the
+# default unless asked, so every read of the open orders asks for these too (and for any the desk's own orders carry)
+OTHER_SOURCES = ("RETAIL_SIMPLE",)
+OPEN_LIKE = ("PENDING", "QUEUED", "CANCEL_QUEUED", "EDIT_QUEUED")     # read besides OPEN (which can't be combined)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -202,6 +212,8 @@ class CoinbaseREST:
         self.posts_sent = 0                     # non-GET requests that left this process (each try)
         self.posts_paths: list[str] = []        # each order call asked for (its path's last part), for the run's report
         self.last_latency_ms = 0.0
+        self.slowest_s = 0.0                    # the slowest try this run (an answer, an error or a timeout)
+        self.learned_sources: list[str] = []    # placement sources the desk's own orders turned out to carry
         self._last_call: float | None = None
         # The tests' fake runs on loopback: never through a proxy from the environment
         handlers = [_NoRedirect()] + ([urllib.request.ProxyHandler({})] if base_url != DEFAULT_BASE else [])
@@ -237,10 +249,27 @@ class CoinbaseREST:
     def is_protecting(self) -> bool:
         return self._protecting > 0
 
-    def server_skew(self) -> float:
-        """Coinbase's clock minus this machine's, from its public time endpoint (no key). Over MAX_SKEW_S refuses:
-        a token signed on a clock that far off is refused with a bare 401. Every token after this is signed on
-        Coinbase's clock (this machine's plus the skew), so a smaller skew either way can't make one look early."""
+    @property
+    def protect_only(self) -> bool:
+        """This client holds a protect-only token (_protect_check reads the account before each order)."""
+        return self._armed is not None and getattr(self._armed, "scope", "trade") != "trade"
+
+    def worst_s(self, requests: int, waits_s: float = 0.0) -> float:
+        """The worst case, in seconds, of a sequence of `requests` requests and `waits_s` of waiting: each request at
+        half again the slowest try this run has seen, and never under MIN_REQUEST_S. A slow Coinbase makes a sequence
+        that must not stop half way (a stop cancelled for a close) not start at all."""
+        return requests * max(MIN_REQUEST_S, 1.5 * self.slowest_s) + waits_s
+
+    def sources(self) -> list[str | None]:
+        """The placement sources every read of the open orders lists: the default (None: RETAIL_ADVANCED), the app's,
+        and any the desk's own orders turned out to carry."""
+        out: list[str | None] = [None, *OTHER_SOURCES]
+        return out + [x for x in self.learned_sources if x not in out and x != "RETAIL_ADVANCED"]
+
+    def measure_skew(self) -> float:
+        """Coinbase's clock minus this machine's, from its public time endpoint (no key), kept for signing whatever
+        it is. server_skew refuses one over MAX_SKEW_S; the read-only watchdog of a run refused over the clock still
+        signs its reads on Coinbase's clock with it."""
         t0 = self.clock()
         out = self._request("GET", PUBLIC_TIME, None, None, auth=False, retries=GET_RETRIES)
         t1 = self.clock()
@@ -249,11 +278,17 @@ class CoinbaseREST:
                 float(out["epochSeconds"])
         except (KeyError, TypeError, ValueError):
             raise CoinbaseDataError("Coinbase's time answer has no epochMillis or epochSeconds") from None
-        skew = server - (t0 + t1) / 2
+        self.skew_s = server - (t0 + t1) / 2
+        return self.skew_s
+
+    def server_skew(self) -> float:
+        """measure_skew, refused over MAX_SKEW_S: a token signed on a clock that far off is refused with a bare 401,
+        and a machine's clock that far off isn't one to trade on. Every token after this is signed on Coinbase's clock
+        (this machine's plus the skew), so a smaller skew either way can't make one look early."""
+        skew = self.measure_skew()
         if abs(skew) > MAX_SKEW_S:
             raise ClockSkewError(f"this machine's clock is {-skew:+.1f} s off Coinbase's (more than {MAX_SKEW_S:.0f} "
-                                 f"s): Coinbase's signed tokens live 2 minutes. Not calling it.")
-        self.skew_s = skew
+                                 f"s): Coinbase's signed tokens live 2 minutes. Not calling it")
         return skew
 
     # ---- calls
@@ -320,51 +355,86 @@ class CoinbaseREST:
 
     def _protect_check(self, path: str, body: dict, armed) -> None:
         """A protect-only token's order: only a cancel, or an order that can only shrink the position Coinbase holds
-        now (read here, just before). Anything else raises OrdersLocked, before anything is sent."""
-        from .coinbase_orders import PRICE_STEP, amount, parse_order, parse_position
+        now, in the exact shape coinbase_orders builds. The position and every open order on the product are read
+        here, just before (every open status and every placement source the desk reads: a stop queued while Coinbase
+        is closed, or one placed in the app, closes as much as any). Anything else raises OrdersLocked, before
+        anything is sent."""
+        from .coinbase_orders import STOP_LIMIT_FALLBACKS, PRICE_STEP, amount, is_desk_cid, parse_order, \
+            parse_position
 
         def refuse(why: str):
             raise OrdersLocked(f"protect only: POST {path} refused before anything was sent: {why}. An armed LIVE whose "
                                f"new-risk check failed this run sends only cancels and orders that shrink the position")
 
-        if path == f"{_V3}/orders/batch_cancel":
-            return
         b = body if isinstance(body, dict) else {}
+        if path == f"{_V3}/orders/batch_cancel":
+            ids = b.get("order_ids")
+            if set(b) != {"order_ids"} or not isinstance(ids, list) or not ids or \
+                    not all(isinstance(i, str) and i for i in ids):
+                refuse("its body isn't a cancel the desk builds")
+            return
+        close = path == f"{_V3}/orders/close_position"
+        want = {"client_order_id", "product_id", "size"} if close else \
+            {"client_order_id", "product_id", "side", "order_configuration"}
+        if set(b) != want or not is_desk_cid(b.get("client_order_id")):
+            refuse("its body isn't one the desk builds (a key it never sends, or no desk client id)")
         if b.get("product_id") != armed.product:
             refuse(f"it isn't for {armed.product}")
-        close = path == f"{_V3}/orders/close_position"
         cfg = b.get("order_configuration") if isinstance(b.get("order_configuration"), dict) else {}
         sl = cfg.get("stop_limit_stop_limit_gtc")
         if not close and (set(cfg) != {"stop_limit_stop_limit_gtc"} or not isinstance(sl, dict)):
             refuse("it isn't a stop (an entry or an add)")
+        if not close and set(sl) != {"base_size", "stop_price", "limit_price", "stop_direction"}:
+            refuse("its stop isn't one the desk builds")
         try:
             n = amount(b.get("size") if close else sl.get("base_size"), "size")
             trig = None if close else amount(sl.get("stop_price"), "stop_price")
+            limit = None if close else amount(sl.get("limit_price"), "limit_price")
         except CoinbaseDataError:
             refuse("its body isn't one the desk builds")
+        if n is None or n < 1 or abs(n - round(n)) > 1e-9:
+            refuse("its size isn't a whole number of contracts")
         rows = self.get(f"{_V3}/cfm/positions").get("positions")
         if not isinstance(rows, list):
             raise CoinbaseDataError("Coinbase's positions answer has no positions list")
         pos = next((q for q in (parse_position(r) for r in rows) if q and q["product_id"] == armed.product), None)
         if pos is None:
             refuse("there is no position to protect")
+        closing = "SELL" if pos["side"] == "long" else "BUY"
+        rows = []
+        for src in self.sources():
+            extra = {} if src is None else {"order_placement_source": src}
+            rows += self.get_pages(f"{_V3}/orders/historical/batch", {"order_status": "OPEN", "product_ids":
+                                                                     armed.product, "limit": 100, **extra}, "orders")
+            rows += self.get_pages(f"{_V3}/orders/historical/batch", {"order_status": list(OPEN_LIKE), "product_ids":
+                                                                     armed.product, "limit": 100, **extra}, "orders")
+        seen, resting = set(), 0.0
+        for o in (parse_order(r) for r in rows):
+            if o["id"] in seen or o["symbol"] != armed.product or o["side"] != closing.lower() or \
+                    o["status"] not in ("open", "canceling") or o.get("cancel_queued"):
+                continue            # (a CANCEL_QUEUED order is cancelled at the reopen, before anything trades)
+            seen.add(o["id"])
+            resting += o["remaining"] if o["remaining"] is not None else (o["amount"] or 0.0)
         if close:
             if n > pos["contracts"]:
                 refuse(f"a close of {n:g} contracts is more than the {pos['contracts']} held")
+            if resting > pos["contracts"] - n + 1e-9:
+                refuse(f"{resting:g} closing contracts rest against the {pos['contracts']} held: a close of {n:g} "
+                       f"would leave them to open a position")
             return
-        closing = "SELL" if pos["side"] == "long" else "BUY"
         if b.get("side") != closing:
             refuse(f"a {b.get('side')} stop doesn't close a {pos['side']} position")
-        rows = self.get_pages(f"{_V3}/orders/historical/batch", {"order_status": "OPEN", "product_ids": armed.product,
-                                                                 "limit": 100}, "orders")
-        resting = sum(o["remaining"] or 0.0 for o in (parse_order(r) for r in rows)
-                      if o["symbol"] == armed.product and o["side"] == closing.lower() and o["status"] == "open")
+        if sl.get("stop_direction") != ("STOP_DIRECTION_STOP_DOWN" if closing == "SELL" else "STOP_DIRECTION_STOP_UP"):
+            refuse(f"its stop_direction isn't a {closing} stop's")
+        sign = 1 if pos["side"] == "long" else -1
+        if (trig - limit) * sign < 0 or abs(trig - limit) > max(STOP_LIMIT_FALLBACKS) * trig + PRICE_STEP:
+            refuse(f"its limit {limit:,.0f} isn't on the closing side of its trigger {trig:,.0f}, within "
+                   f"{max(STOP_LIMIT_FALLBACKS):.0%}")
         if resting + n > pos["contracts"] + 1e-9:
             refuse(f"{resting:g} closing contracts already rest against the {pos['contracts']} held; {n:g} more could "
                    f"open a position")
         floor = armed.floor
         if floor and floor.get("side") == pos["side"]:
-            sign = 1 if pos["side"] == "long" else -1
             if (trig - float(floor["stop"])) * sign < -PRICE_STEP:
                 refuse(f"the stop at {trig:,.0f} is wider than the saved one ({float(floor['stop']):,.0f})")
 
@@ -420,6 +490,7 @@ class CoinbaseREST:
                 status = None
             self.requests += 1
             self.last_latency_ms = (self.clock() - t) * 1000
+            self.slowest_s = max(self.slowest_s, self.last_latency_ms / 1000)
             if status is not None:
                 try:
                     out = self._answer(method, path, status, body, ctype)

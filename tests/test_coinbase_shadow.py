@@ -122,12 +122,15 @@ def test_a_key_that_can_trade_or_move_money_is_refused_before_any_account_read(f
     assert sh.status()["problem"] == "permissions" and sh.status()["ok"] is False
 
 
-def test_a_key_on_another_portfolio_is_alerted(fake, tmp_path):
+def test_a_key_on_another_portfolio_is_refused_before_any_money_is_read(fake, tmp_path):
     fk = make_ec_key()
     fk.portfolio_type = "CONSUMER"
     sh = Shadow(fake, tmp_path, fk)
-    assert sh.run()[0] == 0
-    assert any("not DEFAULT" in a for a in sh.r.alerts)
+    code, r = sh.run()
+    assert code == 2 and r.problem == "permissions"                 # before: an alert, and the run went on
+    assert not any("/cfm/balance_summary" in q["path"] or "/accounts" in q["path"] for q in fake.requests)
+    assert sh.status()["note"] == "the key isn't on the Default portfolio"
+    assert any("not Default" in b for _, b, *_ in sh.pushes)
 
 
 # ---------------------------------------------------------------- the would-send script: entry, stop, trail, exit

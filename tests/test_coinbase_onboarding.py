@@ -125,3 +125,154 @@ def test_a_saved_status_with_runs_and_no_state_file_still_refuses_a_younger_stat
     _git("update-ref", REF, "HEAD", cwd=repo)
     said = cs.check(_state_dir(tmp_path / "new2", runs=1, started=5_000), REF)
     assert any("first save" in ln for ln in said), said
+
+
+# ---------------------------------------------------------------- round 4: the wrong portfolio, pushes, the password
+# Each fails on the code before it (da2c7f8): a key on another portfolio ran as OK, opened the account on that
+# portfolio's money, and the fix the desk's own alert asked for read as a +$700 move nothing explained (entry_kill set,
+# LIVE's 7 clean days restarted); a refusal with no state pushed only in a 15-minute slot every 6 hours (a password
+# changed at 15:00 said nothing until 18:00); nothing said when SHADOW worked again.
+
+OTHER_PF = "99999999-2222-3333-4444-555555555555"
+
+
+def _other_portfolio(fake, label, kind="CONSUMER", cbi=300.0):
+    """A key on another portfolio, and that portfolio's own money (its USD account, no transactions)."""
+    k = fake.add_key(make_ec_key(label, portfolio_uuid=OTHER_PF, portfolio_type=kind))
+    default = (fake.usd_account, fake.cbi, list(fake.transactions))
+    fake.usd_account, fake.cbi, fake.transactions = "bbbbbbbb-0000-4000-8000-000000000001", cbi, []
+
+    def back():
+        fake.usd_account, fake.cbi, fake.transactions = default
+    return k, back
+
+
+def _titles(sh, n0=0):
+    return [p[0] for p in sh.pushes[n0:]]
+
+
+@pytest.mark.parametrize("other_cbi", [0.0, 300.0, 5000.0])
+def test_a_key_on_another_portfolio_is_refused_and_the_default_key_then_opens_cleanly(first, other_cbi):
+    sh, fake, br, job = first
+    k, back = _other_portfolio(fake, f"onb4-pf-{int(other_cbi)}-not-real", cbi=other_cbi)
+    for _ in range(2):
+        code, r, changed, saved = job.run(over={"COINBASE_CDP_KEY": k.file_json()})
+        assert code == 2 and r.problem == "permissions" and saved is not False, br.errors   # before: OK, opened
+        assert not any("/cfm/balance_summary" in q["path"] for q in fake.requests[-12:])
+        _next(fake)
+    st = job.status()
+    assert st["ok"] is False and st["note"] == "the key isn't on the Default portfolio"
+    assert any("not Default" in b for _, b, *_ in sh.pushes)
+    back()
+    n0 = len(sh.pushes)
+    for _ in range(16):                             # past the 3-hour wait for a move nothing explains
+        code, r, changed, saved = job.run()
+        assert code == 0 and saved, (r.lines[-4:], br.errors)
+        _next(fake)
+    titles = _titles(sh, n0)
+    assert not any("ALERT" in t for t in titles), [p[:2] for p in sh.pushes[n0:]]      # before: "+700 ... ALERT"
+    assert "BTC/kills.desk.json" not in br.files()
+    meta = sh.file("shadow", "desk.json")["meta"]
+    assert meta["opened"]["amount"] == 1_000.0                          # the Default portfolio's money
+    days = sh.file("shadow", "account.json")["days"]
+    assert not any(d.get("unexplained") for d in days.values())
+    assert job.status()["ok"] is True and job.status()["note"] is None
+
+
+def test_a_key_on_another_logins_default_portfolio_is_another_account_not_money_moving(first):
+    sh, fake, br, job = first
+    for _ in range(2):
+        assert job.run()[0] == 0
+        _next(fake)
+    assert sh.file("shadow", "desk.json")["meta"]["opened"]["amount"] == 1_000.0
+    k, _ = _other_portfolio(fake, "onb4-login2-not-real", kind="DEFAULT", cbi=300.0)
+    n0 = len(sh.pushes)
+    switched = fake.clock_ms()
+    for _ in range(16):
+        code, r, changed, saved = job.run(over={"COINBASE_CDP_KEY": k.file_json()})
+        assert code == 0 and saved, (r.lines[-4:], br.errors)
+        _next(fake)
+    bodies = [b for _, b, *_ in sh.pushes[n0:]]
+    assert any("another account, not money moving" in b for b in bodies), bodies
+    assert not any("isn't explained" in b or "nothing the desk can read explains" in b for b in bodies), bodies
+    assert "BTC/kills.desk.json" not in br.files() and not cs.read_kills(br.files()["BTC/kills.json"])[0]["entry_kill"]
+    meta = sh.file("shadow", "desk.json")["meta"]
+    assert meta["opened"]["amount"] == 300.0 and meta["periods"][-1]["start_equity"] == 1_000.0
+    acct = sh.file("shadow", "account.json")
+    assert acct["portfolio_uuid"] == OTHER_PF and abs(acct["portfolio_since_ts"] - switched) < 60_000
+    from desk import coinbase_run as cr
+    assert cr.shadow_proof(acct, meta)["started_ts"] == acct["portfolio_since_ts"]     # its 14 days start again
+
+
+def test_a_first_refusal_with_no_state_is_pushed_at_once_then_every_6_hours(first):
+    sh, fake, br, job = first
+    fake.now_s = (fake.now_s // 21600) * 21600 + 3 * 3600 + 4 * 60      # 15:04 UTC: outside the 6-hourly window
+    over = {"DESK_STATE_KEY": "x" * 31}
+    n0 = len(sh.pushes)
+    assert job.run(over=over)[3] is not False
+    assert _titles(sh, n0) == ["BTC SHADOW: not working"]               # before: nothing until 18:04
+    assert ".." not in sh.pushes[-1][1]
+    for _ in range(3):
+        _next(fake)
+        n0 = len(sh.pushes)
+        job.run(over=over)
+        assert _titles(sh, n0) == []                                    # the same one again: not news
+    fake.now_s = (fake.now_s // 21600) * 21600 + 21600 + 10 * 60        # 18:10: the window
+    n0 = len(sh.pushes)
+    job.run(over=over)
+    assert _titles(sh, n0) == ["BTC SHADOW: not working"]
+    _next(fake)
+    n0 = len(sh.pushes)
+    code, r, changed, saved = job.run()
+    assert code == 0 and saved and "BTC SHADOW: connected (read only)" in _titles(sh, n0)
+
+
+def test_a_changed_state_key_is_pushed_at_once_and_working_again_when_the_old_one_is_back(first):
+    sh, fake, br, job = first
+    fake.now_s = (fake.now_s // 21600) * 21600 + 3 * 3600 + 4 * 60
+    assert job.run()[0] == 0
+    new = {"DESK_STATE_KEY": "a-new-password-of-more-than-32-chars-xyz"}
+    _next(fake)
+    n0 = len(sh.pushes)
+    job.run(over=new)
+    assert _titles(sh, n0) == ["BTC SHADOW: not working"]
+    assert "doesn't open the saved" in sh.pushes[-1][1]
+    _next(fake)
+    n0 = len(sh.pushes)
+    job.run(over=new)
+    assert _titles(sh, n0) == []
+    _next(fake)
+    n0 = len(sh.pushes)
+    code, r, changed, saved = job.run()
+    assert code == 0 and saved and _titles(sh, n0) == ["BTC SHADOW: working again"], _titles(sh, n0)
+    assert "DESK_STATE_KEY doesn't open the saved state" in sh.pushes[-1][1]
+
+
+def test_a_run_that_stops_part_way_then_works_says_working_again_and_never_doubles_a_period(first):
+    sh, fake, br, job = first
+    assert job.run()[0] == 0
+    _next(fake)
+    fake.fail_next("GET", PERMISSIONS, 503, times=20)
+    n0 = len(sh.pushes)
+    assert job.run()[0] != 0
+    assert _titles(sh, n0) == ["BTC SHADOW: not working"] and ".." not in sh.pushes[-1][1]
+    fake.fail.clear()
+    _next(fake)
+    n0 = len(sh.pushes)
+    assert job.run()[0] == 0
+    assert _titles(sh, n0) == ["BTC SHADOW: working again"]
+
+
+def test_a_shadow_save_that_will_be_refused_is_pushed_at_its_first_run_outside_the_window(first):
+    sh, fake, br, job = first
+    fake.now_s = (fake.now_s // 21600) * 21600 + 3 * 3600 + 4 * 60
+    assert job.run()[0] == 0
+    br.edit(lambda d: (d / "BTC" / "status.json").unlink())
+    _next(fake)
+    n0 = len(sh.pushes)
+    code, r, changed, saved = job.run(over={"GITHUB_ACTIONS": "true"})
+    assert saved is False and _titles(sh, n0) == ["BTC SHADOW: NOT SAVED"]   # before: nothing until 18:04
+    _next(fake)
+    n0 = len(sh.pushes)
+    job.run(over={"GITHUB_ACTIONS": "true"})
+    assert _titles(sh, n0) == []

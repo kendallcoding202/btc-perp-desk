@@ -44,7 +44,7 @@ import math
 from ..feeds.coinbase import CoinbaseFeed, FeedError
 from ..thresholds import COINBASE
 from . import coinbase_orders as co
-from .coinbase_rest import (CoinbaseDataError, CoinbaseError, CoinbaseRejected, CoinbaseUnavailable,
+from .coinbase_rest import (OTHER_SOURCES, CoinbaseDataError, CoinbaseError, CoinbaseRejected, CoinbaseUnavailable,
                             CoinbaseUncertain)
 from .live import LiveSetupError
 
@@ -79,7 +79,6 @@ CANCEL_CODES = ("ORDER_IS_FULLY_FILLED", "INVALID_CANCEL_FCM_TRADING_SESSION", "
 SESSION_OPEN_STATE = "FCM_TRADING_SESSION_STATE_OPEN"
 SESSION_HALTED = "FCM_TRADING_SESSION_STATE_HALTED"
 SESSION_NO_CANCEL = "FCM_TRADING_SESSION_STATE_PRE_OPEN_NO_CANCEL"
-OTHER_SOURCES = ("RETAIL_SIMPLE",)      # order_placement_source read besides the default (RETAIL_ADVANCED): the app
 
 
 class OrderRefused(CoinbaseError):
@@ -188,6 +187,7 @@ class CoinbaseExchange:
         self.memo = memo if memo is not None else {}
         self.memo.setdefault("alerted", [])
         self.memo.setdefault("sources", [])     # placement sources the desk's own orders turned out to carry
+        self._tell_sources()
         self._quick = False                     # reads without retries (a protective step that has a fallback)
         self.sleep = sleep or rest.sleep
         self.options: dict = {}
@@ -388,6 +388,22 @@ class CoinbaseExchange:
         out += [x for x in self.memo.get("sources") or [] if x not in out and x != co.DESK_SOURCE]
         return out
 
+    def _tell_sources(self) -> None:
+        """The client's protect-only check reads the open orders under the same sources as this adapter."""
+        if isinstance(getattr(self.rest, "learned_sources", None), list):
+            self.rest.learned_sources = [x for x in self._sources() if x is not None and x not in OTHER_SOURCES]
+
+    def close_worst_s(self, cancels: int) -> float:
+        """The worst case of a close that cancels its stop first, in seconds (CoinbaseREST.worst_s): each cancel and
+        two reads of it, the position and orders read again, a protect-only client's own reads, close_position and two
+        reads of it, the position read again after it; and, if the close is refused, the same again to put the stop
+        back. None of it may stop half way, so none of it starts without the time for all of it."""
+        fresh = 1 + 2 * len(self._sources())
+        check = fresh if getattr(self.rest, "protect_only", False) else 0
+        reqs = 3 * cancels + fresh + check + 3 + fresh + (fresh + check + 3)
+        worst = getattr(self.rest, "worst_s", None)
+        return worst(reqs, (cancels + 3) * READBACK_WAIT_S) if worst is not None else 45.0
+
     def _open_orders_all(self) -> list[dict]:
         """Every open order on every product, from every placement source read (_sources): OPEN (which can't be combined
         with other statuses and leaves out PENDING and QUEUED orders that can still be cancelled), then PENDING, QUEUED,
@@ -422,7 +438,8 @@ class CoinbaseExchange:
         for o in self._open_orders_all():
             (mine if self.is_desks(o) else foreign).append(o)
         self.foreign["orders"] = [{"product_id": o["symbol"], "id": o["id"], "side": o["side"],
-                                   "contracts": o["remaining"] if o.get("remaining") is not None else o.get("amount"),
+                                   "contracts": 0.0 if o.get("cancel_queued") else
+                                   (o["remaining"] if o.get("remaining") is not None else o.get("amount")),
                                    "stop": o.get("triggerPrice"), "status": o["status"]} for o in foreign]
         return mine
 
@@ -634,7 +651,9 @@ class CoinbaseExchange:
     def watchdog(self) -> list[tuple[str, str]]:
         """Read only: what is wrong with the account's protection right now. Any run that can still read the account
         runs this, even one that refuses to act. A stop-limit that triggered and didn't fill, or whose limit the price
-        is past, is no working stop ("gapped"). What it read is kept in `watched` (position, the desk's orders)."""
+        is past, is no working stop ("gapped"). Closing orders resting for more contracts than the position holds
+        (the desk's and anyone's: with no reduce-only, if they all fire they open the other way) are "overclosing".
+        What it read is kept in `watched` (position, the desk's orders)."""
         pos, orders = self._fresh()
         self.watched = (pos, orders)
         out = []
@@ -650,6 +669,14 @@ class CoinbaseExchange:
                                      f"position: it would open one if it fired. Cancel it in Coinbase now"))
         else:
             stops = [o for o in orders if o["side"] == closing and o.get("triggerPrice") and o["status"] == "open"]
+            over = sum(float(o["remaining"] if o.get("remaining") is not None else (o.get("amount") or 0))
+                       for o in orders if o["side"] == closing and not o.get("cancel_queued")) + \
+                sum(float(o.get("contracts") or 0) for o in self.foreign_on_product(closing))
+            if over > pos["contracts"] + 1e-9:
+                out.append(("overclosing", f"closing orders for {over:g} contracts rest on {self.product} against "
+                                           f"the {pos['side']} {pos['contracts']:g} held: Coinbase has no reduce-only, "
+                                           f"so if they all fired they would open a position the other way. Cancel the "
+                                           f"extra in Coinbase now"))
             if not stops:
                 out.append(("unprotected", f"the {pos['side']} {pos['contracts']:g} contracts on {self.product} have "
                                            f"no stop resting on Coinbase"))
@@ -701,6 +728,7 @@ class CoinbaseExchange:
         src = o.get("placement")
         if src and src != co.DESK_SOURCE and src not in self.memo["sources"]:
             self.memo["sources"] = self.memo["sources"] + [src]
+            self._tell_sources()
             self._alert_once(f"source:{src}", f"Coinbase lists the desk's own orders under placement source {src}, "
                                               f"not {co.DESK_SOURCE}: the open orders are read under it too from now")
         return o
@@ -763,7 +791,7 @@ class CoinbaseExchange:
         if side != closing:
             raise OrderRefused(f"stop not sent: a {side} stop doesn't close a {pos['side']} position")
         resting = sum(float(o["remaining"] if o.get("remaining") is not None else (o.get("amount") or 0))
-                      for o in orders if o["side"] == closing)
+                      for o in orders if o["side"] == closing and not o.get("cancel_queued"))
         others = sum(float(o.get("contracts") or 0) for o in self.foreign_on_product(closing))
         if resting + others + n > pos["contracts"] + 1e-9:
             raise OrderRefused(f"stop not sent: {resting + others:g} closing contracts already rest against the "

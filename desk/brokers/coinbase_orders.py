@@ -238,7 +238,9 @@ def parse_order(o: dict) -> dict:
     nothing either way. CANCEL_QUEUED (a cancel waiting for the market to reopen), and an open order whose cancel has
     been asked for and isn't done yet (pending_cancel, "Whether a cancel request has been initiated for the order, and
     not yet completed"), are 'canceling': still resting, not counted as protection, and not gone either (it can still
-    fill until its cancel completes). UNKNOWN_ORDER_STATUS raises."""
+    fill until its cancel completes). UNKNOWN_ORDER_STATUS raises. cancel_queued: a CANCEL_QUEUED order, whose cancel
+    Coinbase does at the reopen, before anything trades: it neither protects nor can fill, so it counts for nothing on
+    the closing side (one whose cancel is merely pending still can fill, and counts)."""
     raw = str(o.get("status") or "")
     if raw not in OPEN_STATUSES:
         raise CoinbaseDataError(f"order {o.get('order_id')} has status {raw or 'missing'}: not acted on")
@@ -268,7 +270,7 @@ def parse_order(o: dict) -> dict:
             "placement": o.get("order_placement_source"), "amount": size, "filled": filled,
             "remaining": None if size is None else max(0.0, size - filled),
             "average": avg if avg else None, "price": limit, "triggerPrice": trig, "stopDirection": direction,
-            "triggerStatus": o.get("trigger_status"), "reduceOnly": None,
+            "triggerStatus": o.get("trigger_status"), "reduceOnly": None, "cancel_queued": raw == "CANCEL_QUEUED",
             "fee": {"cost": fee, "currency": "USD"} if fee is not None else None,
             "timestamp": ms(o.get("created_time")), "lastTradeTimestamp": ms(o.get("last_fill_time")),
             "rejectReason": o.get("reject_reason"), "info": o}

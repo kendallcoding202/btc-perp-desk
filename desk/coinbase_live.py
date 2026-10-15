@@ -39,7 +39,9 @@ rest every run. Once LIVE has armed, the checks split in two:
     one failing gives a PROTECT-ONLY token, so a position already open is never left to itself: the run's safety pass
     honours flat_kill, puts a missing stop back no wider than the saved one, and closes a stop the price gapped past at
     market, and nothing else (desk/coinbase_run.py). Deleting DESK_LIVE_CONFIRM stops new trades; to close the
-    position, set flat_kill.
+    position, set flat_kill. A read that fails while checking one (Coinbase didn't answer, or answered in a shape the
+    desk doesn't know) is said as that, never as the check failing: "Coinbase's balance couldn't be read", not "the
+    balance doesn't add up".
 Nothing in this repository calls arm() outside the tests' fake Coinbase: no workflow arms it.
 """
 
@@ -49,7 +51,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from .brokers.coinbase_auth import CdpKey
-from .brokers.coinbase_rest import DEFAULT_BASE, CoinbaseError, CoinbaseREST
+from .brokers.coinbase_rest import DEFAULT_BASE, CoinbaseDataError, CoinbaseError, CoinbaseREST
 from .thresholds import COINBASE
 
 PRODUCT = COINBASE.product
@@ -68,8 +70,13 @@ DIRTY = ("unexplained", "unknown_entries", "equity_mismatch", "flows_unreadable"
 # Once armed, a failed check that gates only new risk gives a protect-only token: its fixed public phrase (no digit, no
 # amount: it goes to the public status) by the check's label
 RISK_PUBLIC = {"confirm": "DESK_LIVE_CONFIRM isn't the exact phrase", "product": "DESK_LIVE_COINBASE isn't the product",
-               "max_notional": "--max-notional isn't given", "cap": "--max-notional doesn't buy one contract",
-               "balance": "Coinbase's balance doesn't add up", "usdc": "USDC is in the portfolio"}
+               "max_notional": "--max-notional isn't given", "max_notional_odd": "--max-notional isn't a plain number",
+               "cap": "--max-notional doesn't buy one contract", "balance": "Coinbase's balance doesn't add up",
+               "usdc": "USDC is in the portfolio",
+               # the read failed: what the check couldn't read, never the check's own failure
+               "cap_unread": "Coinbase's price couldn't be read to check --max-notional",
+               "balance_unread": "Coinbase's balance couldn't be read",
+               "usdc_unread": "the portfolio's accounts couldn't be read to check for USDC"}
 SCOPES = ("trade", "protect")
 
 _SEAL = object()
@@ -137,14 +144,16 @@ def shadow_checks(proof: dict | None, now_ms: int) -> list[tuple[str, bool, str]
     return out
 
 
-def arm(key: CdpKey, *, env, max_notional: float | None, gate: list, force_unproven: bool = False,
+def arm(key: CdpKey, *, env, max_notional: float | None, gate, force_unproven: bool = False,
         shadow_proof: dict | None = None, live_state: dict | None = None, base_url: str = DEFAULT_BASE,
         clock=time.time, sleep=time.sleep, out=print, deadline_s: float | None = None, slippage_bps: float = 3.0,
-        emit=print):
+        emit=print, max_notional_text: str | None = None):
     """Every arming check (module docstring). All pass: (an order-capable CoinbaseREST, its Armed token, scope
     "trade"). Once armed (live_state's armed_at), only new-risk checks failing: the same, scope "protect". Otherwise:
     None, with every check printed and the first failure said; not one non-GET request was made. live_state: the
-    saved LIVE state's armed_at, product, and its position's side and stop (a protect token's floor)."""
+    saved LIVE state's armed_at, product, and its position's side and stop (a protect token's floor). gate: the go-live
+    gate's checks, or a function that reads them (called at a first start only). max_notional_text: what
+    --max-notional said, when it wasn't a number."""
     from .brokers.coinbase import CoinbaseExchange
 
     state = live_state or {}
@@ -152,6 +161,12 @@ def arm(key: CdpKey, *, env, max_notional: float | None, gate: list, force_unpro
     lines: list[tuple[str, bool, str]] = []
     gate_ok = True
     if first:
+        if callable(gate):
+            try:
+                gate = gate()
+            except Exception as exc:        # noqa: BLE001 (an unreadable report or ledger is a gate that doesn't pass)
+                gate = [("the go-live gate can be read (the backtest report and the paper ledger)", False,
+                         type(exc).__name__)]
         for label, ok, val in gate:
             lines.append((label, ok, val))
             gate_ok = gate_ok and ok
@@ -160,8 +175,12 @@ def arm(key: CdpKey, *, env, max_notional: float | None, gate: list, force_unpro
                    "set" if env.get("DESK_LIVE_CONFIRM") else "not set"),
                   ("product", f"DESK_LIVE_COINBASE is exactly {PRODUCT}, the product being armed",
                    env.get("DESK_LIVE_COINBASE") == PRODUCT, repr(env.get("DESK_LIVE_COINBASE") or "")),
-                  ("max_notional", "--max-notional is given", bool(max_notional and max_notional > 0),
-                   f"${max_notional:,.2f}" if max_notional else "missing")]
+                  ("max_notional_odd" if max_notional is None and (max_notional_text or "").strip() else
+                   "max_notional", "--max-notional is given, as a number of USD",
+                   bool(max_notional and max_notional > 0),
+                   f"${max_notional:,.2f}" if max_notional else
+                   f"not a number: {(max_notional_text or '').strip()[:20]!r}" if (max_notional_text or "").strip() else
+                   "missing")]
     local = [(label, ok, val) for _, label, ok, val in risk_local]
     if first:
         local += shadow_checks(shadow_proof, int(clock() * 1000))
@@ -194,11 +213,18 @@ def arm(key: CdpKey, *, env, max_notional: float | None, gate: list, force_unpro
     rest = CoinbaseREST(key, base_url=base_url, clock=clock, sleep=sleep, deadline_s=deadline_s, emit=emit)
     ex = CoinbaseExchange(rest, on_alert=lambda text: None)
 
+    unread: set[str] = set()
+
+    def said(label: str) -> str:
+        """The refusal as said: a check whose read failed is "couldn't be checked", never the check failing."""
+        return f"{label}: couldn't be checked, Coinbase's answer couldn't be read" if label in unread else label
+
     def check(label: str, fn) -> bool:
         try:
             ok, val = fn()
         except CoinbaseError as exc:
-            ok, val = False, f"{type(exc).__name__}: {exc}"
+            ok, val = False, f"couldn't be read: {type(exc).__name__}: {exc}"
+            unread.add(label)
         lines.append((label, ok, val))
         return ok
 
@@ -233,7 +259,7 @@ def arm(key: CdpKey, *, env, max_notional: float | None, gate: list, force_unpro
         bba = ex.best_bid_ask()
         px = bba[1] if bba else (ex.details or {}).get("price")
         if not px:
-            return False, "no price to check it at"
+            raise CoinbaseDataError("no fresh price to check it at")
         need = COINBASE.contract_size * px * (1 + slippage_bps / 1e4)
         return max_notional >= need, f"one contract is ${need:,.2f} at {px:,.0f}; the cap is ${max_notional:,.2f}"
 
@@ -258,7 +284,7 @@ def arm(key: CdpKey, *, env, max_notional: float | None, gate: list, force_unpro
         steps.append((f"the saved LIVE state is for {PRODUCT}", product))
     for label, fn in steps:
         if not check(label, fn):
-            report(label)
+            report(said(label))
             return None
     risk = [("cap", "--max-notional buys one contract", cap), ("balance", "Coinbase's balance adds up", balance),
             ("usdc", "no USDC in the portfolio", usdc)]
@@ -266,12 +292,12 @@ def arm(key: CdpKey, *, env, max_notional: float | None, gate: list, force_unpro
         risk.append(("flat", "the account is flat with no open order (first LIVE start)", flat))
         for _, label, fn in risk:
             if not check(label, fn):
-                report(label)
+                report(said(label))
                 return None
     else:
         for k, label, fn in risk:          # every one, so the run's report names each that fails
-            if not check(label, fn) and not (k == "cap" and "max_notional" in risk_failed):
-                risk_failed.append(k)
+            if not check(label, fn) and not (k == "cap" and {"max_notional", "max_notional_odd"} & set(risk_failed)):
+                risk_failed.append(f"{k}_unread" if label in unread else k)
     scope = "protect" if risk_failed else "trade"
     report(None, risk_failed)
     floor = None
@@ -282,5 +308,5 @@ def arm(key: CdpKey, *, env, max_notional: float | None, gate: list, force_unpro
                   failed=tuple(RISK_PUBLIC[k] for k in dict.fromkeys(risk_failed)))
     client = CoinbaseREST(key, armed=token, base_url=base_url, clock=clock, sleep=sleep, deadline_s=deadline_s,
                           emit=emit)
-    client.skew_s = rest.skew_s
+    client.skew_s, client.slowest_s = rest.skew_s, rest.slowest_s
     return client, token

@@ -418,10 +418,10 @@ def test_a_shadow_save_that_will_be_refused_is_pushed_by_the_run(world):
     assert code == 0 and changed and saved is False and "no status.json" in br.errors[-1]
     assert any(t == "BTC SHADOW: NOT SAVED" and "no status.json" in b for t, b, *_ in sh.pushes)
     assert "its save is refused" in r.public_line()       # before: "state saved", and nothing said anywhere else
-    _next(fake)
+    _next(fake, 45)
     n0 = len(sh.pushes)
     job.run(over={"GITHUB_ACTIONS": "true"})
-    assert not any("NOT SAVED" in t for t, *_ in sh.pushes[n0:])     # SHADOW: once every 6 hours
+    assert not any("NOT SAVED" in t for t, *_ in sh.pushes[n0:])     # SHADOW: then only in the 6-hourly window
 
 
 def test_a_live_save_that_will_be_refused_is_pushed_urgently_at_every_run(world):
@@ -497,4 +497,10 @@ def test_an_armed_live_refused_over_desk_state_key_still_saves_its_status_alone(
     assert code == 2 and changed and saved
     st = job.status()
     assert st["armed"] is True and st["problem"] == "key" and st["note"] == "DESK_STATE_KEY is not set"
-    assert sh.pushes[n0:] == []                             # outside the 6-hour slot: as before
+    # the first such refusal is news (the loaded status was an OK run's): pushed now; the same one again isn't, outside
+    # the 6-hourly window
+    assert [t for t, *_ in sh.pushes[n0:]] == ["BTC LIVE: not working"]
+    _next(fake)
+    n0 = len(sh.pushes)
+    assert job.run("live", {"DESK_STATE_KEY": None})[3]
+    assert sh.pushes[n0:] == []

@@ -300,3 +300,62 @@ def test_the_guide_names_not_saved_and_alert_as_their_own_pushes():
     assert "**BTC SHADOW: not working**" in not_working
     assert "NOT SAVED" not in not_working and "kills.json" not in not_working     # before: listed as its reasons
     assert "**BTC SHADOW: NOT SAVED**" in step22
+
+
+# ---------------------------------------------------------------- round 4: kills.json deleted or renamed
+# Each fails on the code before it (da2c7f8): a desk kill already written into kills.json was cleared by deleting the
+# file (no file read as "you set it false"), or by renaming it and then deleting the renamed one; and a kills.json you
+# deleted while a run was under way came back from the copy the run loaded.
+
+def _rm(path):
+    return lambda d: (d / path).unlink()
+
+
+def test_deleting_kills_json_never_clears_a_kill_the_desk_set(world):
+    sh, fake, br, job = world
+    br.edit(_kills(b'{"entry_kill": false}'))
+    _desk_kill(job, fake)
+    assert json.loads(br.files()["BTC/kills.desk.json"]) == {"entry_kill": cs.DESK_WRITTEN}
+    br.edit(_rm("BTC/kills.json"))
+    _next(fake)
+    code, r, changed, saved = job.run()
+    assert saved and r.kills_now().entry_kill is True                    # before: cleared, entries back on
+    assert any("isn't on the coinbase-state branch" in a for a in r.alerts), r.alerts
+    assert json.loads(br.files()["BTC/kills.json"])["entry_kill"] is True    # written into a new one
+    assert json.loads(br.files()["BTC/kills.desk.json"]) == {"entry_kill": cs.DESK_WRITTEN}
+    assert sh.board()["shadow"]["entry_kill_reason"]
+    br.edit(_kills(b'{"entry_kill": false}'))                           # cleared on purpose, as before
+    _next(fake)
+    code, r, changed, saved = job.run()
+    assert saved and r.kills_now().entry_kill is False and "BTC/kills.desk.json" not in br.files()
+
+
+def test_renaming_kills_json_then_deleting_the_renamed_one_never_clears_a_desk_kill(world):
+    sh, fake, br, job = world
+    br.edit(_kills(b'{"entry_kill": false}'))
+    _desk_kill(job, fake)
+    br.edit(lambda d: (d / "BTC" / "kills.json").rename(d / "BTC" / "Kills.json"))
+    _next(fake)
+    code, r, changed, saved = job.run()
+    assert saved and r.kills_now().entry_kill is True
+    assert "BTC/kills.desk.json" in br.files()                          # before: dropped at this save
+    br.edit(_rm("BTC/Kills.json"))
+    _next(fake)
+    code, r, changed, saved = job.run()
+    assert saved and r.kills_now().entry_kill is True                    # before: entries back on
+    assert json.loads(br.files()["BTC/kills.json"])["entry_kill"] is True
+
+
+def test_a_kills_json_you_delete_while_a_run_is_under_way_stays_deleted(world):
+    sh, fake, br, job = world
+    br.edit(_kills(b'{"flat_kill": true}'))
+    _next(fake)
+    assert job.run()[3]
+    _next(fake)
+    code, r, changed, saved = job.run(between=_rm("BTC/kills.json"))
+    assert saved, br.errors
+    k = cs.read_kills(br.files().get("BTC/kills.json"))[0]
+    assert k["flat_kill"] is False                                       # before: written back from the load
+    _next(fake)
+    code, r, changed, saved = job.run()
+    assert r.kills_now().flat_kill is False
