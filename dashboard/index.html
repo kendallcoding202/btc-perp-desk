@@ -4,10 +4,20 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Perp Desk</title>
+<!-- the comic lab-notebook theme: a day edition and a night edition (auto: the device's light / dark setting; the
+     footer's switch picks one and edition.js remembers it on this device) -->
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#e8dfca" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0d1119" media="(prefers-color-scheme: dark)">
+<script>try{var e=localStorage.getItem("desk-edition");if(e=="day"||e=="night")document.documentElement.dataset.edition=e}catch(x){}</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Silkscreen:wght@400;700&family=JetBrains+Mono:wght@400;600;700&display=swap">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap">
+<!-- lettering, subset to letters and punctuation: every digit, $, % and sign falls through to JetBrains Mono -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bangers&family=Comic+Neue:wght@700&display=swap&text=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz%20%21%22%26%27%28%29%2A%2C.%2F%3A%3B%3F%40_%C2%B7%E2%80%A6%E2%80%94%E2%80%93%E2%80%98%E2%80%99%E2%80%9C%E2%80%9D">
 <link rel="stylesheet" href="style.css">
 <link rel="stylesheet" href="activity.css">
+<link rel="stylesheet" href="theme-comic.css">
 </head>
 <body>
 <div class="frame">
@@ -114,10 +124,11 @@
     </div>
   </section>
 
-  <footer class="foot"><span id="foot">connecting…</span><button type="button" class="spider-toggle" id="spider-toggle" hidden aria-pressed="true" title="the pixel spider walks to whatever the desk just did: the gate cards in the order the desk checks them, the newest candle, the trigger line, new fills (on VT: each coin's row, then the bank). it curls up when the board is stale">spider: on</button></footer>
+  <footer class="foot"><span id="foot">connecting…</span><button type="button" class="spider-toggle" id="spider-toggle" hidden aria-pressed="true" title="the pixel spider walks to whatever the desk just did: the gate cards in the order the desk checks them, the newest candle, the trigger line, new fills (on VT: each coin's row, then the bank). it curls up when the board is stale">spider: on</button><span class="edition" role="group" aria-label="page colors" title="day or night paper; auto follows this device's light or dark setting"><button type="button" data-edition-pick="day" aria-pressed="false">day</button><button type="button" data-edition-pick="night" aria-pressed="false">night</button><button type="button" data-edition-pick="auto" aria-pressed="true">auto</button></span></footer>
 </div>
 <script src="app.js"></script>
 <script src="spider.js"></script>
 <script src="activity.js"></script>
+<script src="edition.js"></script>
 </body>
 </html>

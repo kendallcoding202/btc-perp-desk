@@ -92,6 +92,7 @@ python3 -m pytest                            # 238 tests, incl. "paper ledger ==
   - `ledger/VT/paper.json`: the VT basket's cash, its three positions, every fill and closed position, and each coin's last 70 daily candles. A candle missing from one Hyperliquid answer is filled in from those, so the 50-day average never shifts. A candle no answer has had yet is waited for: it's a day with no candle, which that coin sits out as in the backtest, only once two answers have lacked it and it closed 3 days ago. VT has no kill switches.
 - **The board** for your phone is published to GitHub Pages every run: **https://kendallcoding202.github.io/btc-perp-desk/** (open an account directly with `#ETH`, `#SOL` or `#VT`). It is read-only; kill switches go through `kills.json`.
   - Tabs at the top switch accounts and show all four balances, plus the total.
+  - It's drawn as a comic lab notebook: a day edition on cream paper and a night edition on dark paper, which follows your phone's light or dark setting; `day · night · auto` in the footer picks one for that device. A gain carries ▲, a loss ▼ (in magenta, not red), zero neither.
   - **Between runs, your browser pulls prices straight from Hyperliquid every 5 seconds.** The price, open-position P&L, balance and the candle that's still forming move live. Decisions, fills and the record change only when the desk runs: every 2h candle close, picked up within 15 minutes. The BTC tab uses Hyperliquid's BTC price as a proxy between runs (a browser can't read Coinbase's API) and says so (`LIVE (HYPERLIQUID PROXY)`, `Price (HL proxy)`); it doesn't draw Hyperliquid's forming candle on the Coinbase chart, and while Coinbase is closed it isn't re-marked at all (`CLOSED (COINBASE)`). The desk marks it at Coinbase's price at every run.
 - **Locally:** `python -m desk paper` runs the same step every minute, with a live board and working kill buttons at http://127.0.0.1:8787. Don't run it against the same ledger as the Action, or the two will diverge.
 
@@ -336,4 +337,5 @@ dashboard/           the board: no build step, phone-friendly
 dashboard/spider.js  the walking CRAWLER: visits whatever the desk just did (gate cards in the order the desk
                      checks them, the newest candle, the trigger line, new fills) and curls up when the board
                      is stale. Decoration only; it changes no rule
+dashboard/theme-comic.css  the comic lab-notebook look, day and night editions (edition.js: the footer's switch)
 ```
