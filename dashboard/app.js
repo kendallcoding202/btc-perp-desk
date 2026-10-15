@@ -35,8 +35,9 @@
     c.width = map[0].length * px; c.height = map.length * px;
     c.className = "sprite";
     const g = c.getContext("2d");
-    const body = css(COLORS[key]);
-    const ink = css("--ink") || "#070b10";
+    const skin = key === "crawler" ? css("--spider-body") : "";   // theme hook: the CRAWLER card in the walking spider's skin
+    const body = skin || css(COLORS[key]);
+    const ink = (skin && css("--spider-eye")) || css("--ink") || "#070b10";
     map.forEach((row, y) => [...row].forEach((ch, x) => {
       if (ch === ".") return;
       g.fillStyle = ch === "k" ? ink : body;
@@ -56,6 +57,10 @@
   const hhmm = (ms) => new Date(ms).toISOString().slice(11, 16);
   const mmddhhmm = (ms) => new Date(ms).toISOString().slice(5, 16).replace("T", " ");
   const DAY_MS = 86400000;
+  // theme hook: a signed amount's direction as classes, "ok up" / "bad down" / "ok flat" (zero at the shown `dp`
+  // decimals is flat: neither a gain nor a loss). style.css colors ok / bad; a theme can mark up / down / flat
+  const tone = (x, dp = 2) => x == null || isNaN(x) ? "" : Math.abs(x) * 10 ** dp < 0.5 ? "ok flat" : x < 0 ? "bad down" : "ok up";
+  const closedTag = (text) => `<span class="venue-closed">${text.replace(/ · $/, "")}</span> · `;   // theme hook: CLOSED as a chip
 
   // ---- canvas helpers -------------------------------------------------------
   function fit(canvas) {
@@ -120,25 +125,26 @@
       g.fillText(`${d.toISOString().slice(5, 10)}`, X(k) - 14, h - 4);
     }
 
-    line(g, chart.don_hi.map((v, k) => [X(k), v == null ? null : Y(v)]), rgba("--muted", .55), 1, [3, 4]);
-    line(g, chart.don_lo.map((v, k) => [X(k), v == null ? null : Y(v)]), rgba("--muted", .35), 1, [3, 4]);
+    line(g, chart.don_hi.map((v, k) => [X(k), v == null ? null : Y(v)]), css("--channel") || rgba("--muted", .55), 1, [3, 4]);
+    line(g, chart.don_lo.map((v, k) => [X(k), v == null ? null : Y(v)]), css("--channel") || rgba("--muted", .35), 1, [3, 4]);
     line(g, chart.ema_slow.map((v, k) => [X(k), v == null ? null : Y(v)]), css("--blue"), 1.6);
     line(g, chart.ema_fast.map((v, k) => [X(k), v == null ? null : Y(v)]), css("--cyan"), 1.6);
 
-    const bw = Math.max(1, cw * 0.62);
+    const bw = Math.max(1, cw * 0.62), hollow = css("--candle-up") === "hollow" && bw >= 3;   // theme hook: hollow up candles
     cs.forEach(([, o, hgh, l, c], k) => {
       const up = c >= o, col = up ? css("--green") : css("--red");
       g.strokeStyle = col; g.beginPath(); g.moveTo(X(k), Y(hgh)); g.lineTo(X(k), Y(l)); g.stroke();
       g.fillStyle = col;
       const y1 = Y(Math.max(o, c)), y2 = Y(Math.min(o, c));
-      g.fillRect(X(k) - bw / 2, y1, bw, Math.max(1, y2 - y1));
+      if (up && hollow) { g.fillStyle = css("--ink"); g.fillRect(X(k) - bw / 2, y1, bw, Math.max(1, y2 - y1)); g.strokeRect(X(k) - bw / 2 + 0.5, y1 + 0.5, bw - 1, Math.max(1, y2 - y1 - 1)); }
+      else g.fillRect(X(k) - bw / 2, y1, bw, Math.max(1, y2 - y1));
     });
 
     if (chart.stop) {
       line(g, [[0, Y(chart.stop)], [w - padR, Y(chart.stop)]], css("--orange"), 1.2, [6, 4]);
       tag(g, w - padR, Y(chart.stop), `STOP ${pxAxis(chart.stop)}`, css("--orange"));
     }
-    if (chart.entry) line(g, [[0, Y(chart.entry)], [w - padR, Y(chart.entry)]], "rgba(241,241,246,.6)", 1, [2, 3]);
+    if (chart.entry) line(g, [[0, Y(chart.entry)], [w - padR, Y(chart.entry)]], css("--entry") || "rgba(241,241,246,.6)", 1, [2, 3]);
 
     for (const m of chart.markers) {
       const k = nearest(tsIndex, m.ts, chart.bar_ms, cs);
@@ -186,21 +192,21 @@
     const { X, Y, cs } = lastGeom;
     const chartTop = $("chart").offsetTop;
     const cx = w * 0.56, cy = h * 0.78;
-    const silk = css("--cyan") || "#2ee6ff";
+    const silk = css("--web-silk") || css("--cyan") || "#2ee6ff", dot = css("--web-dot") || "#fff";   // theme hooks
     const picks = [];
     for (let k = cs.length - 1; k >= 0 && picks.length < 9; k -= Math.max(1, Math.floor(cs.length / 18))) picks.push(k);
     g.save();
-    g.strokeStyle = silk; g.lineWidth = 1.3; g.shadowColor = silk; g.shadowBlur = 6;
+    g.strokeStyle = silk; g.lineWidth = 1.3; g.shadowColor = silk; g.shadowBlur = +(css("--web-glow") || 6);
     picks.forEach((k, n) => {
       const tx = X(k) + 6, ty = Y(n % 2 ? cs[k][3] : cs[k][2]) + chartTop;
       const kx = (cx + tx) / 2 + (n % 2 ? 18 : -18), ky = (cy + ty) / 2 + 22;
       g.beginPath(); g.moveTo(cx, cy); g.lineTo(kx, ky); g.lineTo(tx, ty); g.stroke();
-      g.fillStyle = "#fff"; g.beginPath(); g.arc(tx, ty, 2.4, 0, Math.PI * 2); g.fill();
+      g.fillStyle = dot; g.beginPath(); g.arc(tx, ty, 2.4, 0, Math.PI * 2); g.fill();
       g.beginPath(); g.arc(kx, ky, 1.6, 0, Math.PI * 2); g.fill();
     });
     if (document.documentElement.dataset.spider === "on") return g.restore();   // spider.js walks the real one
     g.shadowBlur = 0;
-    g.fillStyle = "#1a1d33"; g.strokeStyle = "#fff"; g.lineWidth = 2;
+    g.fillStyle = css("--web-hub") || "#1a1d33"; g.strokeStyle = dot; g.lineWidth = 2;
     g.beginPath(); g.ellipse(cx, cy, 13, 10, -0.4, 0, Math.PI * 2); g.fill(); g.stroke();
     g.fillStyle = silk; g.beginPath(); g.ellipse(cx + 12, cy + 6, 8, 6, -0.4, 0, Math.PI * 2); g.fill();
     g.restore();
@@ -316,20 +322,20 @@
   // percentage is the time-weighted performance, not the P&L over the money put in, so it's named
   const pnlTag = (s) => s.flows ? `P&amp;L ${usd(s.ticker.pnl)} · PERF ${pct(s.ticker.pnl_pct)} TIME-WEIGHTED · ` +
     `${s.flows.net >= 0 ? "DEPOSITED" : "WITHDRAWN"} ${usd(Math.abs(s.flows.net))}, NOT P&amp;L` : `P&amp;L ${usd(s.ticker.pnl)} (${pct(s.ticker.pnl_pct)})`;
-  const pnlHtml = (s) => pnlTag(s).replace(`P&amp;L ${usd(s.ticker.pnl)}`, `<span class="${s.ticker.pnl < 0 ? "bad" : "ok"}">P&amp;L ${usd(s.ticker.pnl)}</span>`);
+  const pnlHtml = (s) => pnlTag(s).replace(`P&amp;L ${usd(s.ticker.pnl)}`, `<span class="${tone(s.ticker.pnl)}">P&amp;L ${usd(s.ticker.pnl)}</span>`);
 
   function renderStage(s) {
     const t = s.ticker, k = s.kills, coin = s.header.coin || "BTC";
     // BTC on Coinbase: between runs the live price is Hyperliquid's (a proxy), and nothing moves while Coinbase is closed
     const v = s.venue, proxy = v && live.at && !v.closed_now;
-    const liveTag = v && v.closed_now ? "CLOSED (COINBASE) · " : live.at
+    const liveTag = v && v.closed_now ? closedTag("CLOSED (COINBASE) · ") : live.at
       ? `<span class="live-dot" aria-hidden="true"></span><span class="live-word">LIVE${v ? " (HYPERLIQUID PROXY)" : ""}</span> · ` : "";
     const pos = String(t.position || "");
     const posCls = pos.startsWith("SHORT") ? "short" : pos.startsWith("LONG") ? "long" : "flat";
     const chgCls = t.change_24h == null || isNaN(t.change_24h) ? "" : t.change_24h >= 0 ? "ok" : "bad";
     $("ticker").innerHTML = `‹ ${liveTag}TRADES · ${esc(coin)} ${px(t.price)} · BANK ${usd(t.bank)} · ` +
       `<span class="hl ${posCls}">${esc(t.position)}${t.position_detail ? " " + esc(t.position_detail) : ""}</span>` +
-      ` · ${esc(t.record)} · HOLD <span class="${t.hold_pct < 0 ? "bad" : "ok"}">${pct(t.hold_pct)}</span>` +
+      ` · ${esc(t.record)} · HOLD <span class="${tone(t.hold_pct, 4)}">${pct(t.hold_pct)}</span>` +
       ` · ${pnlHtml(s)} · FEES ${usd(t.fees)}${v ? " (EST.)" : ""} · FUNDING ${v ? "(EST.) " : ""}${usd(t.funding)}`;
     $("chart-title").textContent = `${v ? v.product : coin + "-PERP"} · ${s.header.interval} · ${px(t.price)}${proxy ? " (HL proxy)" : ""}`;
     $("chart-sub").innerHTML = `<span class="${chgCls}">24h ${pct(t.change_24h)}</span>` +
@@ -358,9 +364,9 @@
     $("bal-mode").textContent = s.header.mode;
     $("bal-record").textContent = t.record;
     $("bal-hold").textContent = pct(t.hold_pct);
-    $("bal-hold").className = t.hold_pct < 0 ? "bad" : "ok";
+    $("bal-hold").className = tone(t.hold_pct, 4);
     $("balance").textContent = usd(t.bank);
-    $("balance").style.color = t.pnl >= 0 ? "var(--green)" : "var(--red)";
+    $("balance").style.color = t.pnl >= 0 ? "var(--green)" : "var(--red)"; $("balance").className = `big ${tone(t.pnl)}`;
     if (goal) {
       $("goal-from").textContent = usd(goal.start, 0);
       $("goal-to").textContent = usd(goal.target, 0);
@@ -462,7 +468,7 @@
     const posCls = pos.startsWith("SHORT") ? "short" : pos.startsWith("LONG") ? "long" : "flat";
     $("vt-ticker").innerHTML = `‹ ${liveTag}BASKET · ${esc(s.header.coins.join(" · "))} · BANK ${usd(t.bank)} · ` +
       `<span class="hl ${posCls}">${esc(t.position)}${t.position_detail ? " " + esc(t.position_detail) : ""}</span>` +
-      ` · ${esc(t.record)} · HOLD <span class="${t.hold_pct < 0 ? "bad" : "ok"}">${pct(t.hold_pct)}</span>` +
+      ` · ${esc(t.record)} · HOLD <span class="${tone(t.hold_pct, 4)}">${pct(t.hold_pct)}</span>` +
       ` · ${pnlHtml(s)} · FEES ${usd(t.fees)} · FUNDING ${usd(t.funding)}`;
     const next = Math.floor(now / DAY_MS + 1) * DAY_MS, left = next - now;   // every 00:00 UTC
     $("vt-next").textContent = `NEXT DECISION 00:00 UTC · IN ${Math.floor(left / 3600000)}H ${Math.floor(left % 3600000 / 60000)}M`;
@@ -638,14 +644,14 @@
       const label = basket ? (c.holdings || []).map((h) => h.coin).join("·") : lp ? px(lp) : px(c.price);
       const sub = basket ? " · basket" : ` · risk ${(c.risk_per_trade * 100).toFixed(0)}%${c.shorts ? " · +shorts" : ""}${c.venue ? ` · ${esc(c.venue)}` : ""}`;
       const made = c.units != null ? b - c.start - (c.net_flows || 0) : b - c.start;
-      const pnlCls = b == null || c.start == null ? "" : made >= 0 ? "ok" : "bad";
+      const pnlCls = b == null || c.start == null ? "" : tone(made);
       return `<button class="coin ${c.coin === coin ? "on" : ""}" data-coin="${esc(c.coin)}" aria-pressed="${c.coin === coin}">` +
         `<span class="c-name">${esc(c.coin)}<i>${esc(label)}</i></span><span class="c-bank ${pnlCls}">${usd(b)}</span>` +
         `<span class="c-sub">${c.units ? `${pct(b / c.units - 1)} perf · P&amp;L ${usd(b - c.start - c.net_flows, 0)}` : pct(b / c.start - 1)} · ${esc(c.position)} · ${esc(c.record)}${sub}</span></button>`;
     });
     const left = index.coins.filter((c) => c.error).map((c) => c.coin);   // no bank this run: not in the total
     const put = start + net;   // with deposits: the P&L on everything put in, never counting the deposits as profit
-    const allCls = (net ? put > 0 : !!start) ? ((net ? bank - put : bank - start) >= 0 ? "ok" : "bad") : "";
+    const allCls = (net ? put > 0 : !!start) ? tone(net ? bank - put : bank - start) : "";
     cards.push(`<div class="coin total"><span class="c-name">ALL</span><span class="c-bank ${allCls}">${usd(bank)}</span>` +
       (net ? `<span class="c-sub">${pct(put > 0 ? (bank - put) / put : 0)} · P&amp;L ${usd(bank - put)} on ${usd(put, 0)} put in` :
        `<span class="c-sub">${pct(start ? bank / start - 1 : 0)} on ${usd(start, 0)} paper`) +
@@ -777,6 +783,7 @@
   }
 
   window.addEventListener("resize", render);
+  window.addEventListener("desk:theme", () => { $("agents").textContent = ""; $("chief-sprite").textContent = ""; render(); });
   (async function loop() {
     await tick();
     setTimeout(loop, staticMode ? 60000 : 2000);

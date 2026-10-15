@@ -75,9 +75,11 @@
   frameEl.append(layer);
 
   const tone = (name, fallback) => getComputedStyle(root).getPropertyValue(name).trim() || fallback;
-  const bodyCol = tone("--cyan", "#2ee6ff");
-  const eyeCol = tone("--amber", "#ffc53d");
-  const frames = POSES.map((map) => [false, true].map((blink) => {
+  // its colors: a theme's --spider-body / --spider-eye (app.js gives the CRAWLER card the same two), else the
+  // crawler's cyan with amber eyes; painted again when the page's edition changes (edition.js: "desk:theme")
+  const skin = () => [tone("--spider-body", tone("--cyan", "#2ee6ff")), tone("--spider-eye", tone("--amber", "#ffc53d"))];
+  let [bodyCol, eyeCol] = skin();
+  const draw = (map) => [false, true].map((blink) => {
     const c = document.createElement("canvas");
     c.width = c.height = 12;
     const g = c.getContext("2d");
@@ -87,7 +89,8 @@
       g.fillRect(x, y, 1, 1);
     }));
     return c;
-  }));
+  });
+  let frames = POSES.map(draw);
   const g = body.getContext("2d");
   let drawn = -1;
   function pose(n, blink) {
@@ -766,6 +769,7 @@
   }
   if (document.fonts && document.fonts.ready) document.fonts.ready.then(touch);
   document.addEventListener("visibilitychange", apply);
+  addEventListener("desk:theme", () => { [bodyCol, eyeCol] = skin(); frames = POSES.map(draw); drawn = -1; paint(performance.now()); });
   if (reduced.addEventListener) reduced.addEventListener("change", apply);
   if (phone.addEventListener) phone.addEventListener("change", touch);
 

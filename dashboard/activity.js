@@ -721,7 +721,7 @@
     else {
       const m = parseFloat(mids[B.header.coin]);
       const d = prevMid != null && isFinite(m) ? m - prevMid : null;
-      what = `${B.header.coin} ${mid$(m)}${d == null ? "" : d === 0 ? " ·0" : ` ${d > 0 ? "▲" : "▼"}${Number(Math.abs(d).toPrecision(6))}`}`;
+      what = `${B.header.coin} ${mid$(m)}${d == null ? "" : d === 0 ? " ·0" : ` ${d > 0 ? "+" : "−"}${Number(Math.abs(d).toPrecision(6))}`}`;
       prevMid = isFinite(m) ? m : prevMid;
     }
     tapeAdd(`${hms(now)} price check · allMids${ms} · ${what}`, "act-tk");
