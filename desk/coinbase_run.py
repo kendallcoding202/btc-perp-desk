@@ -114,6 +114,13 @@ REDACTED_NOTE = ("(amounts left out: anyone who knows an ntfy.sh topic's name ca
                  "board, encrypted; set NTFY_TOKEN for a reserved topic to get them here)")
 # the public status's note when BTC/kills.json can't be read (no digit, no amount: coinbase_state.check_status)
 KILLS_UNREADABLE = "BTC/kills.json on the coinbase-state branch can't be read: read as entry_kill on, no new entries"
+KILLS_UNREADABLE_FLAT = KILLS_UNREADABLE + "; flat_kill on: any position is closed"
+KILLS_STRAY = ("a file on the coinbase-state branch looks like a kill switch but isn't BTC/kills.json: read as "
+               "entry_kill on, no new entries")
+# DESK_COINBASE_KILL (a repository variable): its words for flat_kill and for entry_kill, letters only, lowercased;
+# any other value is entry_kill, alerted (failing closed)
+KILL_VAR_FLAT = {"flat", "flatkill", "flatten", "close", "closeall", "closeposition", "closeit"}
+KILL_VAR_ENTRY = {"entry", "entrykill", "entries", "noentry", "noentries"}
 URGENT_TITLES = {"no_stop": "NO STOP", "stray": "STOP WITH NO POSITION", "stray-foreign": "STOP WITH NO POSITION",
                  "foreign": "AN ORDER THAT ISN'T THE DESK'S", "unprotected": "NO STOP"}
 
@@ -597,6 +604,11 @@ class Run:
         self._urgent_texts: set[str] = set()
         self.unexplained: list[dict] = []
         self.kills_read: tuple[dict, str | None] | None = None
+        self.kills_named: tuple = ()        # the switches BTC/kills.json names (an unreadable one's, read failing closed)
+        self.kills_strays: list = []        # files of yours that look like kill switches: [(path, KillsRead)]
+        self.kill_var_odd: str | None = None    # DESK_COINBASE_KILL set to a word that isn't entry or flat
+        self.loaded = None                  # the branch as this run loaded it (coinbase_state.Loaded)
+        self.save_refused_why: str | None = None
         self.live_leftover = False          # SHADOW: a never-armed LIVE attempt's files are here (dropped on save)
         self.replaces_leftover = False      # LIVE: the saved LIVE state is one, and this run doesn't carry on from it
         self.refused_before_state = False
@@ -677,30 +689,46 @@ class Run:
                               "SHADOW)", public="COINBASE_CDP_KEY is not set")
         return password, raw
 
+    def branch_loaded(self):
+        """The coinbase-state branch's BTC/ as the load step extracted it here (taken before this run writes)."""
+        if self.loaded is None:
+            try:
+                self.loaded = coinbase_state.Loaded(self.dir.parent)
+            except OSError as exc:
+                self.log(f"the state dir couldn't be read as loaded ({type(exc).__name__})")
+                self.loaded = coinbase_state.Loaded(None)
+        return self.loaded
+
     def kills_file(self) -> tuple[dict, str | None]:
         """BTC/kills.json (yours, on the coinbase-state branch), read once a run the way the save step reads it
-        (coinbase_state.read_kills): one the desk can't read is entry_kill on, never every switch off."""
+        (coinbase_state.kills_read, on the same bytes: a symlink is its target, not plain): one the desk can't read is
+        entry_kill on and each switch it names on unless it says off, never every switch off. A file of yours that
+        looks like a kill switch but isn't BTC/kills.json (BTC/Kills.json, say) turns entry_kill on too."""
         if self.kills_read is None:
-            try:
-                raw = self.paths["kills"].read_bytes()
-            except FileNotFoundError:
-                raw = None
-            except OSError:
-                raw = b"\0"          # there but unreadable: the same safe side as a file that isn't JSON
-            self.kills_read = coinbase_state.read_kills(raw)
+            b = self.branch_loaded()
+            got = coinbase_state.kills_read(*coinbase_state.branch_kills(b))
+            kills = dict(got.kills)
+            self.kills_named = got.named
+            tree = b.tree()
+            self.kills_strays = [(p, coinbase_state.kills_read(b.show(p), tree[p] != coinbase_state.LINK))
+                                 for p in coinbase_state.yours(tree) if coinbase_state.kill_like(p)]
+            if self.kills_strays:
+                kills["entry_kill"] = True
+            self.kills_read = (kills, got.why)
         return self.kills_read
 
     def kills_now(self) -> Kills:
         d, _ = self.kills_file()
         k = Kills(**{n: bool(d.get(n)) for n in coinbase_state.KILL_KEYS})
-        v = (self.env.get("DESK_COINBASE_KILL") or "").strip().lower()
-        if v == "flat":
+        v = (self.env.get("DESK_COINBASE_KILL") or "").strip()
+        w = re.sub(r"[^a-z]", "", v.lower())
+        if w in KILL_VAR_FLAT:
             k.flat_kill = True
-        elif v == "entry":
+        elif w in KILL_VAR_ENTRY:
             k.entry_kill = True
         elif v:
-            k.entry_kill = True
-            self.log(f"DESK_COINBASE_KILL is {v!r}, not entry or flat: read as entry")
+            k.entry_kill = True             # failing closed: a word it doesn't know is entry_kill, and alerted
+            self.kill_var_odd = v[:40]
         return k
 
     # ---- the key, the clock, the permissions
@@ -848,6 +876,7 @@ class Run:
     # ---- the whole run
     def execute(self) -> int:
         paths = self.paths
+        self.branch_loaded()                # the branch as loaded, before anything here is written
         try:
             password, _ = self.preflight()
         except Stop as s:
@@ -928,10 +957,22 @@ class Run:
         github_output(wrote, self.env)
         self.changed = False
         self.public_note = s.text
-        if self.now % PUSH_EVERY_MS < 15 * 60_000:     # no state to remember a push in: once every 6 hours by the clock
+        self.refused_push(s)
+        return self.code
+
+    def refused_push(self, s: Stop) -> None:
+        """No state to remember a push in: once every 6 hours by the clock (LiveRun: see its own)."""
+        if self.now % PUSH_EVERY_MS < 15 * 60_000:
             self.push(f"{COIN} {self.mode.upper()}: not working", f"{self.mode.upper()} didn't run: {s.text}. Nothing "
                                                                   f"was sent. Paper is unaffected.", "high", "warning")
-        return self.code
+
+    def saved_status(self) -> dict | None:
+        """BTC/status.json as loaded (public, plain: readable without DESK_STATE_KEY), or None."""
+        try:
+            st = json.loads(self.branch_loaded().show(f"{COIN}/status.json") or b"null")
+        except ValueError:
+            return None
+        return st if isinstance(st, dict) else None
 
     def status_only(self, s: Stop) -> bool:
         """The public status of a run refused over the secrets, on the last status's counts (same start, same runs:
@@ -1065,19 +1106,39 @@ class Run:
                                                    and self.broker.balance_confirmed))
 
     def say_kills_unreadable(self) -> None:
-        """A kills.json the desk can't read is entry_kill on (failing closed), said on the board, in the status and on
-        the phone. The save step writes it back as a valid file with entry_kill true (coinbase_state.read_kills)."""
+        """Every kill switch the desk can't read as written fails closed (entry_kill on), and is said on the board, in
+        the status and on the phone (each kind at most every 6 hours): a BTC/kills.json it can't read (kept as you
+        wrote it, so every run reads it the same way until you fix it), a file of yours that looks like a kill switch
+        but isn't BTC/kills.json, and a DESK_COINBASE_KILL that isn't entry or flat."""
         d, why = self.kills_file()
-        if not why:
-            return
-        extra = [k for k in ("flat_kill", "jev_kill") if d.get(k)]
-        text = (f"BTC/kills.json on the coinbase-state branch can't be read ({why}): read as entry_kill on, no new "
-                f"entries" + (f" ({', '.join(extra)} too: written exactly true)" if extra else "") +
-                ", and nothing else in it is acted on. This run's save writes it back as a valid file with entry_kill "
-                "true: fix what you meant there")
-        if not self.account.get("entry_kill_reason"):
-            self.account["entry_kill_reason"] = {"ts": self.now, "why": f"BTC/kills.json couldn't be read ({why})"}
-        self.on_alert(text)
+        if why:
+            parts = [(f"BTC/kills.json on the coinbase-state branch can't be read ({why}). Read failing closed: "
+                      f"entry_kill on, no new entries")]
+            if d.get("flat_kill"):
+                parts.append("flat_kill on too: any position is closed, and stays closed")
+            elif "flat_kill" in self.kills_named:
+                parts.append("flat_kill is in it but says off, so nothing is closed (for a sure close, set the "
+                             "variable DESK_COINBASE_KILL to flat)")
+            if d.get("jev_kill"):
+                parts.append("jev_kill on too")
+            parts.append("nothing else in it is acted on (reset_halt_at included). It's kept as you wrote it, so every "
+                         "run reads it this way, and says so, until you fix it")
+            if not self.account.get("entry_kill_reason"):
+                self.account["entry_kill_reason"] = {"ts": self.now, "why": f"BTC/kills.json couldn't be read ({why})"}
+            self.on_alert("; ".join(parts))
+        for path, got in self.kills_strays:
+            flat = got.kills.get("flat_kill") and "flat_kill" in got.named
+            self.on_alert(f"{path} on the coinbase-state branch looks like a kill switch, but the desk reads only "
+                          f"BTC/kills.json (that name, all lowercase): entry_kill on, no new entries, until you rename "
+                          f"it to that or delete it" + (
+                              "; it says flat_kill, which isn't acted on from there: put it in BTC/kills.json, or set "
+                              "the variable DESK_COINBASE_KILL to flat for a sure close" if flat else ""))
+            if not self.account.get("entry_kill_reason"):
+                self.account["entry_kill_reason"] = {"ts": self.now, "why": f"{path} looks like a kill switch"}
+        if self.kill_var_odd is not None:
+            self.on_alert(f"the variable DESK_COINBASE_KILL is {self.kill_var_odd!r}, which isn't entry or flat: read "
+                          f"as entry (no new entries). Set it to flat to close the position, or delete it to turn it "
+                          f"off")
 
     # ---- the real account's reads
     def read_account(self) -> None:
@@ -1408,8 +1469,11 @@ class Run:
         tmp.write_text(statebox.seal_json(board, password, statebox.board_aad(self.mode), compress=False,
                                           iterations=it))
         tmp.replace(paths["board"])
-        paths["status"].write_text(json.dumps(self.status(ok), indent=1) + "\n")
-        paths["kills_set"].write_text(json.dumps({k: True for k, v in self.kills_set.items() if v}) + "\n")
+        for name, d in (("status", self.status(ok)), ("kills_set", {k: True for k, v in self.kills_set.items() if v})):
+            tmp = paths[name].with_name(paths[name].name + ".tmp")
+            tmp.write_text(json.dumps(d, indent=1 if name == "status" else None) + "\n")
+            tmp.replace(paths[name])        # never through a symlink the branch put there
+        self.check_own_save()
         if first_ok:
             self.push(f"{COIN} {self.mode.upper()}: connected (read only)" if self.mode == "shadow" else
                       f"{COIN} LIVE: armed and connected",
@@ -1418,6 +1482,37 @@ class Run:
                       "default", "white_check_mark")
         self.push_trades()
         self.public_note = "" if ok else (self.problem or "")
+
+    def check_own_save(self) -> None:
+        """On GitHub Actions the state dir is the branch as the load step extracted it, so the save step's own check
+        (coinbase_state.check) runs here first, against the branch as loaded: a save it would refuse is pushed now,
+        since nothing after it would say so (the saved state and status just stop moving)."""
+        if self.env.get("GITHUB_ACTIONS") != "true":
+            return
+        try:
+            coinbase_state.check(self.dir.parent, branch=self.branch_loaded())
+        except coinbase_state.StateCheckError as exc:
+            self.save_refused(str(exc))
+        except Exception as exc:        # noqa: BLE001 (advisory: the save step runs the check itself)
+            self.log(f"the save check couldn't run here ({type(exc).__name__}); the save step runs it")
+
+    def save_refused(self, why: str) -> None:
+        """This run's save will be refused. LIVE: an urgent push at every run (what it remembers between runs, the
+        stop's level and the risk brakes, stops being saved). SHADOW: once every 6 hours by the clock (the push memo
+        is in the state that isn't saved)."""
+        self.save_refused_why = why
+        self.log(f"this run's save will be refused: {why}")
+        if self.mode == "live":
+            self.push(f"{COIN} LIVE: NOT SAVED",
+                      f"The save step will refuse this run's state: {why}. The orders and the stop are on Coinbase, "
+                      f"but what LIVE remembers between runs (the stop's level, the halt, the daily loss, the "
+                      f"cooldown) isn't saved, so each run starts again from the last saved state until this is "
+                      f"fixed on the coinbase-state branch. {self.sent_note()}", "urgent", "rotating_light")
+        elif self.now % PUSH_EVERY_MS < 15 * 60_000:
+            self.push(f"{COIN} SHADOW: NOT SAVED",
+                      f"The save step will refuse this run's state: {why}. SHADOW ran, but its state, board and status "
+                      f"aren't saved (the dashboard goes stale) until this is fixed on the coinbase-state branch. "
+                      f"Nothing was sent. Paper is unaffected.", "high", "warning")
 
     def push_trades(self) -> None:
         if self.mode != "shadow":
@@ -1461,8 +1556,16 @@ class Run:
                 "decision": decision, "would_send_last_24h": ws, "alerts_open": len(self.alerts),
                 "checks_passed": self.checks.passed, "checks_total": len(self.checks.rows),
                 "opened": bool(self.meta.get("start_equity", 0) > 0),
-                "note": self.public_why if not ok else KILLS_UNREADABLE if self.kills_file()[1] else None,
+                "note": self.public_why if not ok else self.kills_note(),
                 **({"armed": bool(self.meta.get("armed_at"))} if self.mode == "live" else {})}
+
+    def kills_note(self) -> str | None:
+        """The public status's note on an OK run: a kill switch the desk can't read as written (fixed text, no digit:
+        coinbase_state.check_status)."""
+        d, why = self.kills_file()
+        if why:
+            return KILLS_UNREADABLE_FLAT if d.get("flat_kill") else KILLS_UNREADABLE
+        return KILLS_STRAY if self.kills_strays else None
 
     def public_line(self) -> str:
         """The one line the public log gets: no amounts, no ids, no Coinbase wording."""
@@ -1472,8 +1575,11 @@ class Run:
             done = getattr(getattr(self, "shot", None), "processed", 0)
             return (f"{m} BTC: run {self.meta.get('runs', 0)} · key {'View only' if self.mode == 'shadow' else 'armed'} "
                     f"· reads ok · {done} close{'s' if done != 1 else ''} processed · {n} order"
-                    f"{'s' if n != 1 else ''} it {'would send' if self.mode == 'shadow' else 'sent'} · state saved"
-                    + (" · kills.json can't be read: entry_kill on" if self.kills_read and self.kills_read[1] else ""))
+                    f"{'s' if n != 1 else ''} it {'would send' if self.mode == 'shadow' else 'sent'} · "
+                    + ("its save is refused (the reason is on your phone)" if self.save_refused_why else "state saved")
+                    + (" · kills.json can't be read: entry_kill on" if self.kills_read and self.kills_read[1] else "")
+                    + (" · a file looks like a kill switch but isn't kills.json: entry_kill on" if self.kills_strays
+                       else ""))
         if not self.changed:
             why = self.public_why or self.problem or "error"
             return f"{m} BTC: refused before reading the account: {why} (nothing read or sent; the state is unchanged)"
@@ -1571,14 +1677,39 @@ class LiveRun(Run):
 
     def stopped(self, why: str) -> None:
         """A LIVE run that stopped before it ever armed saves nothing (no state, board, status or kill), so the branch
-        is as it was: SHADOW carries on and the next LIVE run is a first start again. With no state to remember a push
-        in, it pushes at every such run while SHADOW's record is fresh enough to arm on (under 2 hours), then once
-        every 6 hours by the clock."""
+        is as it was: SHADOW carries on and the next LIVE run is a first start again (not_armed_push)."""
         if self.changed:
             return super().stopped(why)
+        self.not_armed_push(why)
+
+    def refused_push(self, s: Stop) -> None:
+        """Refused before the state was opened (DESK_STATE_KEY not set, say). A LIVE that has armed (its public status
+        says so): as SHADOW, once every 6 hours. One that never armed: the same push as any never-armed refusal."""
+        st = self.saved_status() or {}
+        if (st.get("mode") == "LIVE" and st.get("armed") is True) or (
+                not st and f"{COIN}/state-live.enc.json" in self.branch_loaded().tree()):
+            return super().refused_push(s)      # armed (or a LIVE state with no status to say it never armed)
+        self.not_armed_push(s.text)
+
+    def shadow_last_run(self) -> int:
+        """When SHADOW last ran on this account: its encrypted record's (DESK_STATE_KEY opens it), else its public
+        status's "updated" (readable without the key: a refusal over DESK_STATE_KEY), else 0."""
+        if self.password:
+            last = int((self.read_shadow_proof() or {}).get("last_run_ts") or 0)
+            if last:
+                return last
+        st = self.saved_status() or {}
+        try:
+            return int(st.get("updated") or 0) if st.get("mode") == "SHADOW" else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def not_armed_push(self, why: str) -> None:
+        """With no state to remember a push in: at every never-armed refusal while SHADOW's last run is fresh enough
+        to arm on (under 2 hours), then once every 6 hours by the clock."""
         from .coinbase_live import SHADOW_FRESH_MS
 
-        last = int((self.read_shadow_proof() or {}).get("last_run_ts") or 0)
+        last = self.shadow_last_run()
         fresh = last > 0 and 0 <= self.now - last < SHADOW_FRESH_MS
         if not fresh and self.now % PUSH_EVERY_MS >= 15 * 60_000:
             return

@@ -6,7 +6,8 @@
    armed, and a LIVE state that never armed is no LIVE start, for SHADOW, for LIVE and for the save check.
 2. A BTC/kills.json the owner mistyped was read as every switch off (fail-open), and then the save check refused the
    save over it, so every run after went unsaved. Now the runs, check and stage all read it one way
-   (coinbase_state.read_kills): entry_kill on, said on the board, in the status and on the phone, and saved.
+   (coinbase_state.kills_read): entry_kill on, said on the board, in the status and on the phone, and saved, the file
+   kept as the owner wrote it (tests/test_coinbase_kills_fail_closed.py has the rest).
 
 Everything runs against the local fake Coinbase (tests/fake_coinbase.py) on 127.0.0.1; every key is a fresh fake."""
 
@@ -271,9 +272,9 @@ def test_the_runs_check_and_stage_read_a_bad_kills_json_the_same_way(tmp_path, m
     monkeypatch.chdir(repo)
     d = _state_dir(tmp_path / "new", runs=1, extra={"kills.json": raw.decode("latin-1")})
     (d / "BTC" / "kills.json").write_bytes(raw)
-    assert any("kills.json isn't readable" in ln for ln in cs.check(d, NO_BRANCH))      # before: refused, unsaved
+    assert any("kills.json can't be read" in ln for ln in cs.check(d, NO_BRANCH))      # before: refused, unsaved
     cs.stage(d, tmp_path / "work", NO_BRANCH)
-    assert json.loads((tmp_path / "work" / "BTC" / "kills.json").read_text()) == kills
+    assert (tmp_path / "work" / "BTC" / "kills.json").read_bytes() == raw              # kept as you wrote it
 
 
 def test_a_bad_kills_json_keeps_a_switch_written_exactly_true_and_acts_on_nothing_else():
@@ -323,12 +324,14 @@ def test_shadow_with_a_kills_json_it_cant_read_takes_no_entry_says_so_and_saves(
         monkeypatch.chdir(repo)
         cs.check(sh.dir, NO_BRANCH)                                          # before: "kills.json isn't JSON"
         cs.stage(sh.dir, tmp_path / "work", NO_BRANCH)
-        saved = json.loads((tmp_path / "work" / "BTC" / "kills.json").read_text())
-        assert saved == {"flat_kill": False, "entry_kill": True, "jev_kill": False}
-        # the next run reads the file the save wrote: entry_kill on, the reason kept, nothing unreadable now
-        (sh.dir / "BTC" / "kills.json").write_text(json.dumps(saved))
-        assert sh.run()[0] == 0 and sh.status()["note"] is None
+        assert (tmp_path / "work" / "BTC" / "kills.json").read_bytes() == raw   # kept as you wrote it
+        # the next run reads the same file the same way, and says so again
+        assert sh.run()[0] == 0 and sh.status()["note"] == cr.KILLS_UNREADABLE
         assert "couldn't be read" in sh.board()["shadow"]["entry_kill_reason"]
+        assert any("kills.json on the coinbase-state branch can't be read" in a for a in sh.board()["shadow"]["alerts"])
+        # you fix it: entries back on, nothing said
+        (sh.dir / "BTC" / "kills.json").write_text('{"entry_kill": false}')
+        assert sh.run()[0] == 0 and sh.status()["note"] is None and sh.board()["kills"]["entry_kill"] is False
 
 
 def test_live_with_a_kills_json_it_cant_read_sends_no_entry(tmp_path):
@@ -363,9 +366,9 @@ def test_the_workflow_saves_through_a_kills_json_you_mistyped(actions, tmp_path)
     _state_dir(rt / "cb", runs=2)
     res = _bash(save, ws, env)
     assert res.returncode == 0, res.stdout + res.stderr                          # before: ::error:: isn't JSON
-    assert "kills.json isn't readable" in res.stdout
+    assert "kills.json can't be read" in res.stdout
     files = _remote_files(origin)
-    assert json.loads(files["BTC/kills.json"]) == {"flat_kill": False, "entry_kill": True, "jev_kill": False}
+    assert files["BTC/kills.json"] == '{"flat_kill": false, "entry_kill": true,}'      # kept as you wrote it
     assert json.loads(files["BTC/status.json"])["runs"] == 2
 
 
@@ -383,13 +386,31 @@ def test_the_setup_guide_matches_the_code_and_coinbases_key_page():
     assert first < part2.index("SHADOW's record on this account") < every
     assert part2.index("`DESK_LIVE_CONFIRM` is set to exactly") > every
     assert "A LIVE run that refuses before LIVE has ever armed saves nothing" in part2
-    # the trailing gap: one POST, POST_RETRIES + 1 tries of the client's timeout, the backoff between, PROTECT_S
+    assert "a missing or short `DESK_STATE_KEY` included" in part2
+    # the trailing gap, from the code: STOP_ATTEMPTS placements (STOP_BACKOFF_S doubling between), each one POST sent
+    # POST_RETRIES + 1 times with the client's timeout (BACKOFF_S doubling between), then the close; all of it inside
+    # protecting(), so at worst until PROTECT_S past the run's deadline (DEADLINE_S from its start)
     import inspect
+
+    from desk.brokers import live
+
     timeout = inspect.signature(CoinbaseREST.__init__).parameters["timeout"].default
-    gap = (rest.POST_RETRIES + 1) * timeout + sum(rest.BACKOFF_S * 2 ** k for k in range(rest.POST_RETRIES))
-    assert 45 < gap < 60 and "close to a minute" in part2 and "about 30 s" not in doc
-    assert f"waits up to {timeout:g} s" in part2 and f"tried {rest.POST_RETRIES + 1} times" in part2
-    assert f"{rest.PROTECT_S:g} s past the run's deadline" in part2
+    per_try = (rest.POST_RETRIES + 1) * timeout + sum(min(rest.BACKOFF_CAP_S, rest.BACKOFF_S * 2 ** k)
+                                                      for k in range(rest.POST_RETRIES))
+    apart = [live.STOP_BACKOFF_S * 2 ** k for k in range(live.STOP_ATTEMPTS - 1)]
+    to_close = live.STOP_ATTEMPTS * per_try + sum(apart)
+    worst = cr.DEADLINE_S + rest.PROTECT_S
+    assert round(per_try, -1) == 50 and 3.25 * 60 <= to_close <= 3.75 * 60 and worst == 5.5 * 60
+    assert f"tried up to {live.STOP_ATTEMPTS} times, 1 s, 2 s and then 4 s apart" in part2 and apart == [1, 2, 4]
+    assert f"waits up to {timeout:g} s for an answer and is sent up to {rest.POST_RETRIES + 1} times, 2 s and then " \
+           f"4 s apart: about {round(per_try, -1):g} s a try" in part2
+    assert "about 3½ minutes before the desk gives up on the stop and closes the position at market" in part2
+    assert f"{rest.PROTECT_S:g} s past the run's deadline, which can be up to about 5½ minutes after the cancel" in part2
+    assert cr.DEADLINE_S == 4.5 * 60 and "(the run's 4½ minutes plus that minute)" in part2
+    assert "close to a minute" not in doc and "about 30 s" not in doc
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+    assert f"tried up to {live.STOP_ATTEMPTS} times" in readme and "about 3½ minutes" in readme and \
+        "about 5½ minutes after the cancel" in readme and "close to a minute" not in readme
     # Coinbase's labels (2026-10-14), quoted
     for label in ("Secret API Keys", "Create API key", "API key nickname", "Advanced Settings",
                   "Coinbase App & Advanced Trade", "**Accounts**", "View is enabled by default",

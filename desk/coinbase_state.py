@@ -14,27 +14,38 @@ The branch holds one orphan commit, replaced at every save (encrypted blobs ever
     BTC/kills.json                   the kill switches: yours to edit here (flat_kill, entry_kill, jev_kill), and
                                      reset_halt_at: any new text (a date, say) clears a drawdown halt once
 
-check refuses (exit 1, an ::error:: naming the file) a file not on that list, an encrypted file that isn't an envelope,
-a status or kills.set.json that isn't what the desk writes (status keys and values are whitelisted, so a bug can't put
-an amount in it), and a younger state: the same start time as the branch's, and more runs, or as many runs with the very
-same state file. A run refused over its secrets (problem "key") saves its status alone: the state file as loaded, or
-none yet on a first save. stage copies the allowed files into a fresh tree, keeps the branch's kills.json (your edits)
-with any kill this run set added (kills.set.json), and moves the branch's last state to .prev.
+check refuses (exit 1, an ::error:: naming the file) a file in the state dir that is neither one of the desk's nor on
+the branch (the run wrote something it never saves), an encrypted file that isn't an envelope, a status or
+kills.set.json that isn't what the desk writes (status keys and values are whitelisted, so a bug can't put an amount in
+it), and a younger state: the same start time as the branch's, and more runs, or as many runs with the very same state
+file. A run refused over its secrets (problem "key") saves its status alone: the state file as loaded, or none yet on a
+first save. stage copies the desk's files into a fresh tree, keeps every file of yours on the branch as it is (any file
+that isn't the desk's: notes, say), keeps the branch's kills.json (your edits) with any kill this run set added
+(kills.set.json), and moves the branch's last state to .prev.
 
-kills.json is yours, so a typo in it never stops a save: read_kills is how the runs, check and stage all read it, and
-one it can't read (not JSON, a key it doesn't know, a switch that isn't true or false) is entry_kill on, and is saved
-back that way. LIVE counts on this branch only once it has armed: its status says "armed": true. A LIVE run that never
-armed saves nothing (desk/coinbase_run.py), check refuses a LIVE status that isn't armed, and a LIVE status without it
-(a LIVE attempt that never armed, before this rule) is no LIVE start: SHADOW saves over it and stage drops its files.
+kills.json is yours, so a typo in it never stops a save, and never turns a switch off: kills_read is how the runs,
+check and stage all read it. One it can't read (not JSON, a key it doesn't know, a switch that isn't true or false, a
+key written twice, a symlink) fails closed: entry_kill on, and every switch it names on unless its value says off
+(false, null, 0, "false", "no", "off"; a word starting with f or n). The save keeps such a file exactly as you wrote it,
+so every run reads it the same way and says so until you fix it. LIVE counts on this branch only once it has armed: its
+status says "armed": true. A LIVE run that never armed saves nothing (desk/coinbase_run.py), check refuses a LIVE status
+that isn't armed, and a LIVE status without it (a LIVE attempt that never armed, before this rule) is no LIVE start:
+SHADOW saves over it and stage drops its files.
+
+check runs against the branch as git has it (GitBranch) or, inside a run, as the run loaded it (Loaded: the load step
+extracts the branch's BTC/ into the state dir), so a run can tell before the save step that its save would be refused.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 from .statebox import is_envelope
 
@@ -51,6 +62,8 @@ STATUS_KEYS = {"v": int, "mode": str, "coin": str, "product": str, "updated": in
                "checks_passed": (int, type(None)), "checks_total": (int, type(None)), "opened": bool,
                "note": (str, type(None)), "armed": (bool, type(None))}
 PROBLEMS = {None, "auth", "permissions", "clock", "read", "state", "refused", "key"}
+LINK = "120000"                         # git's mode for a symlink (its blob is the link's target)
+KILLS = f"{COIN}/kills.json"
 BRANCH_README = """# coinbase-state
 
 Written by the paper desk workflow's `shadow` job (desk/coinbase_run.py). This repository is public, so the real
@@ -58,7 +71,8 @@ Coinbase account's state and board are encrypted with the `DESK_STATE_KEY` secre
 `BTC/status.json` (no amounts) is plain.
 
 To stop new entries or close the position from here: edit `BTC/kills.json` (`"entry_kill": true` or
-`"flat_kill": true`). The next run reads it. Each save replaces this branch's one commit.
+`"flat_kill": true`). The next run reads it. Each save replaces this branch's one commit, and keeps any other file
+you add here as it is (the desk never reads it).
 """
 
 
@@ -73,6 +87,104 @@ def _git_show(ref: str, path: str) -> bytes | None:
         return None
     return out.stdout if out.returncode == 0 else None
 
+
+# ---------------------------------------------------------------- the branch: as git has it, or as the run loaded it
+
+class GitBranch:
+    """The coinbase-state ref in this repository: its files (path -> git mode) and their bytes (a symlink's: its
+    target, as git stores it). A ref that doesn't exist has no files."""
+
+    def __init__(self, ref: str):
+        self.ref = ref
+        self._tree: dict[str, str] | None = None
+
+    def tree(self) -> dict[str, str]:
+        if self._tree is None:
+            self._tree = {}
+            try:
+                out = subprocess.run(["git", "ls-tree", "-r", "-z", "--full-tree", self.ref], capture_output=True,
+                                     timeout=60, check=False)
+            except (OSError, subprocess.SubprocessError):
+                out = None
+            if out is not None and out.returncode == 0:
+                for rec in out.stdout.split(b"\0"):
+                    meta, tab, path = rec.partition(b"\t")
+                    if tab:
+                        self._tree[os.fsdecode(path)] = meta.split(b" ")[0].decode()
+        return self._tree
+
+    def show(self, path: str) -> bytes | None:
+        mode = self.tree().get(path)
+        if mode is None or mode == "160000":        # none, or a submodule (no blob)
+            return None
+        return _git_show(self.ref, path)
+
+
+def _entries(d: Path, prefix: str) -> dict[str, tuple[str, bytes]]:
+    """Every file under `d`, symlinks not followed: {path: (git-like mode, bytes)} (a symlink's bytes: its target)."""
+    out: dict[str, tuple[str, bytes]] = {}
+    if d.is_symlink() or not d.is_dir():
+        return out
+    for p in sorted(d.iterdir()):
+        rel = f"{prefix}/{p.name}"
+        if p.is_symlink():
+            out[rel] = (LINK, os.fsencode(os.readlink(p)))
+        elif p.is_dir():
+            out.update(_entries(p, rel))
+        elif p.is_file():
+            out[rel] = ("100755" if os.access(p, os.X_OK) else "100644", p.read_bytes())
+        else:
+            out[rel] = ("special", b"")
+    return out
+
+
+class Loaded:
+    """The branch as a run loaded it: the load step extracts the branch's BTC/ into the state dir, and the run copies
+    it before it writes anything. Answers as GitBranch does, so the run checks its own save before the save step."""
+
+    def __init__(self, state_dir: str | Path | None):
+        self.files = {} if state_dir is None else _entries(Path(state_dir) / COIN, COIN)
+
+    def tree(self) -> dict[str, str]:
+        return {p: m for p, (m, _) in self.files.items()}
+
+    def show(self, path: str) -> bytes | None:
+        got = self.files.get(path)
+        return None if got is None else got[1]
+
+
+def _desks(path: str) -> bool:
+    """One of the desk's own paths on the branch (kills.json, yours, apart)."""
+    return path == "README.md" or (path.startswith(COIN + "/") and path[len(COIN) + 1:] in ALLOWED - {"kills.json"})
+
+
+def yours(tree: dict[str, str]) -> list[str]:
+    """The branch's files that aren't the desk's: kept as they are at every save, never read (kill-like ones apart:
+    kill_like). BTC/kills.json is in it only when it isn't a plain file (a symlink, a folder)."""
+    return sorted(p for p, m in tree.items()
+                  if not _desks(p) and not (p == KILLS and m not in (LINK, "160000")))
+
+
+def kill_like(path: str) -> bool:
+    """A file of yours whose name says kill but isn't BTC/kills.json (BTC/Kills.json, say): it looks like a kill
+    switch, so the runs read it as one they can't read (entry_kill on), and say so."""
+    return path.startswith(COIN + "/") and "kill" in path[len(COIN) + 1:].lower() and path != KILLS and \
+        not path.startswith(KILLS + "/")
+
+
+def branch_kills(branch) -> tuple[bytes | None, bool]:
+    """BTC/kills.json on `branch`: (its bytes, whether it is a plain file). A symlink: its target, not plain; a
+    folder: b"", not plain; none: (None, True)."""
+    tree = branch.tree()
+    mode = tree.get(KILLS)
+    if mode is None:
+        if any(p.startswith(KILLS + "/") for p in tree):
+            return b"", False
+        return None, True
+    return branch.show(KILLS) or b"", mode not in (LINK, "160000", "special")
+
+
+# ---------------------------------------------------------------- the files' checks
 
 def _json(data: bytes, name: str):
     try:
@@ -115,30 +227,117 @@ def check_kills(d, name: str) -> dict:
     return d
 
 
-def read_kills(raw: bytes | str | None) -> tuple[dict, str | None]:
-    """BTC/kills.json as the SHADOW and LIVE runs, check and stage all read it: (the switches, None), or, for a file
-    that isn't one the desk can read, (entry_kill on, why). Failing closed: entry_kill on, any switch written exactly
-    true still on (flat_kill closes the position), nothing else in it acted on (reset_halt_at included). No file:
-    every switch off."""
+# ---------------------------------------------------------------- kills.json, read failing closed
+
+OFF_WORDS = {"", "false", "f", "no", "n", "off", "null", "none", "nil"}
+TRUE_WORDS = {"true", "t", "yes", "y", "on", "1"}
+# a switch's name in text the desk can't parse: flat_kill, "Flat Kill", entry-kill..., then (maybe) : or =, then a value
+_NAMED = re.compile(r"(?<![a-z])(flat|entry|jev)[\s_\-]*kills?[\"']?\s*([:=]?)\s*(\"[^\"\n]*\"?|'[^'\n]*'?|[\w.+\-]*)",
+                    re.IGNORECASE)
+
+
+class KillsRead(NamedTuple):
+    kills: dict             # the switches (and reset_halt_at, from a file the desk can read)
+    why: str | None         # None: read as written; else why the desk can't read it (then entry_kill is on)
+    named: tuple            # the switches the file names
+
+
+def says_off(v) -> bool:
+    """A switch's value that says off: false, null, 0, or a word for off ("false", "no", "off", "", and a word
+    starting with f or n: a typo of false, no or null). Anything else says on (failing closed)."""
+    if v is None or v is False:
+        return True
+    if v is True:
+        return False
+    if isinstance(v, (int, float)):
+        return v == 0
+    if isinstance(v, str):
+        t = v.strip().strip("\"'").strip().lower()
+        if t in OFF_WORDS or t[:1] in ("f", "n"):
+            return True
+        try:
+            return float(t) == 0
+        except ValueError:
+            return False
+    return False                # a list or an object: not off
+
+
+def _switch(key) -> str | None:
+    m = re.fullmatch(r"(flat|entry|jev)kills?", re.sub(r"[^a-z]", "", str(key).lower()))
+    return f"{m.group(1)}_kill" if m else None
+
+
+def _text(raw: bytes | str) -> str:
+    if isinstance(raw, str):
+        return raw
+    try:
+        enc = json.detect_encoding(raw)
+    except Exception:           # noqa: BLE001 (any odd bytes: read them as UTF-8, replaced)
+        enc = "utf-8"
+    return raw.decode(enc, errors="replace")
+
+
+def kills_read(raw: bytes | str | None, plain: bool = True) -> KillsRead:
+    """BTC/kills.json as the SHADOW and LIVE runs, check and stage all read it. No file: every switch off. A file the
+    desk can read (an object of the three switches, each true or false, and reset_halt_at): as written. Any other
+    (`plain` False: a symlink or a folder) fails closed: entry_kill on, each switch it names on unless its value says
+    off (says_off), wherever it's named (a key, or text that isn't JSON: "flat_kill": true, with a trailing comma, say);
+    reset_halt_at not acted on."""
     kills: dict = {k: False for k in KILL_KEYS}
     if raw is None:
-        return kills, None
-    try:
-        d = json.loads(raw)
-    except (ValueError, RecursionError):
-        kills["entry_kill"] = True
-        return kills, "it isn't JSON"
-    try:
-        check_kills(d, "kills.json")
-    except StateCheckError:
-        kills["entry_kill"] = True
-        if isinstance(d, dict):
-            kills.update({k: True for k in KILL_KEYS if d.get(k) is True})
-        return kills, (f"it isn't a kill-switch file: only {', '.join(KILL_KEYS)}, each true or false, and "
-                       f"{', '.join(RESET_KEYS)} (a short text)")
-    kills.update(d)
-    return kills, None
+        return KillsRead(kills, None, ())
+    top: list = []
+    if not plain:
+        why = "it isn't a plain file (a symlink or a folder)"
+    else:
+        calls: list = []
 
+        def hook(pairs):
+            calls.append(pairs)
+            return dict(pairs)
+
+        try:
+            d = json.loads(raw, object_pairs_hook=hook)
+        except (ValueError, RecursionError):
+            why = "it isn't JSON"
+        else:
+            top = calls[-1] if isinstance(d, dict) and calls else []
+            keys = [k for k, _ in top]
+            if len(keys) != len(set(keys)):
+                why = "a key is in it twice"
+            else:
+                try:
+                    check_kills(d, "kills.json")
+                    kills.update(d)
+                    return KillsRead(kills, None, tuple(k for k in KILL_KEYS if k in d))
+                except StateCheckError:
+                    why = (f"it isn't a kill-switch file: only {', '.join(KILL_KEYS)}, each true or false, and "
+                           f"{', '.join(RESET_KEYS)} (a short text)")
+    named: dict = {}
+    for k, v in top:
+        sw = _switch(k)
+        if sw:
+            named[sw] = named.get(sw, False) or not says_off(v)
+    for m in _NAMED.finditer(_text(raw)):
+        sw, sep, val = f"{m.group(1).lower()}_kill", m.group(2), m.group(3)
+        if sep:
+            named[sw] = named.get(sw, False) or not says_off(val)
+        elif val.strip("\"'").lower() in TRUE_WORDS:        # no : or = (prose, say): only a plain yes counts
+            named[sw] = True
+    for sw, on in named.items():
+        kills[sw] = kills[sw] or on
+    kills["entry_kill"] = True
+    return KillsRead(kills, why, tuple(k for k in KILL_KEYS if k in named))
+
+
+def read_kills(raw: bytes | str | None, plain: bool = True) -> tuple[dict, str | None]:
+    """(the switches, None), or, for a file the desk can't read, (entry_kill on and each switch it names on unless
+    it says off, why): kills_read."""
+    got = kills_read(raw, plain)
+    return got.kills, got.why
+
+
+# ---------------------------------------------------------------- the state dir, against the branch
 
 def _never_armed(status: dict | None) -> bool:
     """A LIVE status that isn't armed: the files of a LIVE attempt that never armed, which are no LIVE start."""
@@ -149,24 +348,34 @@ LIVE_FILES = tuple(f"{kind}-live{suffix}" for kind, suffix in
                    (("state", ".enc.json"), ("state", ".prev.enc.json"), ("board", ".enc.json")))
 
 
-def _local(state_dir: Path) -> dict[str, bytes]:
-    d = state_dir / COIN
+def _local(state_dir: Path, branch) -> dict[str, bytes]:
+    """The desk's files in the state dir. Anything else in it must be the branch's (yours, as loaded: stage keeps the
+    branch's own copy); a file that is neither is something the run wrote and the desk never saves: refused."""
     for p in state_dir.iterdir():
         if p.name != COIN:
             raise StateCheckError(f"{p.name} isn't something the SHADOW job saves (only {COIN}/)")
+    tree = branch.tree()
     out = {}
-    if not d.is_dir():
-        return out
-    for p in sorted(d.iterdir()):
-        if p.name not in ALLOWED or not p.is_file():
-            raise StateCheckError(f"{COIN}/{p.name} isn't a file the SHADOW job saves; not saving")
-        out[p.name] = p.read_bytes()
+    for rel, (mode, data) in _entries(state_dir / COIN, COIN).items():
+        name = rel[len(COIN) + 1:]
+        if name in ALLOWED and mode not in (LINK, "special"):
+            out[name] = data
+        elif rel not in tree:
+            raise StateCheckError(f"{rel} isn't a file the SHADOW job saves, and it isn't on the branch: not saving")
     return out
 
 
-def check(state_dir: str | Path, remote_ref: str) -> list[str]:
+def _kills_here(files: dict, branch) -> tuple[bytes | None, bool]:
+    raw, plain = branch_kills(branch)
+    if raw is None and plain:
+        return files.get("kills.json"), True        # none on the branch yet: the one loaded (a first save)
+    return raw, plain
+
+
+def check(state_dir: str | Path, remote_ref: str | None = None, branch=None) -> list[str]:
     """Raises StateCheckError; returns what it checked, for the log."""
-    files = _local(Path(state_dir))
+    b = branch if branch is not None else GitBranch(remote_ref)
+    files = _local(Path(state_dir), b)
     said = []
     for name, data in files.items():
         if name in ENCRYPTED:
@@ -174,11 +383,17 @@ def check(state_dir: str | Path, remote_ref: str) -> list[str]:
                 raise StateCheckError(f"{COIN}/{name} isn't encrypted: never saving the real account in plain text")
         elif name == "kills.set.json":
             check_kills(_json(data, f"{COIN}/{name}"), f"{COIN}/{name}")
-    # kills.json is yours: stage saves the branch's (or, with none there yet, this one) as read_kills reads it
-    raw = _git_show(remote_ref, f"{COIN}/kills.json")
-    _, why = read_kills(raw if raw is not None else files.get("kills.json"))
-    if why:
-        said.append(f"{COIN}/kills.json isn't readable ({why}): saved as entry_kill on, as the run read it")
+    # kills.json is yours: stage saves the branch's (or, with none there yet, this one), as kills_read reads it
+    got = kills_read(*_kills_here(files, b))
+    if got.why:
+        on = ", ".join(k for k in KILL_KEYS if got.kills[k])
+        said.append(f"{KILLS} can't be read ({got.why}): kept as you wrote it; every run reads it failing closed "
+                    f"({on} on) until you fix it")
+    mine = yours(b.tree())
+    if mine:
+        said.append(f"yours, kept as they are: {', '.join(mine[:10])}" + (" and more" if len(mine) > 10 else "")
+                    + ("; read as a kill switch the desk can't read (entry_kill on): "
+                       + ", ".join(p for p in mine if kill_like(p)) if any(kill_like(p) for p in mine) else ""))
     if "status.json" not in files:
         raise StateCheckError(f"{COIN}/status.json is missing: nothing to save")
     new = check_status(_json(files["status.json"], f"{COIN}/status.json"))
@@ -189,13 +404,13 @@ def check(state_dir: str | Path, remote_ref: str) -> list[str]:
         raise StateCheckError(f"{COIN}/status.json is a LIVE status that isn't armed: a LIVE run that never armed "
                               f"saves nothing (it isn't a LIVE start)")
     if state not in files:
-        if status_only and new["runs"] == 0 and _git_show(remote_ref, f"{COIN}/{state}") is None:
+        if status_only and new["runs"] == 0 and b.show(f"{COIN}/{state}") is None:
             said.append(f"a status-only save: {new['mode']} was refused over its secrets before it had a state")
             return said
         raise StateCheckError(f"{COIN}/{state} is missing next to a {new['mode']} status")
-    old_raw = _git_show(remote_ref, f"{COIN}/status.json")
+    old_raw = b.show(f"{COIN}/status.json")
     if old_raw is None:
-        if _git_show(remote_ref, f"{COIN}/{state}") is not None:
+        if b.show(f"{COIN}/{state}") is not None:
             raise StateCheckError(f"the branch has {COIN}/{state} but no status.json: not replacing it blind")
         said.append("no saved state on the branch: a first save")
         return said
@@ -207,9 +422,9 @@ def check(state_dir: str | Path, remote_ref: str) -> list[str]:
                         "replaced")
             return said
         # SHADOW's own counts went with its status: this run must have loaded the branch (its LIVE file, as is)
-        left = _git_show(remote_ref, f"{COIN}/state-live.enc.json")
+        left = b.show(f"{COIN}/state-live.enc.json")
         loaded = files.get("state-live.enc.json") == left if left is not None else \
-            _git_show(remote_ref, f"{COIN}/{state}") is None
+            b.show(f"{COIN}/{state}") is None
         if not loaded:
             raise StateCheckError("the branch holds a LIVE attempt that never armed, and this SHADOW run didn't "
                                   "load it: not saving a SHADOW state that may not be the branch's")
@@ -217,7 +432,7 @@ def check(state_dir: str | Path, remote_ref: str) -> list[str]:
                     "state saved, they're dropped")
         return said
     if old["mode"] != new["mode"]:
-        if old["mode"] == "SHADOW" and new["mode"] == "LIVE" and _git_show(remote_ref, f"{COIN}/{state}") is None:
+        if old["mode"] == "SHADOW" and new["mode"] == "LIVE" and b.show(f"{COIN}/{state}") is None:
             said.append("the first LIVE save: SHADOW's files stay on the branch beside it")
             return said
         raise StateCheckError(f"the branch's state is {old['mode']}, this run's {new['mode']}: not saving over it")
@@ -228,7 +443,7 @@ def check(state_dir: str | Path, remote_ref: str) -> list[str]:
     if new["runs"] < old["runs"]:
         raise StateCheckError(f"{COIN}/{state} has {new['runs']} runs, the saved one {old['runs']}: a younger state, "
                               f"not saving")
-    if new["runs"] == old["runs"] and files[state] != (_git_show(remote_ref, f"{COIN}/{state}") or b""):
+    if new["runs"] == old["runs"] and files[state] != (b.show(f"{COIN}/{state}") or b""):
         raise StateCheckError(f"{COIN}/{state} changed but its run count didn't: not saving")
     if status_only and new["runs"] == old["runs"]:
         said.append(f"a status-only save: {new['mode']} was refused over its secrets; its state is as loaded")
@@ -237,16 +452,42 @@ def check(state_dir: str | Path, remote_ref: str) -> list[str]:
     return said
 
 
-def stage(state_dir: str | Path, work: str | Path, remote_ref: str) -> list[str]:
-    files = _local(Path(state_dir))
+def _safe(path: str) -> bool:
+    parts = path.split("/")
+    return all(p not in ("", ".", "..", ".git") for p in parts) and "\\" not in path
+
+
+def _put(path: Path, mode: str, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if mode == LINK:
+        os.symlink(os.fsdecode(data), path)
+    else:
+        path.write_bytes(data)
+        if mode == "100755":
+            path.chmod(0o755)
+
+
+def stage(state_dir: str | Path, work: str | Path, remote_ref: str | None = None, branch=None) -> list[str]:
+    b = branch if branch is not None else GitBranch(remote_ref)
+    files = _local(Path(state_dir), b)
     status = check_status(_json(files["status.json"], "status.json"))
     mode = status["mode"].lower()
+    for top in ("README.md", COIN):
+        p = Path(work) / top
+        if p.is_symlink() or p.is_file():
+            p.unlink()
+        elif p.exists():
+            shutil.rmtree(p)
     out = Path(work) / COIN
-    if out.exists():
-        shutil.rmtree(out)
     out.mkdir(parents=True)
     (Path(work) / "README.md").write_text(BRANCH_README)
-    raw_status = _git_show(remote_ref, f"{COIN}/status.json")
+    # yours: every file on the branch that isn't the desk's, as it is
+    tree = b.tree()
+    for path in yours(tree):
+        data = b.show(path)
+        if data is not None and _safe(path) and tree[path] != "160000":
+            _put(Path(work) / path, tree[path], data)
+    raw_status = b.show(f"{COIN}/status.json")
     try:
         leftover = _never_armed(json.loads(raw_status)) if raw_status is not None else False
     except ValueError:
@@ -256,22 +497,33 @@ def stage(state_dir: str | Path, work: str | Path, remote_ref: str) -> list[str]
             if leftover and mode == "shadow" and n in LIVE_FILES:
                 continue        # a LIVE attempt that never armed: no LIVE start, its files go
             (out / n).write_bytes(files[n])
-    old_state = _git_show(remote_ref, f"{COIN}/state-{mode}.enc.json")
-    old_prev = _git_show(remote_ref, f"{COIN}/state-{mode}.prev.enc.json")
+    old_state = b.show(f"{COIN}/state-{mode}.enc.json")
+    old_prev = b.show(f"{COIN}/state-{mode}.prev.enc.json")
     if leftover and mode == "live":
         old_state = old_prev = None                                 # nothing of it becomes LIVE's .prev
     if old_state is not None and old_state != files.get(f"state-{mode}.enc.json"):
         (out / f"state-{mode}.prev.enc.json").write_bytes(old_state)
     elif old_prev is not None:
         (out / f"state-{mode}.prev.enc.json").write_bytes(old_prev)
-    raw = _git_show(remote_ref, f"{COIN}/kills.json")
-    kills, _ = read_kills(raw if raw is not None else files.get("kills.json"))   # unreadable: entry_kill on
+    raw, plain = _kills_here(files, b)
+    got = kills_read(raw, plain)
+    added = {}
     if "kills.set.json" in files:
-        for k, v in check_kills(_json(files["kills.set.json"], "kills.set.json"), "kills.set.json").items():
-            if k in KILL_KEYS:
-                kills[k] = kills[k] or v
-    (out / "kills.json").write_text(json.dumps(kills, indent=1) + "\n")
-    return sorted(p.name for p in out.iterdir())
+        added = {k: v for k, v in check_kills(_json(files["kills.set.json"], "kills.set.json"),
+                                              "kills.set.json").items() if k in KILL_KEYS and v}
+    if got.why is None or any(not got.kills[k] for k in added):
+        # read as written (or a kill this run set that the file can't carry): written valid, every switch on kept on
+        kills = {**got.kills, **{k: True for k in added}}
+        p = out / "kills.json"
+        if p.is_symlink() or p.is_file():
+            p.unlink()
+        elif p.exists():
+            shutil.rmtree(p)
+        p.write_text(json.dumps(kills, indent=1) + "\n")
+    elif not ((out / "kills.json").is_symlink() or (out / "kills.json").exists()):
+        (out / "kills.json").write_bytes(raw or b"")    # one the desk can't read: kept exactly as you wrote it
+    # (a symlink or a folder in its place was kept above, as it is: every run reads it as one it can't read)
+    return sorted(str(p.relative_to(out)) for p in out.rglob("*") if p.is_symlink() or p.is_file())
 
 
 def main(argv: list[str]) -> int:
