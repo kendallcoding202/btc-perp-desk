@@ -58,13 +58,18 @@ def test_it_subscribes_to_the_boards_product_only():
         assert not re.search(r"BIP-|-CDE\b|BTC-USD", js)
     msg = _function(APP, "cbMessage")
     assert 'm.channel === "heartbeats"' in msg and 'm.channel !== "ticker"' in msg
-    assert "k.product_id === cb.sub" in msg and "JSON.parse(raw)" in msg and "isFinite(x)" in msg
+    assert "k.product_id !== cb.sub" in msg and "JSON.parse(raw)" in msg and "isFinite(x)" in msg
+    assert '/^\\d+(\\.\\d+)?$/.test(k.price)' in msg      # "0x13a00", " 70000 ", "8.1e4" aren't prices
 
 
 def test_freshness_throttle_and_backoff_numbers():
-    """Fresh = a heartbeat within 5 s (they come every second) and a ticker message within 15 s (about two a second).
-    At most one redraw a second from the ticker. Retries from 2 s doubling to 60 s with jitter, never two a second."""
-    assert _const("CB_BEAT") == 5000 and _const("CB_QUIET") == 15000 and _const("CB_DEAD") == 10000
+    """Fresh = a heartbeat within 5 s (they come every second) and a ticker message on this connection within a minute
+    (its price is the last trade, still the price in a quiet spell). At most one redraw a second from the ticker.
+    Retries from 2 s doubling to 60 s with jitter, never two a second. The proxy stops being called live when the desk
+    monitor says "no live price", and the monitor leaves Coinbase's freshness to app.js."""
+    assert _const("CB_BEAT") == 5000 and _const("CB_QUIET") == 60000 and _const("CB_DEAD") == 10000
+    act = lambda name: int(re.search(rf"\b{name} = (\d+)", ACT).group(1))
+    assert _const("STALE") == act("NO_TICK") == 20000 and act("FEED_QUIET") > _const("CB_QUIET")
     assert _const("CB_PAINT") >= 1000
     assert _const("CB_BASE") == 2000 and _const("CB_MAX") == 60000 and _const("CB_GAP") >= 1000
     fresh = APP[APP.index("const cbFresh"):APP.index("function cbClosed")]
@@ -95,16 +100,18 @@ def test_vt_and_the_other_tabs_keep_hyperliquid():
 def test_labels_name_the_source():
     for text in ('dot("LIVE (COINBASE)")', '" (HYPERLIQUID PROXY)"', '" (HL proxy)"', '"Price (HL proxy)"', '"Price (Coinbase live)"',
                  "s ago from Coinbase`", "s ago from Hyperliquid`", '"CLOSED (COINBASE) · "',
-                 "no live price until a run finds it open", "is closed now by its schedule"):
+                 "no live price until a run finds it open", "is closed now by its schedule", '"STALE (HYPERLIQUID PROXY) · "',
+                 "its own feed does`"):
         assert text in APP, text
     # the chart's live marker only with Coinbase's own price; no candle made up for it
     assert 'if (lp.source === "coinbase") s.chart.live = mid;' in APP
-    for text in ('"Coinbase feed"', "FROM COINBASE'S OWN PRICES", "A PROXY FOR COINBASE'S", 'from ${o.feed ? "Coinbase"'):
+    for text in ('"Coinbase feed"', "FROM COINBASE'S OWN PRICES", "A PROXY FOR COINBASE'S", 'from ${o.feed ? "Coinbase"',
+                 "AT THE LAST RUN'S PRICE${basket() ? \"S\" : \"\"} (NO LIVE PRICE YET)"):
         assert text in ACT, text
     assert "d.source" in ACT and "d.priceAt" in ACT
     now = APP[APP.index("const liveNow"):APP.index("const ticked")]
     assert "source:" in now and "priceAt:" in now and "closed:" in now
-    assert "...liveNow(), mids: live.mids, at: live.at" in APP and "live: liveNow() });" in APP   # desk:tick and desk:board
+    assert "...tell(liveNow()), mids: live.mids, at: live.at" in APP and "live: tell(liveNow()) });" in APP   # desk:tick, desk:board
     assert "const lv = d.live;" in ACT                                                            # the board's first draw
 
 
@@ -135,3 +142,149 @@ const out = [cbTime("2026-10-15T12:52:20.546094437Z"), cbTime("2026-10-15T12:52:
 console.log(JSON.stringify(out));"""
     out = subprocess.run(["node", "-e", js], capture_output=True, text=True, check=True).stdout
     assert out.strip() == "[1792068740546,1792068740000,1792068740500,0,0,0,0]"
+
+
+def _node(js: str) -> str:
+    return subprocess.run(["node", "-e", js], capture_output=True, text=True, check=True).stdout.strip()
+
+
+def _between(src: str, start: str, end: str) -> str:
+    k = src.index(start)
+    return src[k:src.index(end, k)]
+
+
+# the page's own rules, run in node: cbClosed, livePrice and cbFresh as app.js has them, around a stub feed
+_STUB = """
+const live = { mids: { BTC: "80000" }, at: 0 };
+const cb = { ws: null, sub: "P", at: 0, beat: 0, price: 81230 };
+const open = (now) => { cb.ws = { readyState: 1 }; cb.at = now - 500; cb.beat = now - 500; };
+const v = (o) => ({ name: "coinbase", product: "P", closed_now: null, session: { next_closure: null }, ...o });
+const S = (o) => ({ venue: v(o), header: { coin: "BTC" } });
+const show = (r) => [r.source, r.closed ? r.closed.by : null, !!r.stale];
+"""
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_where_the_price_comes_from():
+    """Closed as the last run found it (a scheduled closure: until its end, then until Coinbase's own feed is fresh
+    again), closed by the schedule, Coinbase's own while fresh, else the proxy, stale once Hyperliquid is 20 s quiet."""
+    rules = _between(APP, "const CB_BEAT", "  // quiet: the ticker") + _between(APP, "const cbFresh", "  const cbWanted")
+    js = rules + _STUB + """
+const now = Date.now(), out = {};
+const sched = { why: "weekly break", until: now - 60000, scheduled: true };
+live.at = now - 1000;
+out.unscheduled_feed_on = (open(now), show(livePrice(S({ closed_now: { why: "x", until: null, scheduled: false } }), now)));
+out.scheduled_before_end = show(livePrice(S({ closed_now: { ...sched, until: now + 60000 } }), now));
+out.scheduled_past_end_fresh = show(livePrice(S({ closed_now: sched }), now));
+out.window_now = show(livePrice(S({ session: { next_closure: { start: now - 1000, end: now + 1000, why: "maintenance" } } }), now));
+out.window_over_fresh = show(livePrice(S({ session: { next_closure: { start: now - 9000, end: now - 1000, why: "maintenance" } } }), now));
+out.fresh = show(livePrice(S({}), now));
+out.quiet_59s = (cb.at = now - 59000, show(livePrice(S({}), now)));
+out.quiet_61s = (cb.at = now - 61000, show(livePrice(S({}), now)));
+out.no_heartbeat = (open(now), cb.beat = now - 5100, show(livePrice(S({}), now)));
+out.scheduled_past_end_not_fresh = show(livePrice(S({ closed_now: sched }), now));
+out.proxy_stale = (live.at = now - 21000, show(livePrice(S({}), now)));
+out.other_coin = show(livePrice({ venue: null, header: { coin: "ETH" } }, now));
+console.log(JSON.stringify(out));"""
+    import json
+    out = json.loads(_node(js))
+    assert out == {
+        "unscheduled_feed_on": [None, "run", False], "scheduled_before_end": [None, "run", False],
+        "scheduled_past_end_fresh": ["coinbase", None, False], "window_now": [None, "schedule", False],
+        "window_over_fresh": ["coinbase", None, False], "fresh": ["coinbase", None, False],
+        "quiet_59s": ["coinbase", None, False], "quiet_61s": ["hyperliquid", None, False],
+        "no_heartbeat": ["hyperliquid", None, False], "scheduled_past_end_not_fresh": [None, "run", False],
+        "proxy_stale": ["hyperliquid", None, True], "other_coin": ["hyperliquid", None, False]}
+
+
+def test_a_quiet_ticker_reconnects_and_then_takes_an_update():
+    """A minute with no ticker message (heartbeats still coming), outside a closure the board knows of: the connection
+    is dropped and retried through the backoff, which isn't reset for it. After that, or a closure, a snapshot (the
+    price from before) doesn't count until an update does."""
+    watch = _function(APP, "cbWatch")
+    assert "cbClosed(cb.venue, now)" in watch and "cb.at = 0; cb.quiet = true;" in watch
+    assert "now - Math.max(cb.at, cb.opened, cb.calm) > CB_QUIET) { cb.quiet = true; cbDrop(true); return; }" in watch
+    assert "if (up > 60000 && !quiet) cb.tries = 0;" in _function(APP, "cbDrop")
+    msg = _function(APP, "cbMessage")
+    assert 'upd = upd || e.type === "update"' in msg
+    assert "if (!upd && (cb.quiet || (cb.venue && cb.venue.closed_now))) return;" in msg
+    assert msg.index("if (cbClosed(cb.venue, now)) { cb.quiet = true; return; }") < msg.index("cbPaint();")
+
+
+def test_the_btc_card_follows_the_same_rules_on_every_tab():
+    """On the other tabs the BTC card is priced by livePrice on the BTC board's venue as last shown: the board's price
+    while Coinbase is closed."""
+    coins = _function(APP, "renderCoins")
+    assert "livePrice({ venue: cb.venue, header: { coin: c.coin } })" in coins
+    assert "px(cbq.source && cbq.price || c.price)" in coins
+    assert "cb.venue = s.venue;" in APP
+
+
+def test_listeners_hear_a_change_of_source_at_once():
+    """Any redraw that changes where the price comes from (the page shown again, a closure, the feed going quiet)
+    fires desk:tick; a Coinbase tick only with a new Coinbase message; an allMids tick once per answer."""
+    render = _function(APP, "render")
+    assert "told.source !== n.source" in render and render.rstrip("}").rstrip().endswith("ticked();")
+    assert 'state.livePx.source === "coinbase" && (!told || told.priceAt !== cb.at)) ticked();' in _function(APP, "cbPaint")
+    poll = _function(APP, "pollMids")
+    assert 'livePrice(base).source === "coinbase") cbPaint();' in poll and "if (!told || told.at !== live.at) ticked();" in poll
+
+
+def test_the_tape_has_one_line_per_real_event():
+    feed = _function(ACT, "tapeFeed")
+    assert "!(tk.at > feedAt)" in feed and "feedAt = tk.at" in feed
+    assert "const answer = d.at > midsAt;" in ACT and "else if (answer) setTimeout(" in ACT
+
+
+def test_a_price_redraw_leaves_the_boards_own_panels_alone():
+    """A Coinbase redraw (render(true)) skips the agents, bubbles, P&L bars, rules and switches; panels it does redraw
+    are rewritten only when their text changes."""
+    render = _function(APP, "render")
+    for part in ("if (!light) renderAgents(s.agents);", "if (!light) renderBubbles(s.agents);", "if (!light) drawPnlBars(",
+                 "if (!light) { if (basket) renderRules(s.basket.rules); else renderThresholds(s.thresholds); renderKills(s.kills); }"):
+        assert part in render, part
+    assert "render(true);" in _function(APP, "cbPaint")
+    assert "if (light) return;" in _function(APP, "renderAnalysis")
+    for el in ("stats", "outlook", "gates", "events", "kill-state", "jevbox", "goal-note", "chart-sub"):
+        assert f'put($("{el}"), ' in APP, el
+    assert "put(chips, " in APP
+    assert "toLocaleString" not in APP[APP.index("const usd ="):APP.index("const esc =")]   # formatters made once
+
+
+def test_tab_row_taps_only_switch_on_a_card():
+    """A tap on the ALL total or a gap in the row reloads nothing (body carries data-coin too)."""
+    handler = _between(APP, '$("coins").addEventListener("click"', "});")
+    assert 'closest(".coin[data-coin]")' in handler and '$("coins").contains(b)' in handler
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_the_live_tag_is_clear_of_the_other_tags():
+    """The chart's live price tag sits at its price, or at the nearest place clear of the close's and the stop's tags
+    (17 px: tags are 16 tall) on the same side of each as its price, inside the plot; if there's none, it isn't drawn
+    (the line still is). Checked against every whole-pixel place. An axis label under it is left out."""
+    place = _between(APP, "let liveY = null;", "\n\n    g.font")
+    assert "if (liveY != null && Math.abs(y - liveY) < 13) continue;" in APP
+    js = """
+const out = { n: 0, bad: [], none: 0 };
+const padT = 8, padB = 18, h = 250, top = padT + 8, bot = h - padB - 8, Y = (p) => p;
+for (let close = 2; close <= 248; close += 7) for (const stop of [null, ...Array.from({ length: 28 }, (_, k) => 3 + 9 * k)]) for (let live = 1; live <= 250; live += 3) {
+  const cs = [[0, 0, 0, 0, close]], chart = { live, stop };
+""" + place + """
+  const taken = [close, stop].filter((o) => o != null);
+  const ok = (t) => t >= top && t <= bot && taken.every((o) => Math.abs(t - o) >= 17 && (live === o || (t - o) * (live - o) > 0));
+  let best = null;
+  for (let t = top; t <= bot; t += 0.5) if (ok(t) && (best == null || Math.abs(t - live) < Math.abs(best - live))) best = t;
+  out.n++;
+  if (liveY == null) { out.none++; if (best != null) out.bad.push(["missed", close, stop, live, best]); }
+  else if (!ok(liveY) || Math.abs(liveY - live) > Math.abs(best - live) + 0.5) out.bad.push(["placed", close, stop, live, liveY, best]);
+}
+console.log(JSON.stringify({ n: out.n, none: out.none, bad: out.bad.slice(0, 5), nbad: out.bad.length }));"""
+    r = __import__("json").loads(_node(js))
+    assert r["n"] > 20000 and r["nbad"] == 0, r
+    assert 0 < r["none"] < r["n"] / 10, r     # left off only when the close and the stop leave no room on its side
+
+
+def test_readme_pins_no_test_count():
+    """A number of tests in the README goes stale with the next test added."""
+    line = next(x for x in (ROOT / "README.md").read_text().splitlines() if x.startswith("python3 -m pytest"))
+    assert not re.search(r"\d+ tests", line), line

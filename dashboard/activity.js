@@ -42,6 +42,8 @@
   const phaseOf = (g) => PHASE[g.name] || OWNER_PHASE[g.owner] || "HARD";
   const TRADE = /\b(BOUGHT|SOLD|SHORTED|COVERED|ADDED|TRIMMED|HALT|flattened)\b/;
   const NO_TICK = 20000;          // no live price for this long: say so
+  const FEED_QUIET = 65000;       // Coinbase's feed: app.js says when it stops being fresh (a minute without a ticker
+                                  // message: its price is the last trade, still the price until then); only a backstop
   const NO_READ_STATIC = 130000, NO_READ_LIVE = 15000;   // app.js re-reads every 60 s (a live server: 2 s)
   const NO_FIRST = 15000;         // no board this long after load: say the page can't load one
   const DAY = 86400000;
@@ -185,8 +187,8 @@
   const feedTick = () => !!(tk && B && B.venue && tk.coin === B.header.coin && tk.source === "coinbase");
   function calc(now) {
     const b = B, coin = b.header.coin, ch = b.chart, t = b.ticker, st = b.analysis.stats;
-    const mine = tk && tk.coin === coin ? tk : null;
-    const shut = b.venue ? (b.venue.closed_now ? { ...b.venue.closed_now, by: "run" } : mine && mine.closed) || null : null;
+    const mine = tk && tk.coin === coin ? tk : null;   // app.js's own call (it may find Coinbase open past a closure's end)
+    const shut = b.venue ? (mine ? mine.closed : b.venue.closed_now ? { ...b.venue.closed_now, by: "run" } : null) || null : null;
     const feed = !shut && feedTick();
     const lv = shut ? NaN : feed ? mine.price : mids ? parseFloat(mids[coin]) : NaN, isLive = isFinite(lv) && lv > 0;
     const mid = isLive ? lv : t.price, cl = last(ch.candles), c = closes(now);
@@ -274,6 +276,7 @@
       if (logOn && logPending) playLog();
       if (!monOn && runs.strip) finishStrip();
       clockRun();
+      if (logOn && B && visible()) liveRows(Date.now());   // in view again: its live rows as of now, not as it left
     });
     io.observe(mon); io.observe(log);
   } else { monOn = logOn = true; setTimeout(loadResearch, 0); }
@@ -315,7 +318,7 @@
     if (o.shut) return `${vName()} closed at the last run, ${hhmm(B.updated)} UTC (${o.shut.why}) · price ${mid$(o.mid)} from that run`;
     if (!o.isLive) return `price ${mid$(o.mid)} at the last run, ${hhmm(B.updated)} UTC · no live price yet`;
     const age = now - o.at;
-    return age > NO_TICK ? `no live price for ${Math.round(age / 1000)} s · showing the last one, ${mid$(o.mid)}`
+    return age > (o.feed ? FEED_QUIET : NO_TICK) ? `no live price for ${Math.round(age / 1000)} s · showing the last one, ${mid$(o.mid)}`
       : `price ${mid$(o.mid)} from ${o.feed ? "Coinbase" : `Hyperliquid${venue() ? ", a proxy for Coinbase's" : ""}`} · ${Math.max(0, Math.round(age / 1000))}s ago`;
   }
   let lastPct = null;
@@ -644,7 +647,9 @@
   M.jump.addEventListener("click", () => log.scrollIntoView({ behavior: reduced.matches ? "auto" : "smooth", block: "start" }));
 
   // ---- the log's LIVE rows: computed in this browser from live prices (BTC on Coinbase: its feed, or the proxy) ---
-  const LIVE_HEAD = (iv, o) => `<div class="act-lh">LIVE · COMPUTED IN YOUR BROWSER ${o && o.shut ? `AT THE LAST RUN'S PRICE (${esc(vName().toUpperCase())} CLOSED)`
+  // no feed has answered yet: it names none
+  const LIVE_HEAD = (iv, o, none) => `<div class="act-lh">LIVE · COMPUTED IN YOUR BROWSER ${o && o.shut ? `AT THE LAST RUN'S PRICE (${esc(vName().toUpperCase())} CLOSED)`
+    : none ? `AT THE LAST RUN'S PRICE${basket() ? "S" : ""} (NO LIVE PRICE YET)`
     : o && o.feed ? "FROM COINBASE'S OWN PRICES" : `FROM HYPERLIQUID PRICES${venue() ? " (A PROXY FOR COINBASE'S)" : ""}`} · the desk itself decides only at the ${esc(iv)} close</div>`;
   let liveShape = "";
   function liveRows(now) {
@@ -663,7 +668,7 @@
       o = calc(now);
       const iv = (B.header.interval || "").toLowerCase(), age = Math.round((now - o.at) / 1000);
       rows.push(["PRICE", o.shut ? `${mid$(o.mid)} at the last run · ${vName()} ${o.shut.by === "schedule" ? `is closed now by its schedule (${o.shut.why}, until ${hhmm(o.shut.until)} UTC)` : `was closed then (${o.shut.why})`}`
-        : o.isLive ? `${mid$(o.mid)} · ${o.feed ? "Coinbase feed" : "allMids"} · ${age > NO_TICK / 1000 ? `no live price for ${age} s` : `${Math.max(0, age)}s ago`}` : `${mid$(o.mid)} at the last run · no live price yet`, ""]);
+        : o.isLive ? `${mid$(o.mid)} · ${o.feed ? "Coinbase feed" : "allMids"} · ${age > (o.feed ? FEED_QUIET : NO_TICK) / 1000 ? `no live price for ${age} s` : `${Math.max(0, age)}s ago`}` : `${mid$(o.mid)} at the last run · no live price yet`, ""]);
       const exp = B.header.shorts && B.header.experiment && o.side === "short" ? " · shorts: paper experiment" : "";
       if (o.pos) {
         rows.push(["STOP", `${usd(o.pos.stop)} from the last run · ${pct(o.stopPct)} away${o.stopAtr != null ? ` · ${o.stopAtr.toFixed(1)} ATR` : ""}`, o.through ? "act-hot" : ""]);
@@ -687,7 +692,7 @@
         rows.push(["TREND IF IT CLOSED HERE", `${side}${near ? " ≈" : ""} · ${r.ema_fast}-EMA ${usd(o.ef)} ${near ? "≈" : o.ef >= o.es ? "≥" : "<"} ${r.ema_slow}-EMA ${usd(o.es)}${was && was !== side ? ` · flips from ${was}` : ""}`, ""]);
       }
     }
-    const head = LIVE_HEAD(basket() ? "00:00 UTC" : (B.header.interval || ""), o);   // the heading names the source
+    const head = LIVE_HEAD(basket() ? "00:00 UTC" : (B.header.interval || ""), o, basket() ? !mids : !o.shut && !o.isLive);   // it names the source
     const shape = rows.map((r) => r[0]).join("|") + "|" + head;
     if (shape !== liveShape) {
       liveShape = shape;
@@ -746,11 +751,11 @@
     tapeAdd(`${hms(now)} price check · allMids${ms} · ${what}`, "act-tk");
   }
   // Coinbase's feed (BTC's tab): no request to time; a line at most every 5 s, its newest price, as its prices come
-  // about once a second and the tape holds six lines
-  let feedLine = 0;
+  // about once a second and the tape holds six lines; none without a new message from it
+  let feedLine = 0, feedAt = 0;
   function tapeFeed(now) {
-    if (now - feedLine < 5000) return;
-    feedLine = now;
+    if (now - feedLine < 5000 || !(tk.at > feedAt)) return;
+    feedLine = now; feedAt = tk.at;
     tapeAdd(`${hms(now)} price · Coinbase feed · ${B.header.coin} ${mid$(tk.price)}${moved("cb", tk.price)}`, "act-tk");
   }
   function tapeBoard(now, kind) {
@@ -880,14 +885,15 @@
   addEventListener("desk:tick", (e) => {
     const d = e.detail || {};
     if (!d.mids) return;
-    mids = d.mids; midsAt = d.at || Date.now();
+    const answer = d.at > midsAt;            // a new allMids answer (a tick is also Coinbase's price, or a change of source)
+    if (d.at) { mids = d.mids; midsAt = d.at; }
     tk = { coin: d.coin, price: Number(d.price), source: d.source || null, at: d.priceAt || midsAt, closed: d.closed || null };
     if (!B || document.hidden) return;     // hidden: keep the price; the clock redraws it when the page is back
     const now = Date.now();
     if (basket()) vtLive(now); else meter(now);
     liveRows(now);
     if (feedTick()) tapeFeed(now);
-    else setTimeout(() => { if (B) tapeTick(now); }, 50);   // the request's timing entry lands just after its answer
+    else if (answer) setTimeout(() => { if (B) tapeTick(now); }, 50);   // its timing entry lands just after the answer
   });
   document.addEventListener("visibilitychange", () => {
     document.documentElement.classList.toggle("act-hidden", document.hidden);
@@ -896,6 +902,8 @@
       if (runs.log) playLog();
     } else visibleSince = Date.now();   // a hidden tab's re-reads may have been held back: give them time to land
     clockRun();
+    // shown again: the live numbers as of now, from app.js's last word on the price (it redraws first)
+    if (!document.hidden && B) { const now = Date.now(); if (basket()) vtLive(now); else meter(now); liveRows(now); }
   });
   if (reduced.addEventListener) reduced.addEventListener("change", () => { if (reduced.matches) { if (runs.strip) finishStrip(); if (runs.log) playLog(); } });
   if (wide.addEventListener) wide.addEventListener("change", () => { if (runs.log) playLog(); });
