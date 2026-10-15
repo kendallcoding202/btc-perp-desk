@@ -9,7 +9,11 @@ What it can't do is the point:
   * POST only with a valid Armed token (desk/coinbase_live.py, the one place that makes one, after every arming
     check), and even then only to ORDER_PATHS: create an order, batch-cancel, close a position. Without it every POST
     raises OrdersLocked before a socket opens: SHADOW holds a client built with no token, so even a bug in its overlay
-    can't reach the exchange. Never: /orders/preview (it needs only view, but this desk doesn't preview with
+    can't reach the exchange. A PROTECT-ONLY token (an armed LIVE whose new-risk check failed this run) lets through only
+    what can't add risk, checked here against the position read just before (_protect_check): a cancel; a close of at
+    most the contracts held; a stop-limit on the closing side that, with the closing contracts already resting, covers
+    at most the position, and is no wider than the saved stop. An entry, an add, a stop on the wrong side or one
+    further from the price: OrdersLocked, before anything is sent. Never: /orders/preview (it needs only view, but this desk doesn't preview with
     credentials), /orders/edit (futures orders can't be edited: CANNOT_EDIT_FUTURES_ORDER), sweeps or any transfer
     (they need the Transfer permission the desk's keys never have), the intraday margin setting, portfolio moves, any
     v2 write. There is no delete() or put().
@@ -309,8 +313,60 @@ class CoinbaseREST:
                                f"Going live on Coinbase)")
         if path not in ORDER_PATHS:
             raise PathNotAllowed(f"POST {path} isn't an order call the desk makes; refused before anything was sent")
+        if armed.scope != "trade":
+            self._protect_check(path, body, armed)
         data = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()     # the same bytes on every retry
         return self._request("POST", path, None, data, auth=True, retries=POST_RETRIES)
+
+    def _protect_check(self, path: str, body: dict, armed) -> None:
+        """A protect-only token's order: only a cancel, or an order that can only shrink the position Coinbase holds
+        now (read here, just before). Anything else raises OrdersLocked, before anything is sent."""
+        from .coinbase_orders import PRICE_STEP, amount, parse_order, parse_position
+
+        def refuse(why: str):
+            raise OrdersLocked(f"protect only: POST {path} refused before anything was sent: {why}. An armed LIVE whose "
+                               f"new-risk check failed this run sends only cancels and orders that shrink the position")
+
+        if path == f"{_V3}/orders/batch_cancel":
+            return
+        b = body if isinstance(body, dict) else {}
+        if b.get("product_id") != armed.product:
+            refuse(f"it isn't for {armed.product}")
+        close = path == f"{_V3}/orders/close_position"
+        cfg = b.get("order_configuration") if isinstance(b.get("order_configuration"), dict) else {}
+        sl = cfg.get("stop_limit_stop_limit_gtc")
+        if not close and (set(cfg) != {"stop_limit_stop_limit_gtc"} or not isinstance(sl, dict)):
+            refuse("it isn't a stop (an entry or an add)")
+        try:
+            n = amount(b.get("size") if close else sl.get("base_size"), "size")
+            trig = None if close else amount(sl.get("stop_price"), "stop_price")
+        except CoinbaseDataError:
+            refuse("its body isn't one the desk builds")
+        rows = self.get(f"{_V3}/cfm/positions").get("positions")
+        if not isinstance(rows, list):
+            raise CoinbaseDataError("Coinbase's positions answer has no positions list")
+        pos = next((q for q in (parse_position(r) for r in rows) if q and q["product_id"] == armed.product), None)
+        if pos is None:
+            refuse("there is no position to protect")
+        if close:
+            if n > pos["contracts"]:
+                refuse(f"a close of {n:g} contracts is more than the {pos['contracts']} held")
+            return
+        closing = "SELL" if pos["side"] == "long" else "BUY"
+        if b.get("side") != closing:
+            refuse(f"a {b.get('side')} stop doesn't close a {pos['side']} position")
+        rows = self.get_pages(f"{_V3}/orders/historical/batch", {"order_status": "OPEN", "product_ids": armed.product,
+                                                                 "limit": 100}, "orders")
+        resting = sum(o["remaining"] or 0.0 for o in (parse_order(r) for r in rows)
+                      if o["symbol"] == armed.product and o["side"] == closing.lower() and o["status"] == "open")
+        if resting + n > pos["contracts"] + 1e-9:
+            refuse(f"{resting:g} closing contracts already rest against the {pos['contracts']} held; {n:g} more could "
+                   f"open a position")
+        floor = armed.floor
+        if floor and floor.get("side") == pos["side"]:
+            sign = 1 if pos["side"] == "long" else -1
+            if (trig - float(floor["stop"])) * sign < -PRICE_STEP:
+                refuse(f"the stop at {trig:,.0f} is wider than the saved one ({float(floor['stop']):,.0f})")
 
     # ---- transport
     def _pace(self) -> None:

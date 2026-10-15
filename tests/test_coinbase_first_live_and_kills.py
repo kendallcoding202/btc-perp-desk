@@ -381,10 +381,14 @@ def test_the_setup_guide_matches_the_code_and_coinbases_key_page():
 
     doc = (Path(__file__).resolve().parents[1] / "docs" / "coinbase-setup.md").read_text()
     part2 = doc[doc.index("## Part 2"):]
-    first, every = part2.index("At the first LIVE start only:"), part2.index("At every LIVE run:")
+    first, every = part2.index("At the first LIVE start only:"), part2.index("At every LIVE run, what any order needs:")
+    risk = part2.index("And what only new trades need:")
     assert first < part2.index("The go-live gate passes") < every
     assert first < part2.index("SHADOW's record on this account") < every
-    assert part2.index("`DESK_LIVE_CONFIRM` is set to exactly") > every
+    assert every < part2.index("View + Trade and NOT Transfer") < risk < part2.index("`DESK_LIVE_CONFIRM` is set to "
+                                                                                    "exactly")
+    assert "Deleting `DESK_LIVE_CONFIRM` stops new trades; the desk keeps protecting a position that is already " \
+           "open. To close it, set `flat_kill`." in part2
     assert "A LIVE run that refuses before LIVE has ever armed saves nothing" in part2
     assert "a missing or short `DESK_STATE_KEY` included" in part2
     # the trailing gap, from the code: STOP_ATTEMPTS placements (STOP_BACKOFF_S doubling between), each one POST sent

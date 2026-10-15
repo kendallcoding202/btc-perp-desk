@@ -36,8 +36,8 @@ REF = "refs/remotes/origin/coinbase-state"
 # ---------------------------------------------------------------- the branch, and the job's load and save around runs
 
 class Branch:
-    """The coinbase-state branch in a local repository, and the workflow's load (git archive BTC) and save (check,
-    stage, one commit) around each run."""
+    """The coinbase-state branch in a local repository, and the workflow's load (coinbase_state.load: the whole
+    branch, the commit loaded kept) and save (check and stage against it, one commit) around each run."""
 
     def __init__(self, tmp_path, monkeypatch):
         self.repo = tmp_path / "repo"
@@ -47,6 +47,7 @@ class Branch:
         self.tmp, self.n = tmp_path, 0
         self.said: list[list[str]] = []
         self.errors: list[str] = []
+        self.loaded: str | None = None
 
     def files(self) -> dict:
         out = _git("ls-tree", "-r", "--name-only", REF, cwd=self.repo, check=False).stdout.split()
@@ -61,16 +62,18 @@ class Branch:
         if state_dir.exists():
             shutil.rmtree(state_dir)
         state_dir.mkdir(parents=True)
-        if _git("rev-parse", "--verify", "-q", REF, cwd=self.repo, check=False).returncode == 0:
-            a = subprocess.run(["git", "archive", REF, "BTC"], cwd=self.repo, capture_output=True, check=True).stdout
-            subprocess.run(["tar", "-x", "-C", str(state_dir)], input=a, check=True)
+        self.loaded = None
+        got = _git("rev-parse", "--verify", "-q", REF, cwd=self.repo, check=False)
+        if got.returncode == 0:
+            cs.load(state_dir, REF)             # as the load step does
+            self.loaded = got.stdout.strip()
 
     def commit(self, work: Path) -> None:
         idx = self.tmp / f"idx{self.n}"
         if idx.exists():
             idx.unlink()
         env = {**os.environ, "GIT_INDEX_FILE": str(idx)}
-        subprocess.run(["git", "--work-tree", str(work), "add", "-A", "."], cwd=self.repo, env=env, check=True)
+        subprocess.run(["git", "--work-tree", str(work), "add", "-A", "-f", "."], cwd=self.repo, env=env, check=True)
         tree = subprocess.run(["git", "write-tree"], cwd=self.repo, env=env, capture_output=True, text=True,
                               check=True).stdout.strip()
         c = subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@x.invalid", "commit-tree", tree, "-m", "s"],
@@ -79,13 +82,14 @@ class Branch:
 
     def save(self, state_dir: Path) -> bool:
         self.n += 1
+        loaded = cs.GitBranch(self.loaded) if self.loaded else None
         try:
-            said = cs.check(state_dir, REF)
+            said = cs.check(state_dir, REF, loaded=loaded)
         except cs.StateCheckError as exc:
             self.errors.append(str(exc))
             return False
         work = self.tmp / f"work{self.n}"
-        cs.stage(state_dir, work, REF)
+        cs.stage(state_dir, work, REF, loaded=loaded)
         self.commit(work)
         self.said.append(said)
         return True
@@ -94,11 +98,9 @@ class Branch:
         """You, on GitHub: a commit on the branch that changes its files (`change` gets a checkout of it)."""
         self.n += 1
         d = self.tmp / f"you{self.n}"
+        keep = self.loaded
         self.load(d)
-        for p, b in self.files().items():
-            if not p.startswith("BTC/"):
-                (d / p).parent.mkdir(parents=True, exist_ok=True)
-                (d / p).write_bytes(b)
+        self.loaded = keep              # your edit isn't a run's load
         change(d)
         self.commit(d)
 

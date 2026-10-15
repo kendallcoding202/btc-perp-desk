@@ -209,11 +209,15 @@ jobs:
         run: |
           # As paper's load: a failed fetch stops the run, so a fresh SHADOW state never replaces the saved one (that
           # would count the account's money again). Only a branch that doesn't exist yet (exit 2) means a first run.
+          # The whole branch, byte for byte as git stores it (a kill-switch-like file anywhere on it counts; no
+          # .gitattributes of the branch's applied), and the commit loaded kept for the save's check: your own files as
+          # loaded are never a reason to refuse it.
           mkdir -p "$RUNNER_TEMP/cb"
           for attempt in 1 2 3; do
             if git fetch --depth=1 origin +coinbase-state:refs/remotes/origin/coinbase-state; then
-              git archive refs/remotes/origin/coinbase-state BTC | tar -x -C "$RUNNER_TEMP/cb"
+              python3 -m desk.coinbase_state load "$RUNNER_TEMP/cb" refs/remotes/origin/coinbase-state
               git rev-parse refs/remotes/origin/coinbase-state > "$RUNNER_TEMP/cb.lease"
+              cp "$RUNNER_TEMP/cb.lease" "$RUNNER_TEMP/cb.loaded"
               exit 0
             fi
             rc=0
@@ -221,6 +225,7 @@ jobs:
             if [ "$rc" -eq 2 ]; then
               echo "no coinbase-state branch yet: SHADOW opens a new state"
               : > "$RUNNER_TEMP/cb.lease"
+              : > "$RUNNER_TEMP/cb.loaded"
               exit 0
             fi
             sleep $((attempt * 10))
@@ -250,17 +255,25 @@ jobs:
           gitdir="$(git rev-parse --absolute-git-dir)"
           # Never a younger state, never a plain-text file (desk/coinbase_state.py: standard library, no secrets).
           # One orphan commit, replaced each save (--force-with-lease on the commit loaded), built without a branch.
+          loaded=$(cat "$RUNNER_TEMP/cb.loaded")
           for attempt in 1 2 3; do
-            python3 -m desk.coinbase_state check "$RUNNER_TEMP/cb" refs/remotes/origin/coinbase-state
+            python3 -m desk.coinbase_state check "$RUNNER_TEMP/cb" refs/remotes/origin/coinbase-state "$loaded"
             work="$RUNNER_TEMP/cb-tree-$attempt"
             idx="$RUNNER_TEMP/cb-index-$attempt"
             rm -rf "$work" "$idx"
             mkdir -p "$work"
-            # kills.json = the branch's (your edits) with any kill this run set added
-            python3 -m desk.coinbase_state stage "$RUNNER_TEMP/cb" "$work" refs/remotes/origin/coinbase-state
-            GIT_INDEX_FILE="$idx" git -C "$work" --git-dir="$gitdir" --work-tree=. add -A .
+            # kills.json = the branch's (your edits) with every kill the desk set added (kills.desk.json)
+            python3 -m desk.coinbase_state stage "$RUNNER_TEMP/cb" "$work" refs/remotes/origin/coinbase-state "$loaded"
+            # -f: a .gitignore of yours on the branch never drops the desk's files
+            GIT_INDEX_FILE="$idx" git -C "$work" --git-dir="$gitdir" --work-tree=. add -A -f .
             tree=$(GIT_INDEX_FILE="$idx" git --git-dir="$gitdir" write-tree)
             lease=$(cat "$RUNNER_TEMP/cb.lease")
+            # .github/ on this branch is never written or changed (the job's token can't push a workflow file change)
+            was=""; [ -n "$lease" ] && was=$(git rev-parse -q --verify "$lease:.github" || true)
+            if [ "$(git rev-parse -q --verify "$tree:.github" || true)" != "$was" ]; then
+              echo "::error::coinbase-state: this save would change .github/ on the branch; not saving"
+              exit 1
+            fi
             if [ -n "$lease" ] && [ "$(git rev-parse "$lease^{tree}")" = "$tree" ]; then
               echo "coinbase-state: nothing new to save"
               exit 0

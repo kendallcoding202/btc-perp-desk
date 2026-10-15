@@ -157,9 +157,10 @@ def test_stage_keeps_your_kills_adds_the_runs_and_rotates_the_previous_state(rep
     work = tmp_path / "work"
     cs.stage(d, work, "refs/remotes/origin/coinbase-state")
     out = work / "BTC"
-    assert sorted(p.name for p in out.iterdir()) == ["board-shadow.enc.json", "kills.json", "state-shadow.enc.json",
-                                                     "state-shadow.prev.enc.json", "status.json"]
+    assert sorted(p.name for p in out.iterdir()) == ["board-shadow.enc.json", "kills.desk.json", "kills.json",
+                                                     "state-shadow.enc.json", "state-shadow.prev.enc.json", "status.json"]
     assert json.loads((out / "kills.json").read_text()) == {"flat_kill": True, "entry_kill": True, "jev_kill": False}
+    assert json.loads((out / "kills.desk.json").read_text()) == {"flat_kill": cs.DESK_WRITTEN}     # the run's own kill
     assert (out / "state-shadow.prev.enc.json").read_bytes() == (saved / "BTC" / "state-shadow.enc.json").read_bytes()
     assert (work / "README.md").read_text().startswith("# coinbase-state")
 

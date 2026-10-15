@@ -117,12 +117,22 @@ KILLS_UNREADABLE = "BTC/kills.json on the coinbase-state branch can't be read: r
 KILLS_UNREADABLE_FLAT = KILLS_UNREADABLE + "; flat_kill on: any position is closed"
 KILLS_STRAY = ("a file on the coinbase-state branch looks like a kill switch but isn't BTC/kills.json: read as "
                "entry_kill on, no new entries")
-# DESK_COINBASE_KILL (a repository variable): its words for flat_kill and for entry_kill, letters only, lowercased;
-# any other value is entry_kill, alerted (failing closed)
-KILL_VAR_FLAT = {"flat", "flatkill", "flatten", "close", "closeall", "closeposition", "closeit"}
-KILL_VAR_ENTRY = {"entry", "entrykill", "entries", "noentry", "noentries"}
+# DESK_COINBASE_KILL (a repository variable) reads kills.json's switch words (coinbase_state.named_switches): flat,
+# close or flatten anywhere in it is flat_kill, entry (entries, no_entries) entry_kill, both can be set together; a
+# value with neither is entry_kill, alerted (failing closed)
 URGENT_TITLES = {"no_stop": "NO STOP", "stray": "STOP WITH NO POSITION", "stray-foreign": "STOP WITH NO POSITION",
-                 "foreign": "AN ORDER THAT ISN'T THE DESK'S", "unprotected": "NO STOP"}
+                 "foreign": "AN ORDER THAT ISN'T THE DESK'S", "unprotected": "NO STOP", "gapped": "STOP DIDN'T FILL",
+                 "flat_kill": "FLAT_KILL NOT DONE"}
+WATCHED = ("stray", "unprotected", "gapped", "flat_kill")      # what the watchdog pushes urgently, at every run
+
+
+def protect_note(failed) -> str:
+    """The public status's note for a protect-only run: coinbase_live.RISK_PUBLIC's fixed phrases (no digit, no
+    amount), as many as fit the status's 200 characters."""
+    note, left = "protect only, no new trades:", list(failed)
+    while left and len(note) + len(left[0]) + 2 <= 190:
+        note += (" " if note.endswith(":") else "; ") + left.pop(0)
+    return note + (" and more" if left else "")
 
 
 def redact_amounts(text: str) -> str:
@@ -606,12 +616,16 @@ class Run:
         self.kills_read: tuple[dict, str | None] | None = None
         self.kills_named: tuple = ()        # the switches BTC/kills.json names (an unreadable one's, read failing closed)
         self.kills_strays: list = []        # files of yours that look like kill switches: [(path, KillsRead)]
+        self.desk_kills: dict = {}          # the kills the desk set and you haven't cleared (BTC/kills.desk.json)
+        self.kills_written: dict = {}       # BTC/kills.json's switches as written (read failing closed)
         self.kill_var_odd: str | None = None    # DESK_COINBASE_KILL set to a word that isn't entry or flat
         self.loaded = None                  # the branch as this run loaded it (coinbase_state.Loaded)
         self.save_refused_why: str | None = None
         self.live_leftover = False          # SHADOW: a never-armed LIVE attempt's files are here (dropped on save)
         self.replaces_leftover = False      # LIVE: the saved LIVE state is one, and this run doesn't carry on from it
         self.refused_before_state = False
+        self.protect_failed: tuple = ()     # LIVE: the new-risk checks this armed run failed (a protect-only run)
+        self.safety_state = ""              # LIVE: what the safety pass found when it had nothing to do
         self.now = int(clock() * 1000)
 
     # ---- small things
@@ -701,32 +715,34 @@ class Run:
 
     def kills_file(self) -> tuple[dict, str | None]:
         """BTC/kills.json (yours, on the coinbase-state branch), read once a run the way the save step reads it
-        (coinbase_state.kills_read, on the same bytes: a symlink is its target, not plain): one the desk can't read is
-        entry_kill on and each switch it names on unless it says off, never every switch off. A file of yours that
-        looks like a kill switch but isn't BTC/kills.json (BTC/Kills.json, say) turns entry_kill on too."""
+        (coinbase_state.kills_effective, on the same bytes: a symlink is its target, not plain): one the desk can't
+        read is entry_kill on and each switch it names on unless it says off, never every switch off; every kill the
+        desk set and you haven't cleared in it (BTC/kills.desk.json) is on. A file of yours anywhere on the branch
+        that looks like a kill switch but isn't BTC/kills.json (kills.json at the root, BTC/Kills.json, say) turns
+        entry_kill on too."""
         if self.kills_read is None:
             b = self.branch_loaded()
-            got = coinbase_state.kills_read(*coinbase_state.branch_kills(b))
-            kills = dict(got.kills)
-            self.kills_named = got.named
+            raw, plain = coinbase_state.branch_kills(b)
+            kills, why, self.desk_kills = coinbase_state.kills_effective(
+                raw, plain, *coinbase_state.branch_file(b, coinbase_state.DESK_KILLS))
+            got = coinbase_state.kills_read(raw, plain)
+            self.kills_named, self.kills_written = got.named, dict(got.kills)
             tree = b.tree()
             self.kills_strays = [(p, coinbase_state.kills_read(b.show(p), tree[p] != coinbase_state.LINK))
                                  for p in coinbase_state.yours(tree) if coinbase_state.kill_like(p)]
             if self.kills_strays:
                 kills["entry_kill"] = True
-            self.kills_read = (kills, got.why)
+            self.kills_read = (kills, why)
         return self.kills_read
 
     def kills_now(self) -> Kills:
         d, _ = self.kills_file()
         k = Kills(**{n: bool(d.get(n)) for n in coinbase_state.KILL_KEYS})
         v = (self.env.get("DESK_COINBASE_KILL") or "").strip()
-        w = re.sub(r"[^a-z]", "", v.lower())
-        if w in KILL_VAR_FLAT:
-            k.flat_kill = True
-        elif w in KILL_VAR_ENTRY:
-            k.entry_kill = True
-        elif v:
+        named = coinbase_state.named_switches(v)
+        k.flat_kill = k.flat_kill or "flat_kill" in named
+        k.entry_kill = k.entry_kill or "entry_kill" in named
+        if v and not {"flat_kill", "entry_kill"} & set(named):
             k.entry_kill = True             # failing closed: a word it doesn't know is entry_kill, and alerted
             self.kill_var_odd = v[:40]
         return k
@@ -1021,7 +1037,8 @@ class Run:
 
     def after_failure(self) -> None:
         """LIVE, a run that stopped part way: one more read-only look at the protection (the watchdog), each problem
-        pushed urgently. SHADOW: nothing real to protect."""
+        pushed urgently: a position with no stop, a stop with no position, a stop the price gapped past, a flat_kill
+        that isn't done. SHADOW: nothing real to protect."""
         if self.mode != "live" or self.real is None:
             return
         try:
@@ -1032,8 +1049,13 @@ class Run:
             found = [("unprotected", f"LIVE stopped part way and couldn't read {PRODUCT}'s position and orders "
                                      f"back: check in Coinbase that the position (if any) has its stop")] \
                 if getattr(self.rest, "posts_paths", None) else []
+        pos = (getattr(self.real, "watched", None) or (None, []))[0]
+        if pos is not None and self.meta.get("armed_at") and self.kills_now().flat_kill:
+            found.append(("flat_kill", f"flat_kill is on and the {pos['side']} {pos['contracts']:g} contracts on "
+                                       f"{PRODUCT} are still open: the next run that can closes them; close them in "
+                                       f"Coinbase if you can't wait"))
         for kind, text in found:
-            if kind in ("stray", "unprotected") and text not in self._urgent_texts:
+            if kind in WATCHED and text not in self._urgent_texts:
                 self._urgent_texts.add(text)
                 self.push(f"{COIN} LIVE: {URGENT_TITLES[kind]}", f"{text}. LIVE stopped part way this run: "
                                                                  f"{self.sent_note()}", "urgent", "rotating_light")
@@ -1049,10 +1071,14 @@ class Run:
                       "high", "warning")
 
     def body(self, work: Path, password: str, saved_desk: dict) -> None:
-
+        self.work = work
         key, perms = self.connect()
         self.check_permissions(perms)
         self.safety_pass(work)
+        if self.protect_failed:
+            # an armed LIVE whose new-risk check failed: the safety pass protected the position; nothing else is sent
+            raise Stop("refused", f"protect only: {'; '.join(self.protect_failed)}. No new trades this run; the safety "
+                                  f"pass protected the position", public=protect_note(self.protect_failed))
         vstate, rules, feed, bars, funding, ctx = self.market(work)
         self.read_account()
         self.extras = read_extras(self.real, self.account, self.now, self.log)
@@ -1126,6 +1152,13 @@ class Run:
             if not self.account.get("entry_kill_reason"):
                 self.account["entry_kill_reason"] = {"ts": self.now, "why": f"BTC/kills.json couldn't be read ({why})"}
             self.on_alert("; ".join(parts))
+        for sw, st in sorted(self.desk_kills.items()):
+            if st == coinbase_state.DESK_PENDING and not why and not self.kills_written.get(sw):
+                self.on_alert(f"the desk set {sw} itself while BTC/kills.json couldn't be read, so your file doesn't "
+                              f"show it yet: it stays on, and this save writes it into BTC/kills.json. Set it to false "
+                              f"there once you've looked" + (f" ({self.account['entry_kill_reason']['why']})" if
+                                                              sw == "entry_kill" and self.account.get(
+                                                                  "entry_kill_reason") else ""))
         for path, got in self.kills_strays:
             flat = got.kills.get("flat_kill") and "flat_kill" in got.named
             self.on_alert(f"{path} on the coinbase-state branch looks like a kill switch, but the desk reads only "
@@ -1655,32 +1688,70 @@ class LiveRun(Run):
         return self.proof
 
     def client_for(self, key):
+        """The order client arm() unlocks. Refused: the read-only watchdog looks (and pushes urgently), then the run
+        stops. Once armed, a failed new-risk check gives a protect-only client (coinbase_live.arm): the run is the
+        safety pass alone (body), and pushes so every time (protect_push)."""
         from . import coinbase_live
 
         out: list[str] = []
+        sp = ((_read(self.work, "live_position.json") or {}) if getattr(self, "work", None) else {}).get("position") \
+            or {}
+        state = {"armed_at": self.meta.get("armed_at"), "product": self.meta.get("product"), "side": sp.get("side"),
+                 "stop": sp.get("stop")}
         got = coinbase_live.arm(key, env=self.env, max_notional=self.cap, gate=self.gate, force_unproven=self.force,
-                                shadow_proof=self.read_shadow_proof(), live_state={"armed_at": self.meta.get("armed_at")},
+                                shadow_proof=self.read_shadow_proof(), live_state=state,
                                 base_url=self.base_url, clock=self.clock, sleep=self.sleep, out=out.append,
                                 deadline_s=self.clock() + self.deadline_s, emit=self.mask_emit)
         self.arm_lines = out
         for ln in out:
             self.log(ln.strip())
         if got is None:
-            self.watchdog(key)
             fail = next((ln.split("Not going live on Coinbase:", 1)[1].strip() for ln in out
                          if "Not going live on Coinbase:" in ln), "an arming check failed")
+            self.watchdog(key, fail, after_arming=bool(self.meta.get("armed_at")))
             raise Stop("refused", f"not armed: {fail}")
+        client, token = got
         self.meta["armed_at"] = self.meta.get("armed_at") or int(self.clock() * 1000)
+        if token.scope == "protect":
+            self.protect_failed = token.failed or ("an arming check failed",)
         if not self.changed:
             self.begin_saving()         # LIVE's first start: from its arming on, the run is saved
-        return got[0]
+        return client
+
+    def protect_push(self) -> None:
+        """A protect-only run (an armed LIVE whose new-risk check failed): urgent, at every run, naming the check and
+        what the safety pass did."""
+        done = "; ".join(self.safety_said) or self.safety_state or "nothing it could read to do"
+        self.push(f"{COIN} LIVE: PROTECT ONLY",
+                  f"{'; '.join(self.protect_failed)}: no new trades this run (no entry, no add, no stop moved). It "
+                  f"protected the position it holds: {done}. {self.sent_note()} To trade again, fix that. To close the "
+                  f"position, set flat_kill (the variable DESK_COINBASE_KILL to flat, or BTC/kills.json).", "urgent",
+                  "rotating_light")
 
     def stopped(self, why: str) -> None:
         """A LIVE run that stopped before it ever armed saves nothing (no state, board, status or kill), so the branch
         is as it was: SHADOW carries on and the next LIVE run is a first start again (not_armed_push)."""
+        if self.protect_failed:
+            return self.protect_push()
         if self.changed:
             return super().stopped(why)
         self.not_armed_push(why)
+
+    def refused_early(self, s: Stop) -> int:
+        """Refused before the state was opened (DESK_STATE_KEY, or the key's secret). An armed LIVE (its public status
+        says so) still looks, read only, when the key loads: the watchdog pushes what can't wait."""
+        code = super().refused_early(s)
+        st = self.saved_status() or {}
+        if st.get("mode") == "LIVE" and st.get("armed") is True:
+            from .brokers.coinbase_auth import CdpKeyError, load_cdp_key, mask_for_actions
+
+            try:
+                key = load_cdp_key(self.env.get("COINBASE_CDP_KEY"))
+            except CdpKeyError:
+                return code
+            mask_for_actions(key, emit=self.mask_emit, env=self.env)
+            self.watchdog(key, s.public or s.text, after_arming=True)
+        return code
 
     def refused_push(self, s: Stop) -> None:
         """Refused before the state was opened (DESK_STATE_KEY not set, say). A LIVE that has armed (its public status
@@ -1724,15 +1795,19 @@ class LiveRun(Run):
                   f"again.{stale} Paper is unaffected.", "high", "warning")
 
     def public_line(self) -> str:
+        if self.protect_failed and self.code != 0:
+            return (f"LIVE BTC: {protect_note(self.protect_failed)} (the open position is protected; details on your "
+                    f"phone and in the encrypted board)")
         if self.code != 0 and not self.changed and not self.refused_before_state:
             why = self.public_why or ("an arming check failed" if self.problem == "refused" else self.problem or "error")
             return (f"LIVE BTC: not armed: {why} (no order sent; nothing saved: the branch and SHADOW's state are "
                     f"as they were)")
         return super().public_line()
 
-    def watchdog(self, key) -> None:
+    def watchdog(self, key, why: str = "", after_arming: bool = False) -> None:
         """A run that refuses still looks, read only: a stop resting with no position (it would open one: Coinbase has
-        no reduce-only), a position with no stop. Each is pushed, urgently."""
+        no reduce-only), a position with no stop, a stop the price gapped past (triggered, unfilled), and, once LIVE has
+        armed, a flat_kill nothing will honour. Each is pushed, urgently, at every run."""
         from .brokers.coinbase import CoinbaseExchange
         from .brokers.coinbase_rest import CoinbaseError, CoinbaseREST
 
@@ -1744,9 +1819,15 @@ class LiveRun(Run):
         except CoinbaseError as exc:
             self.log(f"watchdog: {type(exc).__name__}")
             return
+        pos = ex.watched[0]
+        if after_arming and pos is not None and self.kills_now().flat_kill:
+            found.append(("flat_kill", f"flat_kill is on, but this run refused ({why or 'an arming check failed'}), "
+                                       f"so nothing closes the {pos['side']} {pos['contracts']:g} contracts on "
+                                       f"{PRODUCT}: fix that, or close them in Coinbase now"))
         for kind, text in found:
-            if kind in ("stray", "unprotected"):
-                self.push(f"{COIN} LIVE: STOP WITH NO POSITION" if kind == "stray" else f"{COIN} LIVE: NO STOP",
+            if kind in WATCHED:
+                self._urgent_texts.add(text)
+                self.push(f"{COIN} LIVE: {URGENT_TITLES[kind]}",
                           f"{text}. LIVE didn't run this check (it refused), so nothing else will fix it.", "urgent",
                           "rotating_light")
             self.alerts.append(text)
@@ -1767,12 +1848,15 @@ class LiveRun(Run):
         of which can fail, or a product change refuse the market): the position and the open orders, read fresh.
           flat      every desk order left resting is cancelled (Coinbase has no reduce-only: it would open a
                     position); one that won't cancel, or one that isn't the desk's, is pushed urgently
-          flat_kill the stop cancelled (confirmed), then close_position
+          flat_kill the stop cancelled (confirmed), then close_position (protect-only: a close the desk wanted too)
+          gapped    a stop-limit that triggered and didn't fill, or whose limit the price is past: closed at market
           no stop   one placed: at the saved stop, else the stop distance from the entry at the last ATR seen; the
                     price already through it: closed at market. None placed: the urgent push
-        It needs only the product's id. What it can't read, it leaves to the rest of the run (which reads it all)."""
+        A close waits while Coinbase reads closed (market orders can't be queued): the stop stays. It needs only the
+        product's id. What it can't read, it leaves to the rest of the run (which reads it all). It is all a
+        protect-only run does (coinbase_live.arm: the client then refuses anything else)."""
         from .brokers import coinbase_orders as co
-        from .brokers.coinbase import CancelFailed, StopAlreadyFilled, StopThroughMarket
+        from .brokers.coinbase import SESSION_OPEN_STATE, CancelFailed, OrderRefused, StopAlreadyFilled, StopThroughMarket
         from .brokers.coinbase_rest import CoinbaseError
         from .brokers.live import STOP_ATTEMPTS, STOP_BACKOFF_S
 
@@ -1821,6 +1905,8 @@ class LiveRun(Run):
                                         f"fired. Cancel order {ids} in Coinbase now")
             elif orders:
                 self._say_safe(f"flat: cancelled {len(orders)} order(s) left resting")
+            else:
+                self.safety_state = "flat, nothing of the desk's resting: nothing to protect"
             for o in others:
                 self.on_urgent("stray-foreign", f"STOP WITH NO POSITION: order {o['id']} rests on {PRODUCT} with no "
                                                 f"position, and it isn't the desk's (the desk never touches it): "
@@ -1833,40 +1919,84 @@ class LiveRun(Run):
         sp = saved.get("position") or {}
         ets = sp.get("entry_ts") if sp.get("side") == pos["side"] else "safety"
         stops = [o for o in orders if o["side"] == closing and o.get("triggerPrice") and o["status"] == "open"]
+        what = f"the {pos['side']} {n} contract(s)"
+
+        def closed_now() -> bool:
+            try:
+                d = real.feed.product()
+            except Exception:       # can't tell: not closed (a close Coinbase refuses is harmless; holding isn't)
+                return False
+            st = d.get("session_state")
+            return d.get("session_open") is False or bool(st and st != SESSION_OPEN_STATE)
 
         def close(reason: str) -> None:
+            why = reason.replace("_", " ")
+            if closed_now():
+                self._say_safe(f"Coinbase reads closed: the {why} close of {what} goes at the reopen (market orders "
+                               f"can't be queued); the stop stays meanwhile")
+                return
             for o in [o for o in orders if o["side"] == closing and o["status"] == "open"]:
                 if not cancel(o):
-                    self._say_safe(f"the {reason} close isn't sent: the stop {o['id']} won't cancel first (no "
-                                   f"reduce-only); the rest of the run tries again")
+                    self._say_safe(f"the {why} close isn't sent: the stop {o['id']} won't cancel first (no "
+                                   f"reduce-only); the next run tries again")
                     return
             save(close_wanted=reason)
             try:
                 real.create_order(PRODUCT, "market", closing, n, None,
                                   {"reduceOnly": True, "clientOrderId": real.client_order_id("close-safety", ets,
                                                                                              seq())})
-                self._say_safe(f"closed the {pos['side']} {n} contract(s) at market ({reason.replace('_', ' ')})")
+                self._say_safe(f"closed {what} at market ({why})")
+            except OrderRefused as exc:
+                try:
+                    now, _ = real._fresh()
+                except CoinbaseError:
+                    now = pos
+                if now is None:
+                    self._say_safe(f"{what} had closed already (the stop filled as it was cancelled)")
+                else:
+                    self.on_urgent("no_stop", f"NO STOP: {what} on {PRODUCT} had their stop cancelled for a {why} "
+                                              f"close, and the close wasn't sent ({exc}). Close it or place its stop "
+                                              f"in Coinbase now")
             except CoinbaseError as exc:
-                self.on_urgent("no_stop", f"NO STOP: the {pos['side']} {n} contract(s) on {PRODUCT} had their stop "
-                                          f"cancelled for a {reason.replace('_', ' ')} close, and the close didn't go "
-                                          f"through ({type(exc).__name__}). Close it or place its stop in Coinbase "
-                                          f"now")
+                self.on_urgent("no_stop", f"NO STOP: {what} on {PRODUCT} had their stop cancelled for a {why} close, "
+                                          f"and the close didn't go through ({type(exc).__name__}). Close it or place "
+                                          f"its stop in Coinbase now")
 
         with real.protecting():
             if kills.flat_kill:
                 close("flat_kill")
                 return
+            if self.protect_failed and saved.get("close_wanted") and sp.get("side") == pos["side"]:
+                close(str(saved["close_wanted"]))       # a close the desk wanted before: it only shrinks the risk
+                return
             if stops:
+                try:
+                    last = real.last_trade()
+                except CoinbaseError:
+                    last = None
+                for o in stops:
+                    hit = o.get("triggerStatus") == "STOP_TRIGGERED"
+                    past = last is not None and o.get("price") is not None and (last[0] - float(o["price"])) * sign < 0
+                    if hit or past:
+                        self._say_safe(f"the stop at {float(o['triggerPrice']):,.0f} on {what} "
+                                       + ("triggered and didn't fill" if hit else
+                                          f"is past its limit {float(o['price']):,.0f} ({COIN} at {last[0]:,.2f})")
+                                       + ": a stop-limit doesn't fill past its limit, so the position is closed at "
+                                         "market")
+                        close("stop")
+                        return
+                self.safety_state = f"{what} have their stop resting at {float(stops[0]['triggerPrice']):,.0f}"
                 return
             level = None
             if sp.get("side") == pos["side"] and sp.get("stop"):
                 level = float(sp["stop"])
             elif self.meta.get("last_atr") and pos.get("entry"):
                 level = float(pos["entry"]) - sign * self.p.strategy.stop_atr * float(self.meta["last_atr"])
+            later = "at the next run that isn't protect only" if self.protect_failed else \
+                "later this run if it can read the market"
             if level is None or level <= 0:
-                self.on_urgent("no_stop", f"NO STOP: the {pos['side']} {n} contract(s) on {PRODUCT} have no stop "
-                                          f"resting and the desk has no level for one yet; it places one later this "
-                                          f"run if it can read the market. Check it in Coinbase")
+                self.on_urgent("no_stop", f"NO STOP: {what} on {PRODUCT} have no stop resting and the desk has no "
+                                          f"level for one yet; it places one {later}. Check it in Coinbase")
                 return
             try:
                 last = real.last_trade()
@@ -1886,17 +2016,16 @@ class LiveRun(Run):
                     real.create_order(PRODUCT, "market", closing, n, trig,
                                       {"stopLossPrice": trig,
                                        "clientOrderId": real.client_order_id("stop-safety", ets, trig, seq())})
-                    self._say_safe(f"no stop was resting on the {pos['side']} {n} contract(s): placed one at "
-                                   f"{trig:,.0f}")
+                    self._say_safe(f"no stop was resting on {what}: placed one at {trig:,.0f}")
                     return
                 except StopThroughMarket:
                     close("stop")
                     return
                 except CoinbaseError as exc:
                     err = f"{type(exc).__name__}: {exc}"
-            self.on_urgent("no_stop", f"NO STOP: the {pos['side']} {n} contract(s) on {PRODUCT} have no stop resting "
-                                      f"and one couldn't be placed ({err}). Place it or close the position in Coinbase "
-                                      f"now; the desk tries again later this run and at the next one")
+            self.on_urgent("no_stop", f"NO STOP: {what} on {PRODUCT} have no stop resting and one couldn't be placed "
+                                      f"({err}). Place it or close the position in Coinbase now; the desk tries again "
+                                      + ("at the next run" if self.protect_failed else "later this run and at the next one"))
 
     def exchange(self, rules, feed):
         return self.real

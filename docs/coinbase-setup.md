@@ -71,21 +71,25 @@ The menu names below are quoted from Coinbase's own pages: its API key page (htt
     - Every read this run, the simulated book, anything your real account holds that the desk didn't place, events, alerts, and the run's private log.
     - Whether its decision matched the paper BTC account's at the same close.
 21. **Your first deposit opens the account.** On day one at $0 the desk reads and decides but sizes nothing. The first bank deposit it reads is the account's **start**: money in, not profit. Later deposits, withdrawals and transfers are recorded as money in or out at the account's value then, never as profit or loss.
-22. If the phone says **not working**, the reason follows:
+22. If the phone says **BTC SHADOW: not working**, the reason follows:
     - **401 Unauthorized:** Coinbase gives no reason. Re-create the key as ECDSA, check that the secret is the whole file (name and privateKey), and check that the key wasn't deleted.
     - **lacks the permission:** the key isn't View-enabled.
     - **can trade / can move money:** you made a trade or transfer key. Make a View-only key for SHADOW.
     - **DESK_STATE_KEY doesn't open the saved state:** the secret changed. Put the old password back, or start over (below).
     - **DESK_STATE_KEY is too short**, or **is not set**: fix the secret. The SHADOW bar on the dashboard says the same, with no amount.
     - **an Ed25519 key, not ECDSA:** create the key again with ECDSA (step 7).
-    - **kills.json can't be read** (a typo, say), or **looks like a kill switch but isn't BTC/kills.json**: see step 24.
-    - **NOT SAVED:** the save check would refuse this run's state (you deleted `BTC/status.json` on the branch, say). The reason follows; put back what you changed on the `coinbase-state` branch. Until then the SHADOW page and the status bar stop moving.
     - **Coinbase didn't answer:** a Coinbase or network outage. The clock check reads "not checked", not failed. The next run tries again.
+    - Whatever the first runs were refused over, fix it and SHADOW starts at the next run: the first run with a working key and password opens the account's state and saves it, and the dashboard's old reason goes away. You don't need to delete anything.
+
+    Two other pushes come with their own titles:
+    - **BTC SHADOW: ALERT** (each kind at most every 6 hours): something SHADOW noticed while it ran, said in plain words. Among them: **kills.json can't be read** (a typo, say), a file that **looks like a kill switch but isn't BTC/kills.json**, and **the desk set entry_kill itself**: see step 24.
+    - **BTC SHADOW: NOT SAVED** (every 6 hours): the save check would refuse this run's state (you deleted `BTC/status.json` on the branch, say). The reason follows; put back what you changed on the `coinbase-state` branch. Until then the SHADOW page and the status bar stop moving.
 23. **To stop SHADOW:** delete the `COINBASE_CDP_KEY` secret. The job then skips and stays green. You can also revoke the key in the CDP portal.
-24. **Kill switches:** edit `BTC/kills.json` on the `coinbase-state` branch (`{"entry_kill": true}` or `{"flat_kill": true}`), or set the repository **variable** `DESK_COINBASE_KILL` to `entry` or `flat` (Settings → Secrets and variables → Actions → Variables; `flat_kill`, `close` and `flatten` mean flat too). Any other value of the variable is read as `entry` and alerted: delete the variable to turn it off. In SHADOW they stop the simulated trading, as they would stop LIVE's.
-    - **If the desk can't read the file** (it isn't JSON, like `{"flat_kill": true,}` with its trailing comma; a key it doesn't know; a switch that isn't `true` or `false`, like `"true"` in quotes or `1`; a key written twice), it fails closed. It reads **entry_kill on** (no new entries), and every switch the file names is **on** unless its value says off (`false`, `null`, `0`, `"false"`, `"no"`, `"off"`, or a word starting with f or n, like the typo `fasle`). So `{"flat_kill": true,}` still closes the position, and `{"flat_kill": false, "entry_kill": true,}` closes nothing. Nothing else in the file is acted on, `reset_halt_at` included. The SHADOW page, the status bar and your phone say so, naming `flat_kill` when the file does.
+24. **Kill switches:** edit `BTC/kills.json` on the `coinbase-state` branch (`{"entry_kill": true}` or `{"flat_kill": true}`), or set the repository **variable** `DESK_COINBASE_KILL` (Settings → Secrets and variables → Actions → Variables). Both read the same words, anywhere in the text: **flat**, **flatten**, **close** (`flat_kill`, `close_all`, `close_position` too) mean flat_kill (close the position); **entry** (`entry_kill`, `no_entries`) means entry_kill (no new entries); one value can say both (`flat entry`). A variable with neither word is read as `entry` and alerted: delete the variable to turn it off. In SHADOW they stop the simulated trading, as they would stop LIVE's.
+    - **If the desk can't read the file** (it isn't JSON, like `{"flat_kill": true,}` with its trailing comma; a key it doesn't know, like `{"flat": true}`; a switch that isn't `true` or `false`, like `"true"` in quotes or `1`; a key written twice), it fails closed. It reads **entry_kill on** (no new entries), and every switch the file names is **on** unless its value is one of the words for off: `false`, `null`, `0`, `""`, `"false"`, `"f"`, `"no"`, `"n"`, `"off"`, `"none"`, `"nil"`, or a near-typo of false, null, off or no (`fasle`, `nul`, `noo`). Any other value is on: `"now"`, `"flat"` and `"force"` close the position. So `{"flat_kill": true,}` and `{"close": true}` still close the position, and `{"flat_kill": false, "entry_kill": true,}` closes nothing. Nothing else in the file is acted on, `reset_halt_at` included. The SHADOW page, the status bar and your phone say so, naming `flat_kill` when the file does.
     - The run is still saved, and **the save keeps the file exactly as you wrote it**, so every run reads it the same way, and says so (the phone at most every 6 hours), until you fix it. For a close you can be sure of, set the variable `DESK_COINBASE_KILL` to `flat`.
-    - **Other files you add on the branch** (notes, say) are kept as they are at every save, and never read. One whose name has "kill" in it but isn't exactly `BTC/kills.json` (`BTC/Kills.json`, `BTC/kills.json.orig`) turns **entry_kill on**, and the phone says so, until you rename it to `BTC/kills.json` or delete it. A `flat_kill` in it isn't acted on from there.
+    - **A kill the desk sets itself** (after a move nothing explains, say) is written into `BTC/kills.json` (`"entry_kill": true`), with its reason on the SHADOW page, and recorded in `BTC/kills.desk.json` (the desk's file: don't edit it). It stays on until **you set it to `false` in `BTC/kills.json`** once you've looked. If the desk set it while it couldn't read your file, your typo is kept and the kill stays on anyway: fixing the typo doesn't turn it off. The next save writes it into your fixed file, and the phone says so; then set it to `false` there.
+    - **Other files you add on the branch** (notes, say) are kept as they are at every save, and never read. One whose name has "kill" in it anywhere on the branch, but isn't exactly `BTC/kills.json` (`kills.json` at the top, `btc/kills.json`, `BTC/Kills.json`, `BTC/kills.json.orig`), turns **entry_kill on**, and the phone says so, until you move it to `BTC/kills.json` or delete it. A `flat_kill` in it is named, but only `BTC/kills.json` closes the position. Deleting one of your files while a run is under way is fine: that run's save goes through, without it. A `.gitattributes` on the branch is dropped at the next save (it could change how git stores the desk's files); a `.gitignore` is kept and never hides the desk's files; a `.github/` folder is kept exactly as it is, and the desk never changes it.
     - **To clear a drawdown halt** once you've looked: add `"reset_halt_at": "2026-11-02"` (any new text, a date is easiest) to the same `BTC/kills.json`. The next run clears the halt once, restarts the peak from the balance then, and says so on the board. Use a new text for the next reset.
 25. **To start SHADOW over:** delete the `coinbase-state` branch. The next run opens a new state.
 
@@ -118,13 +122,21 @@ At the first LIVE start only:
    - the Default portfolio, with its id recorded.
 3. The account is flat, with no open order on any product.
 
-At every LIVE run:
+At every LIVE run, what any order needs:
 
-4. `DESK_LIVE_CONFIRM` is set to exactly `I understand this trades real money and can lose all of it`.
-5. The variable `DESK_LIVE_COINBASE` is exactly `BIP-20DEC30-CDE`.
-6. `--max-notional` is given and buys at least one contract (about $830 at $83,000, plus slippage). Raise it by hand as BTC rises.
-7. The key is **View + Trade and NOT Transfer**, on the same portfolio SHADOW read.
-8. The clock is within 30 s of Coinbase's, the balance adds up, and there's no USDC in the portfolio.
+4. The key is **View + Trade and NOT Transfer**, on the same portfolio SHADOW read, and the clock is within 30 s of Coinbase's.
+5. `DESK_STATE_KEY` opens LIVE's saved state, and it's for `BIP-20DEC30-CDE`.
+
+And what only new trades need:
+
+6. `DESK_LIVE_CONFIRM` is set to exactly `I understand this trades real money and can lose all of it`.
+7. The variable `DESK_LIVE_COINBASE` is exactly `BIP-20DEC30-CDE`.
+8. `--max-notional` is given and buys at least one contract (about $830 at $83,000, plus slippage). Raise it by hand as BTC rises.
+9. The balance adds up, and there's no USDC in the portfolio.
+
+**Once LIVE has armed, a run that fails only checks 6 to 9 is PROTECT ONLY.** It sends no entry, adds nothing and moves no stop, but it still protects the position it holds: it honours `flat_kill` (closes at market), puts a stop back on a position that has none (never wider than the saved one), and closes at market a stop the price gapped past (a stop-limit that triggered and didn't fill). The order client itself refuses anything else, before it's sent. Your phone gets **BTC LIVE: PROTECT ONLY** urgently at every such run, naming the check and what the desk did. **Deleting `DESK_LIVE_CONFIRM` stops new trades; the desk keeps protecting a position that is already open. To close it, set `flat_kill`.**
+
+A run that fails check 4 or 5 sends nothing at all (it can't safely place an order). It still looks, read only, and pushes urgently at every run what can't wait: **NO STOP**, **STOP WITH NO POSITION**, **STOP DIDN'T FILL** (a gapped stop: close the position in Coinbase), and **FLAT_KILL NOT DONE** (`flat_kill` is on but nothing can close the position: fix the check, or close it in Coinbase).
 
 **A LIVE run that refuses before LIVE has ever armed saves nothing.** It writes no LIVE state, board, status or kill switch, so the `coinbase-state` branch and SHADOW's state stay as they were, and the next LIVE run is a first start again. Your phone gets **BTC LIVE: not armed** with the reason, a missing or short `DESK_STATE_KEY` included: at every such run while SHADOW's last run is under 2 hours old, then once every 6 hours. (Without a `DESK_STATE_KEY` that opens SHADOW's record, the age comes from SHADOW's public status.)
 
@@ -148,10 +160,11 @@ To arm it later, deliberately, when you choose:
 To disarm:
 
 1. Set the variable `DESK_COINBASE_KILL=flat`. The next run closes the position and stays flat.
-2. Then delete `DESK_LIVE_CONFIRM`. Every later run refuses.
-3. If you close the position yourself in the app, **cancel its stop too**. Coinbase has no reduce-only: a stop left resting with no position opens one when it fires. A refusing run still looks and pushes **STOP WITH NO POSITION**, but it doesn't cancel anything.
+2. Then delete `DESK_LIVE_CONFIRM`. Every later run is protect only: no new trades, and with no position, nothing to send but a cancel of a desk order left resting.
+3. To stop LIVE sending anything at all, delete the `COINBASE_CDP_TRADE_KEY` secret, or revoke the trade key in the CDP portal.
+4. If you close the position yourself in the app, **cancel its stop too**. Coinbase has no reduce-only: a stop left resting with no position opens one when it fires. A refusing run still looks and pushes **STOP WITH NO POSITION**, but it doesn't cancel anything.
 
-What every LIVE run does first, before it reads the product, the candles or the balance (any of which can fail): it reads the position and the open orders, puts a stop back on a position that has none, cancels any desk order left resting with no position, and honours `flat_kill`. A run that stops part way after that looks once more and pushes **NO STOP** or **STOP WITH NO POSITION** urgently. A stop the desk can't get to rest is never reported as closed unless the close actually went through.
+What every LIVE run does first, before it reads the product, the candles or the balance (any of which can fail): it reads the position and the open orders, puts a stop back on a position that has none, closes at market a stop the price gapped past, cancels any desk order left resting with no position, and honours `flat_kill` (while Coinbase reads closed, a close waits for the reopen and the stop stays). A run that stops part way after that looks once more and pushes **NO STOP** or **STOP WITH NO POSITION** urgently. A stop the desk can't get to rest is never reported as closed unless the close actually went through.
 
 The biggest real-money risks:
 

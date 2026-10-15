@@ -2,10 +2,12 @@
 
 CoinbaseREST (desk/brokers/coinbase_rest.py) refuses every POST, before a socket opens, unless it was built with a valid
 Armed token; this module is the only place one is made (tests/test_coinbase_lock.py scans desk/ for any other
-"Armed(" or "armed="). A token names the product and the cap it was armed for and lives 15 minutes: one run.
+"Armed(" or "armed="). A token names the product and the cap it was armed for and lives 15 minutes: one run. Its scope
+is "trade" (every order the desk sends) or "protect" (only cancels and orders that can only shrink the position held:
+the client checks each one against the position it reads just before, below).
 
-arm() makes one only after every check passes, and prints each as PASS or FAIL. The local ones come first, before any
-network call; any FAIL means no token, no order client, and not one non-GET request:
+arm() makes one only after the checks pass, and prints each as PASS or FAIL. The local ones come first, before any
+network call; at the first LIVE start any FAIL means no token, no order client, and not one non-GET request:
 
   local (no network)
     the go-live gate        the backtest report passes, paper has 14+ days and is up time-weighted
@@ -23,12 +25,21 @@ network call; any FAIL means no token, no order client, and not one non-GET requ
     the clock               within 30 s of Coinbase's
     the key                 View + Trade, and NOT Transfer (the desk never moves money)
     the portfolio           Default, and the same one SHADOW read (the trade key is a different key)
+    the state's product     (once armed) the saved LIVE state is for BIP-20DEC30-CDE
     the cap                 --max-notional buys one contract (0.01 BTC) at the price now, slippage included
     the balance             adds up (coinbase_orders.parse_balance)
     no USDC                 in the portfolio (Coinbase can pull it into futures margin)
     flat                    at the first LIVE start only: no futures position and no open order on any product
 
-The gate and SHADOW's proof are checked at the first LIVE start (live_state has no armed_at yet); the rest every run.
+The gate, SHADOW's proof and the flat start are checked at the first LIVE start (live_state has no armed_at yet); the
+rest every run. Once LIVE has armed, the checks split in two:
+  * what any order needs (the clock, the key, the portfolio, the state's product; and, before arm(), that the state
+    opens): one failing refuses the run as at a first start: no token, no order;
+  * what gates only NEW risk (DESK_LIVE_CONFIRM, DESK_LIVE_COINBASE, --max-notional and the cap, the balance, USDC):
+    one failing gives a PROTECT-ONLY token, so a position already open is never left to itself: the run's safety pass
+    honours flat_kill, puts a missing stop back no wider than the saved one, and closes a stop the price gapped past at
+    market, and nothing else (desk/coinbase_run.py). Deleting DESK_LIVE_CONFIRM stops new trades; to close the
+    position, set flat_kill.
 Nothing in this repository calls arm() outside the tests' fake Coinbase: no workflow arms it.
 """
 
@@ -54,22 +65,36 @@ DAY_MS = 86400_000
 # {runs, ok, flows_unreadable, unexplained, unknown_entries, equity_mismatch, auth_fail, funded (money in the account
 # and the balance adding up at some run that day)}}.
 DIRTY = ("unexplained", "unknown_entries", "equity_mismatch", "flows_unreadable", "auth_fail")
+# Once armed, a failed check that gates only new risk gives a protect-only token: its fixed public phrase (no digit, no
+# amount: it goes to the public status) by the check's label
+RISK_PUBLIC = {"confirm": "DESK_LIVE_CONFIRM isn't the exact phrase", "product": "DESK_LIVE_COINBASE isn't the product",
+               "max_notional": "--max-notional isn't given", "cap": "--max-notional doesn't buy one contract",
+               "balance": "Coinbase's balance doesn't add up", "usdc": "USDC is in the portfolio"}
+SCOPES = ("trade", "protect")
 
 _SEAL = object()
 
 
 class Armed:
-    """Proof, for one run, that arm() passed every check. Only arm() can make one."""
-    __slots__ = ("_seal", "product", "cap", "checks", "made_s", "expires_s")
+    """Proof, for one run, that arm() passed its checks. Only arm() can make one. scope "trade": every order the desk
+    sends; "protect": only cancels and orders that shrink the position (coinbase_rest checks), never wider than
+    `floor` ({"side", "stop"}: the saved stop, when there is one). `failed`: the new-risk checks a protect token failed
+    (RISK_PUBLIC's phrases)."""
+    __slots__ = ("_seal", "product", "cap", "checks", "made_s", "expires_s", "scope", "floor", "failed")
 
-    def __init__(self, seal, product: str, cap: float, checks: tuple, now_s: float):
+    def __init__(self, seal, product: str, cap: float, checks: tuple, now_s: float, scope: str = "trade",
+                 floor: dict | None = None, failed: tuple = ()):
         if seal is not _SEAL:
             raise TypeError("an Armed token is made only by coinbase_live.arm(), after every arming check passes")
+        if scope not in SCOPES:
+            raise ValueError(f"an Armed token's scope is trade or protect, not {scope!r}")
         self._seal, self.product, self.cap, self.checks = seal, product, float(cap), tuple(checks)
         self.made_s, self.expires_s = now_s, now_s + ARM_TTL_S
+        self.scope, self.floor, self.failed = scope, dict(floor) if floor else None, tuple(failed)
 
     def valid(self, now_s: float) -> bool:
-        return self._seal is _SEAL and self.product == PRODUCT and self.made_s <= now_s < self.expires_s
+        return self._seal is _SEAL and self.product == PRODUCT and self.made_s <= now_s < self.expires_s and \
+            self.scope in SCOPES
 
     def __reduce__(self):
         raise TypeError("an Armed token can't be copied or saved")
@@ -78,7 +103,7 @@ class Armed:
         raise TypeError("an Armed token can't be copied or saved")
 
     def __repr__(self) -> str:
-        return f"Armed({self.product}, cap ${self.cap:,.0f})"
+        return f"Armed({self.product}, cap ${self.cap:,.0f}" + (", protect only)" if self.scope == "protect" else ")")
 
 
 def shadow_checks(proof: dict | None, now_ms: int) -> list[tuple[str, bool, str]]:
@@ -116,42 +141,54 @@ def arm(key: CdpKey, *, env, max_notional: float | None, gate: list, force_unpro
         shadow_proof: dict | None = None, live_state: dict | None = None, base_url: str = DEFAULT_BASE,
         clock=time.time, sleep=time.sleep, out=print, deadline_s: float | None = None, slippage_bps: float = 3.0,
         emit=print):
-    """Every arming check (module docstring). All pass: (an order-capable CoinbaseREST, its Armed token). Any
-    fails: None, with every check printed and the first failure said; not one non-GET request was made."""
+    """Every arming check (module docstring). All pass: (an order-capable CoinbaseREST, its Armed token, scope
+    "trade"). Once armed (live_state's armed_at), only new-risk checks failing: the same, scope "protect". Otherwise:
+    None, with every check printed and the first failure said; not one non-GET request was made. live_state: the
+    saved LIVE state's armed_at, product, and its position's side and stop (a protect token's floor)."""
     from .brokers.coinbase import CoinbaseExchange
 
-    first = not (live_state or {}).get("armed_at")
+    state = live_state or {}
+    first = not state.get("armed_at")
     lines: list[tuple[str, bool, str]] = []
     gate_ok = True
     if first:
         for label, ok, val in gate:
             lines.append((label, ok, val))
             gate_ok = gate_ok and ok
-    local = [(f'DESK_LIVE_CONFIRM is the exact phrase ("{LIVE_CONFIRM_PHRASE}")',
-              env.get("DESK_LIVE_CONFIRM") == LIVE_CONFIRM_PHRASE, "set" if env.get("DESK_LIVE_CONFIRM") else "not set"),
-             (f"DESK_LIVE_COINBASE is exactly {PRODUCT}, the product being armed",
-              env.get("DESK_LIVE_COINBASE") == PRODUCT, repr(env.get("DESK_LIVE_COINBASE") or "")),
-             ("--max-notional is given", bool(max_notional and max_notional > 0),
-              f"${max_notional:,.2f}" if max_notional else "missing")]
+    risk_local = [("confirm", f'DESK_LIVE_CONFIRM is the exact phrase ("{LIVE_CONFIRM_PHRASE}")',
+                   env.get("DESK_LIVE_CONFIRM") == LIVE_CONFIRM_PHRASE,
+                   "set" if env.get("DESK_LIVE_CONFIRM") else "not set"),
+                  ("product", f"DESK_LIVE_COINBASE is exactly {PRODUCT}, the product being armed",
+                   env.get("DESK_LIVE_COINBASE") == PRODUCT, repr(env.get("DESK_LIVE_COINBASE") or "")),
+                  ("max_notional", "--max-notional is given", bool(max_notional and max_notional > 0),
+                   f"${max_notional:,.2f}" if max_notional else "missing")]
+    local = [(label, ok, val) for _, label, ok, val in risk_local]
     if first:
         local += shadow_checks(shadow_proof, int(clock() * 1000))
     lines += local
+    risk_failed = [k for k, _, ok, _ in risk_local if not ok]
 
-    def report(failed: str | None) -> None:
+    def report(failed: str | None, protect: list | None = None) -> None:
         for label, ok, val in lines:
             out(f"  {'PASS' if ok else 'FAIL'}  {label} — {val}")
         if failed:
             out(f"\n  Not going live on Coinbase: {failed}")
+        elif protect:
+            out(f"\n  Protect only: {'; '.join(RISK_PUBLIC[k] for k in protect)}. LIVE has armed before, so this run "
+                f"protects the position it holds and sends nothing else: flat_kill honoured, a missing stop put back "
+                f"no wider than the saved one, a stop the price gapped past closed at market. No entry, no add, no "
+                f"stop moved")
 
-    if first and not gate_ok:
-        if not force_unproven:
-            report("the desk hasn't proven itself on paper yet (the go-live gate)")
+    if first:
+        if not gate_ok:
+            if not force_unproven:
+                report("the desk hasn't proven itself on paper yet (the go-live gate)")
+                return None
+            out("  --force-unproven: overriding the backtest and paper checks only. This is your call, not the desk's.")
+        bad = next((label for label, ok, _ in local if not ok), None)
+        if bad:
+            report(bad)
             return None
-        out("  --force-unproven: overriding the backtest and paper checks only. This is your call, not the desk's.")
-    bad = next((label for label, ok, _ in local if not ok), None)
-    if bad:
-        report(bad)
-        return None
 
     # ---- network: reads only, on a client that can't send an order
     rest = CoinbaseREST(key, base_url=base_url, clock=clock, sleep=sleep, deadline_s=deadline_s, emit=emit)
@@ -185,7 +222,13 @@ def arm(key: CdpKey, *, env, max_notional: float | None, gate: list, force_unpro
         return ok, (f"{p.get('portfolio_type')}" + ("" if same else ", not the portfolio SHADOW read: the trade key "
                                                                    "must be on the same account and portfolio"))
 
+    def product():
+        got = state.get("product")
+        return got in (None, PRODUCT), f"{got or PRODUCT}"
+
     def cap():
+        if not (max_notional and max_notional > 0):
+            return False, "no --max-notional to check"
         ex.load_markets()
         bba = ex.best_bid_ask()
         px = bba[1] if bba else (ex.details or {}).get("price")
@@ -208,17 +251,35 @@ def arm(key: CdpKey, *, env, max_notional: float | None, gate: list, force_unpro
         n = (1 if pos else 0) + len(orders) + len(f["positions"]) + len(f["orders"])
         return n == 0, "flat, no orders" if n == 0 else "LIVE starts flat: close or cancel them yourself first"
 
+    # what any order needs, then what gates only new risk
     steps = [("this machine's clock is within 30 s of Coinbase's", skew), ("the key is View + Trade, not Transfer", perms),
-             ("the key's portfolio is Default (and SHADOW's)", portfolio), ("--max-notional buys one contract", cap),
-             ("Coinbase's balance adds up", balance), ("no USDC in the portfolio", usdc)]
-    if first:
-        steps.append(("the account is flat with no open order (first LIVE start)", flat))
+             ("the key's portfolio is Default (and SHADOW's)", portfolio)]
+    if not first:
+        steps.append((f"the saved LIVE state is for {PRODUCT}", product))
     for label, fn in steps:
         if not check(label, fn):
             report(label)
             return None
-    report(None)
-    token = Armed(_SEAL, PRODUCT, max_notional, tuple(label for label, _, _ in lines), clock())
+    risk = [("cap", "--max-notional buys one contract", cap), ("balance", "Coinbase's balance adds up", balance),
+            ("usdc", "no USDC in the portfolio", usdc)]
+    if first:
+        risk.append(("flat", "the account is flat with no open order (first LIVE start)", flat))
+        for _, label, fn in risk:
+            if not check(label, fn):
+                report(label)
+                return None
+    else:
+        for k, label, fn in risk:          # every one, so the run's report names each that fails
+            if not check(label, fn) and not (k == "cap" and "max_notional" in risk_failed):
+                risk_failed.append(k)
+    scope = "protect" if risk_failed else "trade"
+    report(None, risk_failed)
+    floor = None
+    if scope == "protect" and state.get("side") in ("long", "short") and state.get("stop"):
+        floor = {"side": state["side"], "stop": float(state["stop"])}
+    token = Armed(_SEAL, PRODUCT, max_notional if scope == "trade" else float(max_notional or 0.0),
+                  tuple(label for label, _, _ in lines), clock(), scope=scope, floor=floor,
+                  failed=tuple(RISK_PUBLIC[k] for k in dict.fromkeys(risk_failed)))
     client = CoinbaseREST(key, armed=token, base_url=base_url, clock=clock, sleep=sleep, deadline_s=deadline_s,
                           emit=emit)
     client.skew_s = rest.skew_s

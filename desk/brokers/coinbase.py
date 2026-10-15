@@ -205,6 +205,7 @@ class CoinbaseExchange:
         self.permissions: dict | None = None
         self.fees: dict | None = None
         self.last_readback: dict | None = None
+        self.watched: tuple = (None, [])        # what watchdog() last read: (the position, the desk's orders)
 
     # ---- alerts
     def _alert_once(self, key: str, text: str) -> None:
@@ -632,8 +633,10 @@ class CoinbaseExchange:
 
     def watchdog(self) -> list[tuple[str, str]]:
         """Read only: what is wrong with the account's protection right now. Any run that can still read the account
-        runs this, even one that refuses to act."""
+        runs this, even one that refuses to act. A stop-limit that triggered and didn't fill, or whose limit the price
+        is past, is no working stop ("gapped"). What it read is kept in `watched` (position, the desk's orders)."""
         pos, orders = self._fresh()
+        self.watched = (pos, orders)
         out = []
         closing = None if pos is None else ("sell" if pos["side"] == "long" else "buy")
         if pos is None:
@@ -646,9 +649,25 @@ class CoinbaseExchange:
                 out.append(("stray", f"order {o['id']} ({o['side']}, not the desk's) rests on {self.product} with no "
                                      f"position: it would open one if it fired. Cancel it in Coinbase now"))
         else:
-            if not any(o["side"] == closing and o.get("triggerPrice") and o["status"] == "open" for o in orders):
+            stops = [o for o in orders if o["side"] == closing and o.get("triggerPrice") and o["status"] == "open"]
+            if not stops:
                 out.append(("unprotected", f"the {pos['side']} {pos['contracts']:g} contracts on {self.product} have "
                                            f"no stop resting on Coinbase"))
+            else:
+                try:
+                    last = self.last_trade()
+                except CoinbaseError:
+                    last = None
+                sign = 1 if pos["side"] == "long" else -1
+                for o in stops:
+                    hit = o.get("triggerStatus") == "STOP_TRIGGERED"
+                    if hit or (last is not None and o.get("price") is not None and (last[0] - o["price"]) * sign < 0):
+                        out.append(("gapped", f"the stop {o['id']} at {o['triggerPrice']:,.0f} on the {pos['side']} "
+                                              f"{pos['contracts']:g} contracts on {self.product} "
+                                              + ("triggered and didn't fill" if hit else
+                                                 f"is past its limit {o['price']:,.0f}")
+                                              + ": a stop-limit doesn't fill past its limit, so the position has no "
+                                                "working stop. Close it in Coinbase now"))
         for p in self.foreign["positions"]:
             out.append(("foreign", f"a {p['side']} {p['contracts']} on {p['product_id']} (not the desk's)"))
         for o in self.foreign["orders"]:
