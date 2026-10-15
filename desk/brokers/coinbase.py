@@ -45,7 +45,7 @@ from ..feeds.coinbase import CoinbaseFeed, FeedError
 from ..thresholds import COINBASE
 from . import coinbase_orders as co
 from .coinbase_rest import (OTHER_SOURCES, CoinbaseDataError, CoinbaseError, CoinbaseRejected, CoinbaseUnavailable,
-                            CoinbaseUncertain)
+                            CoinbaseUncertain, OrdersLocked)
 from .live import LiveSetupError
 
 V3 = "/api/v3/brokerage"
@@ -394,15 +394,14 @@ class CoinbaseExchange:
             self.rest.learned_sources = [x for x in self._sources() if x is not None and x not in OTHER_SOURCES]
 
     def close_worst_s(self, cancels: int) -> float:
-        """The worst case of a close that cancels its stop first, in seconds (CoinbaseREST.worst_s): each cancel and
-        two reads of it (a protect-only client reads the order first too), the position and orders read again, a
-        protect-only client's own reads, close_position and two reads of it, the position read again after it; and, if
-        the close is refused, the same again to put the stop back. None of it may stop half way, so none of it starts
-        without the time for all of it."""
+        """The worst case of a close that cancels its stop first, in seconds (CoinbaseREST.worst_s): each cancel, the
+        client's read of the order first and two reads of it after, the position and orders read again, a protect-only
+        client's own reads, close_position and two reads of it, the position read again after it; and, if the close is
+        refused, the same again to put the stop back (the client reads the position and orders before any stop). None
+        of it may stop half way, so none of it starts without the time for all of it."""
         fresh = 1 + 2 * len(self._sources())
-        protect = getattr(self.rest, "protect_only", False)
-        check = fresh if protect else 0
-        reqs = (4 if protect else 3) * cancels + fresh + check + 3 + fresh + (fresh + check + 3)
+        check = fresh if getattr(self.rest, "protect_only", False) else 0
+        reqs = 4 * cancels + fresh + check + 3 + fresh + (fresh + fresh + 3)
         worst = getattr(self.rest, "worst_s", None)
         return worst(reqs, (cancels + 3) * READBACK_WAIT_S) if worst is not None else 45.0
 
@@ -442,8 +441,20 @@ class CoinbaseExchange:
         self.foreign["orders"] = [{"product_id": o["symbol"], "id": o["id"], "side": o["side"],
                                    "contracts": 0.0 if o.get("cancel_queued") else
                                    (o["remaining"] if o.get("remaining") is not None else o.get("amount")),
-                                   "stop": o.get("triggerPrice"), "status": o["status"]} for o in foreign]
+                                   "stop": o.get("triggerPrice"), "limit": o.get("price"),
+                                   "trigger_status": o.get("triggerStatus"), "status": o["status"]} for o in foreign]
         return mine
+
+    @staticmethod
+    def stop_works(o: dict, last, sign: int) -> bool:
+        """Whether a stop-limit can still fill as a stop: not triggered (a triggered one that didn't fill is a limit
+        the price has left), and the last trade (when read) not past its limit. `o` is the desk's (triggerStatus,
+        price) or one that isn't (trigger_status, limit)."""
+        desks = "triggerPrice" in o
+        if o.get("triggerStatus" if desks else "trigger_status") == "STOP_TRIGGERED":
+            return False
+        limit = o.get("price" if desks else "limit")
+        return not (last is not None and limit is not None and (last[0] - float(limit)) * sign < 0)
 
     def foreign_on_product(self, side: str | None = None) -> list[dict]:
         """Orders resting on the desk's product that aren't the desk's (on `side`, if given), as of the last read."""
@@ -653,10 +664,11 @@ class CoinbaseExchange:
     def watchdog(self) -> list[tuple[str, str]]:
         """Read only: what is wrong with the account's protection right now. Any run that can still read the account
         runs this, even one that refuses to act. A stop-limit that triggered and didn't fill, or whose limit the price
-        is past, is no working stop ("gapped"). Stops covering less than the position holds leave the rest with none
-        ("unprotected", like no stop at all: only a stop counts, never a limit). Closing orders resting for more
-        contracts than the position holds (the desk's and anyone's: with no reduce-only, if they all fire they open
-        the other way) are "overclosing". What it read is kept in `watched` (position, the desk's orders)."""
+        is past, is no working stop ("gapped"), the desk's or one that isn't (yours, in the app). Stops that can still
+        fill covering less than the position holds leave the rest with none ("unprotected", like no stop at all: only
+        a stop counts, never a limit). Closing orders resting for more contracts than the position holds (the desk's
+        and anyone's: with no reduce-only, if they all fire they open the other way) are "overclosing". What it read
+        is kept in `watched` (position, the desk's orders)."""
         pos, orders = self._fresh()
         self.watched = (pos, orders)
         out = []
@@ -672,6 +684,8 @@ class CoinbaseExchange:
                                      f"position: it would open one if it fired. Cancel it in Coinbase now"))
         else:
             stops = [o for o in orders if o["side"] == closing and o.get("triggerPrice") and o["status"] == "open"]
+            theirs = [o for o in self.foreign_on_product(closing) if o.get("stop") is not None and
+                      float(o.get("contracts") or 0) > 0]           # stops that aren't the desk's protect too
             over = sum(float(o["remaining"] if o.get("remaining") is not None else (o.get("amount") or 0))
                        for o in orders if o["side"] == closing and not o.get("cancel_queued")) + \
                 sum(float(o.get("contracts") or 0) for o in self.foreign_on_product(closing))
@@ -680,9 +694,7 @@ class CoinbaseExchange:
                                            f"the {pos['side']} {pos['contracts']:g} held: Coinbase has no reduce-only, "
                                            f"so if they all fired they would open a position the other way. Cancel the "
                                            f"extra in Coinbase now"))
-            theirs = sum(float(o.get("contracts") or 0) for o in self.foreign_on_product(closing)
-                         if o.get("stop") is not None)          # stops that aren't the desk's protect too
-            if not stops and theirs <= 1e-9:
+            if not stops and not theirs:
                 out.append(("unprotected", f"the {pos['side']} {pos['contracts']:g} contracts on {self.product} have "
                                            f"no stop resting on Coinbase"))
             else:
@@ -692,11 +704,11 @@ class CoinbaseExchange:
                     last = None
                 sign = 1 if pos["side"] == "long" else -1
                 gapped = False
-                cover = theirs
+                cover = 0.0
                 for o in stops:
-                    hit = o.get("triggerStatus") == "STOP_TRIGGERED"
-                    if hit or (last is not None and o.get("price") is not None and (last[0] - o["price"]) * sign < 0):
+                    if not self.stop_works(o, last, sign):
                         gapped = True
+                        hit = o.get("triggerStatus") == "STOP_TRIGGERED"
                         out.append(("gapped", f"the stop {o['id']} at {o['triggerPrice']:,.0f} on the {pos['side']} "
                                               f"{pos['contracts']:g} contracts on {self.product} "
                                               + ("triggered and didn't fill" if hit else
@@ -705,6 +717,18 @@ class CoinbaseExchange:
                                                 "working stop. Close it in Coinbase now"))
                     elif not o.get("cancel_queued"):
                         cover += float(o["remaining"] if o.get("remaining") is not None else (o.get("amount") or 0))
+                for o in theirs:
+                    if not self.stop_works(o, last, sign):
+                        gapped = True
+                        hit = o.get("trigger_status") == "STOP_TRIGGERED"
+                        out.append(("gapped", f"your stop {o['id']} at {float(o['stop']):,.0f} (not the desk's) on the "
+                                              f"{pos['side']} {pos['contracts']:g} contracts on {self.product} "
+                                              + ("triggered and didn't fill" if hit else
+                                                 f"is past its limit {float(o['limit']):,.0f}")
+                                              + ": a stop-limit doesn't fill past its limit, so it's no working stop. "
+                                                "Close the position or place a new stop in Coinbase now"))
+                    else:
+                        cover += float(o.get("contracts") or 0)
                 if not gapped and cover + 1e-9 < pos["contracts"]:
                     # only part of the position has a stop (it grew in the app, say): the rest has none
                     out.append(("unprotected", f"the stops resting on the {pos['side']} {pos['contracts']:g} contracts "
@@ -887,6 +911,8 @@ class CoinbaseExchange:
             res = self._post(f"{V3}/orders/batch_cancel", co.batch_cancel([oid]))
         except CoinbaseUncertain:
             res = None          # it may have reached Coinbase: what the order reads now decides
+        except OrdersLocked as exc:     # the client refused it before sending (not the desk's order, say)
+            raise CancelFailed(f"the cancel of order {oid} wasn't sent: {exc}") from None
         rows = [] if res is None else \
             [r for r in res.get("results") or [] if str(r.get("order_id")) == oid] or res.get("results") or []
         r = rows[0] if rows else {}

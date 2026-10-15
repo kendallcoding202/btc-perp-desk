@@ -130,7 +130,11 @@ KILLS_UNREADABLE_FLAT = KILLS_UNREADABLE + "; flat_kill on: any position is clos
 KILLS_STRAY = ("a file on the coinbase-state branch looks like a kill switch but isn't BTC/kills.json: read as "
                "entry_kill on, no new entries")
 # the public status's note of a run that wrote BTC/status.json back beside the state (status_written_back)
-STATUS_BACK = "BTC/status.json was missing on the coinbase-state branch: this run wrote it back, the next run saves"
+STATUS_BACK = coinbase_state.STATUS_BACK
+# the public status's note for a SHADOW that never worked and stopped after the key passed, by problem (no digit)
+UNWORKED_PUBLIC = {"read": "Coinbase didn't answer part of the run (the next run tries again)",
+                   "refused": "SHADOW refused to go on (the reason is on your phone; the next run tries again)",
+                   "state": "SHADOW couldn't go on (the reason is on your phone; the next run tries again)"}
 # DESK_COINBASE_KILL (a repository variable) reads kills.json's switch words (coinbase_state.named_switches): flat,
 # close or flatten anywhere in it is flat_kill, entry (entries, no_entries) entry_kill, both can be set together; a
 # value with neither is entry_kill, alerted (failing closed)
@@ -780,11 +784,17 @@ class Run:
         state already sealed with it keeps its key. None: fine."""
         cdp = (self.env.get("COINBASE_CDP_KEY") or "").strip()
         low = password.lower()
-        if "privatekey" in low or "-----begin" in low or (cdp and password.strip() == cdp):
+        if "privatekey" in low or "-----begin" in low:
             return ("DESK_STATE_KEY looks like the key file: the two secrets are swapped (or the file was pasted into "
                     "both). Put the whole downloaded key file in COINBASE_CDP_KEY and a random password of 32 "
                     "characters or more in DESK_STATE_KEY (docs/coinbase-setup.md, steps 12 and 13)",
                     "DESK_STATE_KEY looks like the key file (the two secrets are swapped)")
+        if cdp and password.strip() == cdp:
+            # the same text in both, and it isn't the key file (the password pasted into both, say)
+            return ("COINBASE_CDP_KEY and DESK_STATE_KEY hold the same text: put the whole downloaded key file in "
+                    "COINBASE_CDP_KEY, and keep the password in DESK_STATE_KEY (docs/coinbase-setup.md, steps 12 and "
+                    "13)", "COINBASE_CDP_KEY and DESK_STATE_KEY hold the same text (put the key file in "
+                           "COINBASE_CDP_KEY)")
         if "\r" in password or "\n" in password:
             return ("DESK_STATE_KEY has a line break in it: set it again without one. The SHADOW page's password "
                     "field can't hold a line break, so a board sealed with it would never open",
@@ -1073,8 +1083,8 @@ class Run:
             if self.saves_from_the_start():
                 self.begin_saving()             # written ahead: from here this run is saved, whatever happens
             # A SHADOW that has never had a working run (no state, or one whose every run failed before any money was
-            # in it): a refusal over the key itself saves its status alone (refused_unworked), never a state a later,
-            # corrected DESK_STATE_KEY would have to open
+            # in it): a run that stops, over the key or later, saves its status alone (refused_unworked), never a
+            # state a later, corrected (or changed) DESK_STATE_KEY would have to open
             st = self.saved_status() or {}
             try:
                 worked = st.get("mode") == "SHADOW" and (st.get("opened") is True or
@@ -1089,7 +1099,7 @@ class Run:
                 self.body(work, password, saved_desk)
                 ok = True
             except Stop as s:
-                if self.never_worked and not self.key_passed:
+                if self.never_worked:
                     return self.refused_unworked(s)
                 self.problem, self.code = s.problem, s.code
                 self.public_why = s.public
@@ -1100,6 +1110,9 @@ class Run:
             except Exception as exc:     # anything else, mid-run: LIVE would be in entry_kill now; so is SHADOW
                 from .brokers.coinbase_rest import CoinbaseError, CoinbaseUncertain
 
+                if self.never_worked:
+                    self.log(f"error: {type(exc).__name__}: {exc}")
+                    return self.refused_unworked(Stop("read", f"{type(exc).__name__} while it ran", code=1))
                 self.problem, self.code = "read", 1
                 transient = isinstance(exc, CoinbaseError) and exc.transient and not isinstance(exc, CoinbaseUncertain)
                 self.log(f"error: {type(exc).__name__}: {exc}")
@@ -1148,12 +1161,18 @@ class Run:
         return self.code
 
     def refused_unworked(self, s: Stop) -> int:
-        """A SHADOW that has never had a working run, refused over the key itself (connect, check_permissions: the
-        key file, a 401, its permissions, its portfolio, the clock, Coinbase not answering): its status alone, the
-        state as loaded (none, on a first run). Nothing it read is worth keeping, and a state saved now would be sealed
-        with whatever DESK_STATE_KEY holds now (the key file, if the two secrets are swapped), so a corrected one
-        couldn't open it. The next run that works is a first save (coinbase_state.check)."""
-        self.log("SHADOW hasn't had a working run yet: this refusal saves only the status, no state")
+        """A SHADOW that has never had a working run, stopped, over the key itself (connect, check_permissions: the
+        key file, a 401, its permissions, its portfolio, the clock, Coinbase not answering) or after it (Coinbase not
+        answering for the candles or the balance, say): its status alone, the state as loaded (none, on a first run).
+        Nothing it read is worth keeping, and a state saved now would be sealed with whatever DESK_STATE_KEY holds now
+        (the key file, if the two secrets are swapped; a password you change before SHADOW has worked), so a corrected
+        or changed one couldn't open it. The next run that works is a first save (coinbase_state.check)."""
+        self.log("SHADOW hasn't had a working run yet: this run saves only the status, no state")
+        if self.key_passed:
+            s = Stop(s.problem, f"{s.text.rstrip('. ')}. SHADOW hasn't had a run that works yet, so this run saved "
+                                f"only its status, no state (DESK_STATE_KEY can still change); the next run tries "
+                                f"again", code=s.code,
+                     public=s.public or UNWORKED_PUBLIC.get(s.problem, UNWORKED_PUBLIC["read"]))
         return self.refused_early(s, status=True)
 
     def status_gone(self) -> bool:
@@ -1233,9 +1252,13 @@ class Run:
         (LiveRun: see its own)."""
         wrote = s.problem == "key" if wrote is None else wrote
         if self.first_refusal(s, wrote) or (self.in_window() and not (wrote and self.pushed_this_window(s))):
+            gone = "" if wrote or not self.status_gone() else (
+                f" {COIN}/status.json is missing on the coinbase-state branch too (deleted?): this run wrote nothing, "
+                f"and the first run that opens the saved state writes it back, so fix this and wait for the next run.")
+            lead = "stopped part way this run" if self.key_passed else "didn't run"
             self.push(f"{COIN} {self.mode.upper()}: not working",
-                      f"{self.mode.upper()} didn't run: {s.text.rstrip('. ')}. Nothing was sent. Paper is unaffected.",
-                      "high", "warning")
+                      f"{self.mode.upper()} {lead}: {s.text.rstrip('. ')}. Nothing was sent.{gone} Paper is "
+                      f"unaffected.", "high", "warning")
 
     def saved_status(self) -> dict | None:
         """BTC/status.json as loaded (public, plain: readable without DESK_STATE_KEY), or None."""
@@ -1251,6 +1274,13 @@ class Run:
         the branch while its runs are 0). `counts`: the opened state's meta instead (status_written_back)."""
         p = self.paths["status"]
         old = {}
+        if counts is None and self.status_gone():
+            # the status is gone from beside the saved state, and this run couldn't open that state: a status written
+            # now would carry none of its counts (its start, its runs), and every later save would be refused as
+            # another account. Nothing is written: the first run that opens the state writes it back
+            self.log(f"{COIN}/status.json isn't on the coinbase-state branch, beside the saved state: this refusal "
+                     f"writes no status (the first run that opens the state writes it back)")
+            return False
         if counts is not None:
             old = {"mode": self.mode.upper(), "started_ts": counts.get("started_ts"), "runs": counts.get("runs"),
                    "failed_runs": counts.get("failed_runs"),
@@ -1931,6 +1961,9 @@ class Run:
         if not self.changed:
             why = self.public_why or self.problem or "error"
             what = "" if self.problem in (None, "key") else f" ({self.problem})"     # the key's own: auth, permissions
+            if self.key_passed:         # a SHADOW that never worked, stopped part way: its status alone
+                return (f"{m} BTC: stopped{what} part way: {why} (it hasn't had a run that works yet: only its status "
+                        f"is saved, no state; nothing sent)")
             return (f"{m} BTC: refused{what} before reading the account: {why} (nothing read or sent; the state is "
                     f"unchanged)")
         if self.public_why and self.problem:
@@ -2226,20 +2259,26 @@ class LiveRun(Run):
                     position); one that won't cancel, or one that isn't the desk's, is pushed urgently
           flat_kill close() (protect-only: a close the desk wanted too)
           gapped    a stop-limit that triggered and didn't fill, or whose limit the price is past: close(); held
-                    back, every stop that can still fill stays (cut back below keeps them first)
+                    back, every stop that can still fill stays, and contracts none covers get one at the tightest
+                    working stop's trigger (the saved level is through)
           too many  desk stops covering more than the position: kept up to it, the ones that can still fill first
-                    and the tightest of those first; the rest cancelled
+                    and the tightest of those first; one that can't fill goes before any that can. A working stop
+                    too big for what's left is placed again at its trigger for that many (cancel-first, and only
+                    with room for it), never just cancelled
           no stop   one placed: at the saved stop, else the stop distance from the entry at the last ATR seen; the
                     price already through it: close(). None placed: the urgent push
-          too few   stops covering only part of the position (only a stop is cover, never a limit): one placed for
-                    the rest at the saved level, as far as the closing orders resting leave room; the rest pushed
+          too few   stops that can still fill covering only part of the position (a limit is no cover, nor a stop of
+                    yours that triggered and didn't fill): one placed for the rest at the saved level, as far as the
+                    closing orders resting leave room; the rest pushed
         close() never cancels the stop for a close that may not go through: not while Coinbase reads closed, or its
         product can't be read to tell (market orders can't be queued); not with an order that isn't the desk's on the
         closing side covering the position; not without the time for the whole sequence, the stop put back included
-        (close_worst_s). The stop cancelled and the close refused or cut off: the stop goes back at its trigger. A
-        close that fills only in part: the rest is closed again, or gets a stop. What it did is said as it happened
-        (safety_said, safety_end): never "closed" unless Coinbase reads it flat. It needs only the product's id. What
-        it can't read, it leaves to the rest of the run (which reads it all). It is all a protect-only run does
+        (close_worst_s). The stops cancelled and the close refused or cut off: a stop goes back at their trigger, the
+        tightest the price isn't through (the saved level only when there's none). A close that fills only in part:
+        the rest is closed again, or gets a stop. What it did is said as it happened (safety_said); safety_end is what
+        it left, and "protected" only where it read or placed stops that can still fill for every contract held:
+        never by default, never "closed" unless Coinbase reads it flat. It needs only the product's id. What it can't
+        read, it leaves to the rest of the run (which reads it all). It is all a protect-only run does
         (coinbase_live.arm: the client then refuses anything else)."""
         import math
 
@@ -2293,9 +2332,14 @@ class LiveRun(Run):
             return False
 
         def urgent(kind: str, text: str, protected: bool = False) -> None:
+            """Pushed urgently and said. `protected`: stops that can still fill cover the position all the same (the
+            pass ends protected unless something else says otherwise); else it ends "unprotected"."""
             self.on_urgent(kind, text)
             self._say_safe(text)
-            if not protected:
+            if protected:
+                if self.safety_end is None:
+                    self.safety_end = "protected"
+            else:
                 self.safety_end = "unprotected"
 
         others = real.foreign_on_product()
@@ -2317,13 +2361,18 @@ class LiveRun(Run):
                                                 f"Coinbase has no reduce-only, so it would open a position if it "
                                                 f"fired. Cancel it in Coinbase now")
             return
-        self.safety_end = "protected"
+        self.safety_end = None          # decided where the pass ends (ok_end, urgent): never "protected" by default
         sign = 1 if pos["side"] == "long" else -1
         closing = "sell" if sign > 0 else "buy"
         n = int(pos["contracts"])
         sp = saved.get("position") or {}
         ets = sp.get("entry_ts") if sp.get("side") == pos["side"] else "safety"
         what = f"the {pos['side']} {n} contract(s)"
+
+        def ok_end() -> None:
+            """Where the pass ends with every contract held covered by stops that can still fill (stop_cover)."""
+            if self.safety_end is None:
+                self.safety_end = "protected"
 
         def rem(o) -> float:
             """What an order could still close (a CANCEL_QUEUED one: nothing, it's cancelled at the reopen)."""
@@ -2336,18 +2385,21 @@ class LiveRun(Run):
 
         def works(o, last) -> bool:
             """A stop that can still fill as a stop: not triggered, and the price (when read) not past its limit."""
-            if o.get("triggerStatus") == "STOP_TRIGGERED":
-                return False
-            return not (last is not None and o.get("price") is not None and (last[0] - float(o["price"])) * sign < 0)
+            return real.stop_works(o, last, sign)
+
+        def tight(levels) -> list[float]:
+            return sorted(set(levels), key=lambda t: -sign * t)
 
         def stop_cover(now_orders, last=None) -> float:
-            """The contracts stops cover, on the closing side: the desk's that can still fill, and any stop that isn't
-            the desk's (yours, in the app). A limit or any other order that isn't a stop is no cover: it doesn't
-            close the position when the price falls through the stop."""
+            """The contracts stops that can still fill cover, on the closing side (works): the desk's, and any that
+            isn't the desk's (yours, in the app). A limit or any other order that isn't a stop is no cover (it doesn't
+            close the position when the price falls through the stop), and neither is a stop that triggered and didn't
+            fill, or whose limit the price is past."""
+            last = last if last is not None else (price[0] if price else None)
             mine = sum(rem(o) for o in now_orders if o["side"] == closing and o.get("triggerPrice") and
                        o["status"] == "open" and works(o, last))
             return mine + sum(float(o.get("contracts") or 0) for o in real.foreign_on_product(closing)
-                              if o.get("stop") is not None)
+                              if o.get("stop") is not None and works(o, last))
 
         def room(now_orders, held: int) -> int:
             """How many contracts a new stop may cover beside every closing order resting (the desk's and anyone's):
@@ -2415,9 +2467,34 @@ class LiveRun(Run):
                 return "unknown"
             return {"canceled": "gone", "closed": "filled", "open": "rests", "canceling": "pending"}.get(st, "unknown")
 
-        def put_back(trig: float | None, why: str) -> None:
+        def place(k: int, trig: float, known: dict | None = None, tries: int = STOP_ATTEMPTS) -> str | None:
+            """A stop for `k` contracts at `trig`, up to `tries` tries: None once Coinbase holds it (it's added to
+            `orders`), "through" when the price is already through it, else why it couldn't be placed."""
+            err = ""
+            for attempt in range(tries):
+                if attempt:
+                    self.sleep(STOP_BACKOFF_S * 2 ** (attempt - 1))
+                params = {"stopLossPrice": trig, "clientOrderId": real.client_order_id("stop-safety", ets, trig, seq())}
+                if known is not None:
+                    params["known"] = known
+                try:
+                    res = real.create_order(PRODUCT, "market", closing, k, trig, params)
+                except StopThroughMarket:
+                    return "through"
+                except CoinbaseError as exc:
+                    err = f"{type(exc).__name__}: {exc}"
+                    continue
+                rec = res if res.get("triggerPrice") is not None and res.get("side") else \
+                    {"id": res.get("id"), "side": closing, "status": "open", "triggerPrice": trig, "price": None,
+                     "triggerStatus": None, "amount": float(k), "remaining": float(k)}
+                orders.append({**rec, "status": "open"} if rec.get("status") in (None, "open") else rec)
+                return None
+            return err
+
+        def put_back(levels: list[float], why: str) -> None:
             """A stop back on what Coinbase still holds (never more than the closing orders already resting leave),
-            at `trig`: the close it was cancelled for didn't take all of the position."""
+            at the first of `levels` the price isn't through (the stops cancelled for the close, tightest first, then
+            the saved level): the close they were cancelled for didn't take all of the position."""
             try:
                 now, now_orders = real._fresh()
             except CoinbaseError as exc:
@@ -2428,41 +2505,47 @@ class LiveRun(Run):
             if now is None:
                 return clear_flat(now_orders, why)
             held = int(now["contracts"])
-            need = held - math.ceil(stop_cover(now_orders) - 1e-9)       # only a stop is cover
+            need = held - math.ceil(stop_cover(now_orders) - 1e-9)       # only a stop that can still fill is cover
             if need <= 0:
                 self._say_safe(f"{held} contract(s) still held after the {why} close: covered by the stops resting")
-                return
+                return ok_end()
             k = min(need, room(now_orders, held))
             if k <= 0:
                 return urgent("no_stop", f"NO STOP: {need} of the {held} contract(s) still held on {PRODUCT} after a "
                                          f"{why} close have no stop: the closing orders resting on them aren't stops "
-                                         f"(yours in the app, a take-profit limit, say), and with no reduce-only a "
-                                         f"stop beside them could open a position. Cancel them and place a stop, or "
-                                         f"close the position, in Coinbase now")
-            if trig is None:
+                                         f"that can still fill (yours in the app: a take-profit limit, or a stop that "
+                                         f"triggered and didn't fill, say), and with no reduce-only a stop beside them "
+                                         f"could open a position. Cancel them and place a stop, or close the position, "
+                                         f"in Coinbase now")
+            if not levels:
                 return urgent("no_stop", f"NO STOP: {held} contract(s) on {PRODUCT} are still held after a {why} close "
                                          f"that didn't take them all, and the desk has no level for their stop. Place "
                                          f"it or close the position in Coinbase now")
-            trig = float(co.round_price(trig))
-            try:
-                real.create_order(PRODUCT, "market", closing, k, trig,
-                                  {"stopLossPrice": trig, "known": {"side": now["side"], "contracts": held,
-                                                                    "orders": now_orders},
-                                   "clientOrderId": real.client_order_id("stop-safety", ets, trig, seq())})
-                self._say_safe(f"the stop is back at {trig:,.0f} on {k} of the {held} contract(s) still held")
-                if k < need:
-                    urgent("no_stop", f"NO STOP: {need - k} of the {held} contract(s) still held on {PRODUCT} have no "
-                                      f"stop: closing orders that aren't stops rest on them, and a bigger stop could "
-                                      f"open a position. Cancel them and place a stop, or close the position, in "
-                                      f"Coinbase now")
-            except StopThroughMarket as exc:
-                urgent("no_stop", f"NO STOP: {held} contract(s) on {PRODUCT} are still held after a {why} close that "
-                                  f"didn't take them all, and their stop can't go back at {trig:,.0f}: the price is "
-                                  f"through it ({exc}). Close the position in Coinbase now")
-            except CoinbaseError as exc:
-                urgent("no_stop", f"NO STOP: {held} contract(s) on {PRODUCT} are still held after a {why} close that "
-                                  f"didn't take them all, and their stop couldn't be put back at {trig:,.0f} "
-                                  f"({type(exc).__name__}). Place it or close the position in Coinbase now")
+            known = {"side": now["side"], "contracts": held, "orders": now_orders}
+            tried = []
+            for trig in levels:
+                trig = float(co.round_price(trig))
+                got = place(k, trig, known=known, tries=1)
+                if got is None:
+                    self._say_safe(f"the stop is back at {trig:,.0f} on {k} of the {held} contract(s) still held"
+                                   + (f" (the price is through {', '.join(f'{t:,.0f}' for t in tried)})"
+                                      if tried else ""))
+                    if k < need:
+                        return urgent("no_stop", f"NO STOP: {need - k} of the {held} contract(s) still held on "
+                                                 f"{PRODUCT} have no stop: closing orders that aren't stops rest on "
+                                                 f"them, and a bigger stop could open a position. Cancel them and "
+                                                 f"place a stop, or close the position, in Coinbase now")
+                    return ok_end()
+                if got != "through":
+                    return urgent("no_stop", f"NO STOP: {held} contract(s) on {PRODUCT} are still held after a {why} "
+                                             f"close that didn't take them all, and their stop couldn't be put back "
+                                             f"at {trig:,.0f} ({got.split(':')[0]}). Place it or close the position "
+                                             f"in Coinbase now")
+                tried.append(trig)
+            urgent("no_stop", f"NO STOP: {held} contract(s) on {PRODUCT} are still held after a {why} close that "
+                              f"didn't take them all, and their stop can't go back at "
+                              f"{', '.join(f'{t:,.0f}' for t in tried)}: the price is through it. Close the position "
+                              f"in Coinbase now")
 
         def clear_flat(now_orders, why: str) -> None:
             self.safety_end = "flat"
@@ -2477,6 +2560,9 @@ class LiveRun(Run):
 
         held_back: list[str] = []         # why the last close() sent nothing (Coinbase closed, unreadable, too slow)
 
+        def uncovered(cover: float) -> str:
+            return f" on {n - cover:g} of its {n} contracts" if cover > 1e-9 else ""
+
         def close(reason: str) -> bool:
             """The position closed at market, cancel-first. True: done, or what stopped it is said (urgently when the
             position may be left without a working stop). False: nothing was sent and the stop is as it was (Coinbase
@@ -2485,10 +2571,13 @@ class LiveRun(Run):
             why = reason.replace("_", " ")
             mine = [o for o in orders if o["side"] == closing and not o.get("cancel_queued")]
             trigs = [float(o["triggerPrice"]) for o in mine if o.get("triggerPrice") and o["status"] == "open"]
-            # the stop put back if the close fails: at the tightest stop that could still fill, else the saved level
-            good = [float(o["triggerPrice"]) for o in mine if o.get("triggerPrice") and o["status"] == "open" and
-                    works(o, price[0] if price else None)]
-            back = (max(good) if sign > 0 else min(good)) if good else saved_level()
+            # the stop put back if the close fails: at the cancelled stops' triggers the price isn't through, the
+            # tightest first; the saved level only when there is none
+            last = price[0] if price else None
+            back = tight(float(o["triggerPrice"]) for o in mine if o.get("triggerPrice") and o["status"] == "open"
+                         and works(o, last) and (last is None or (last[0] - float(o["triggerPrice"])) * sign > 0))
+            level = saved_level()
+            back += [] if level is None or any(abs(level - t) < 1e-6 for t in back) else [level]
             held_back.clear()
             wait = closed_now()
             if wait:
@@ -2504,10 +2593,20 @@ class LiveRun(Run):
                 return True
             k = n - math.ceil(foreign_closing() - 1e-9)
             if k <= 0:
-                urgent("foreign", f"the {why} close of {what} on {PRODUCT} isn't sent: orders that aren't the desk's "
-                                  f"rest on the closing side for the whole position, and with no reduce-only they "
-                                  f"would open one once it's closed. Cancel them, or close the position, in Coinbase",
-                       protected=True)
+                cover = stop_cover(orders, last_price())
+                if cover + 1e-9 >= n:
+                    urgent("foreign", f"the {why} close of {what} on {PRODUCT} isn't sent: orders that aren't the "
+                                      f"desk's rest on the closing side for the whole position, and with no "
+                                      f"reduce-only they would open one once it's closed (stops that can still fill "
+                                      f"cover it meanwhile). Cancel them, or close the position, in Coinbase",
+                           protected=True)
+                else:
+                    urgent("no_stop", f"NO STOP: the {why} close of {what} on {PRODUCT} isn't sent: orders that "
+                                      f"aren't the desk's rest on the closing side for the whole position (with no "
+                                      f"reduce-only they would open one once it's closed), and they aren't stops "
+                                      f"that can still fill (a take-profit limit, or a stop that triggered and "
+                                      f"didn't fill), so the position has no working stop{uncovered(cover)}. Cancel "
+                                      f"them and close the position, or place a stop, in Coinbase now")
                 return True
             if not real.fits(real.close_worst_s(len(mine))):
                 slow = ("Coinbase is answering too slowly this run to cancel the stop, close and, if the close failed, "
@@ -2528,6 +2627,21 @@ class LiveRun(Run):
                 if got == "rests":
                     self._say_safe(f"the {why} close isn't sent: the order {o['id']} won't cancel first (no "
                                    f"reduce-only); it still rests, and the next run tries again")
+                    if not i:               # nothing was cancelled: the position's stops are as they were read
+                        last = last_price()
+                        cover = stop_cover(orders, last)
+                        if cover + 1e-9 >= n:
+                            ok_end()
+                        else:
+                            gap = o.get("triggerPrice") and not works(o, last)
+                            urgent("gapped" if gap else "no_stop",
+                                   (f"the stop {o['id']} at {float(o['triggerPrice']):,.0f} on {what} on {PRODUCT} "
+                                    f"can't fill (the price is past its limit) and won't cancel, so the {why} close "
+                                    f"at market isn't sent beside it (no reduce-only)" if gap else
+                                    f"NO STOP: the order {o['id']} on {what} on {PRODUCT} won't cancel, so the {why} "
+                                    f"close at market isn't sent beside it (no reduce-only)")
+                                   + f": the position has no working stop{uncovered(cover)}. Close it in Coinbase "
+                                     f"now (cancel that order first); the next run tries again")
                 else:
                     urgent("no_stop", f"NO STOP: the cancel of {what}'s stop {o['id']} on {PRODUCT} for a {why} close "
                                       f"got no clear end ({got}): it may be gone, or about to be, so the position may "
@@ -2543,7 +2657,7 @@ class LiveRun(Run):
                 err = f"{type(exc).__name__}: {exc}"
             return settle(back, why, sent=True, err=err)
 
-        def settle(back, why: str, sent: bool, err: str | None = None) -> bool:
+        def settle(back: list[float], why: str, sent: bool, err: str | None = None) -> bool:
             """After the close (or the stop filling as it was cancelled): Coinbase's position read again. Flat: the
             desk's orders left on the closing side cancelled. Still open: what the close took said; the rest closed
             once more if the first went through, else (or if that fails too) its stop put back."""
@@ -2611,69 +2725,117 @@ class LiveRun(Run):
             space = min(k, room(orders, n))
             if space <= 0:
                 urgent("no_stop", f"NO STOP: {whom} on {PRODUCT} have no stop resting, and the closing orders resting "
-                                  f"on them aren't stops (yours in the app, a take-profit limit, say): with no "
-                                  f"reduce-only a stop beside them could open a position. Cancel them in Coinbase so "
-                                  f"the desk can place the stop, or close the position there")
+                                  f"on them aren't stops that can still fill (yours in the app: a take-profit limit, "
+                                  f"or a stop that triggered and didn't fill, say): with no reduce-only a stop beside "
+                                  f"them could open a position. Cancel them in Coinbase so the desk can place the "
+                                  f"stop, or close the position there")
                 return
             trig = float(co.round_price(level))
-            err = ""
-            for attempt in range(STOP_ATTEMPTS):
-                if attempt:
-                    self.sleep(STOP_BACKOFF_S * 2 ** (attempt - 1))
-                try:
-                    real.create_order(PRODUCT, "market", closing, space, trig,
-                                      {"stopLossPrice": trig,
-                                       "clientOrderId": real.client_order_id("stop-safety", ets, trig, seq())})
-                    self._say_safe(f"no stop was resting on {whom}: placed one at {trig:,.0f}"
-                                   + (f" for {space} of them" if space < k else ""))
-                    if space < k:
-                        urgent("no_stop", f"NO STOP: {k - space} of {what} on {PRODUCT} have no stop: closing orders "
-                                          f"that aren't stops rest on them, and a bigger stop could open a position. "
-                                          f"Cancel them and place a stop, or close the position, in Coinbase now")
-                    return
-                except StopThroughMarket:
-                    if not close("stop"):
-                        urgent("no_stop", f"NO STOP: {whom} on {PRODUCT} have no stop resting, the price is already "
-                                          f"through its level {trig:,.0f}, and the close at market can't go now "
-                                          f"({held_back[0]}). Close it in Coinbase as soon as you can")
-                    return
-                except CoinbaseError as exc:
-                    err = f"{type(exc).__name__}: {exc}"
-            urgent("no_stop", f"NO STOP: {whom} on {PRODUCT} have no stop resting and one couldn't be placed ({err}). "
+            got = place(space, trig)
+            if got is None:
+                self._say_safe(f"no stop was resting on {whom}: placed one at {trig:,.0f}"
+                               + (f" for {space} of them" if space < k else ""))
+                if space < k:
+                    urgent("no_stop", f"NO STOP: {k - space} of {what} on {PRODUCT} have no stop: closing orders "
+                                      f"that aren't stops rest on them, and a bigger stop could open a position. "
+                                      f"Cancel them and place a stop, or close the position, in Coinbase now")
+                else:
+                    ok_end()
+                return
+            if got == "through":
+                if not close("stop"):
+                    urgent("no_stop", f"NO STOP: {whom} on {PRODUCT} have no stop resting, the price is already "
+                                      f"through its level {trig:,.0f}, and the close at market can't go now "
+                                      f"({held_back[0]}). Close it in Coinbase as soon as you can")
+                return
+            urgent("no_stop", f"NO STOP: {whom} on {PRODUCT} have no stop resting and one couldn't be placed ({got}). "
                               f"Place it or close the position in Coinbase now; the desk tries again "
                               + ("at the next run" if self.protect_failed else "later this run and at the next one"))
 
         def cut_back(stops: list, last) -> list:
             """The desk's own closing orders covering more than the position (no reduce-only: if they all fired they
             would open it the other way): kept up to the position, the stops that can still fill first (works) and the
-            tightest of them first, so a stop that can still work is never cancelled for one that can't; the rest
-            cancelled. Returns the stops still resting; `orders` is left as what still rests."""
-            if sum(rem(o) for o in orders if o["side"] == closing) <= n + 1e-9:
+            tightest of them first; a stop that can't fill goes before any that can. A working stop is never cancelled
+            unless one of the right size goes back at its trigger: the one too big for what's left is cancelled and
+            placed again for that many contracts (a stop-limit queues while Coinbase is closed), and only when every
+            other extra order has gone and there's room for it. Returns the stops resting after; `orders` is left as
+            what rests."""
+            desk_closing = [o for o in orders if o["side"] == closing]
+            if sum(rem(o) for o in desk_closing) <= n + 1e-9:
                 return stops
-            keep, total = [], 0.0
-            for o in sorted(stops, key=lambda o: (not works(o, last), -sign * float(o["triggerPrice"]))):
-                if total + rem(o) <= n + 1e-9:
+            left_n = n - sum(rem(o) for o in desk_closing if o["status"] != "open")    # cancels in flight stay
+            keep, total, resize = [], 0.0, None
+            for o in sorted((o for o in stops if works(o, last)), key=lambda o: -sign * float(o["triggerPrice"])):
+                if left_n - total < 1 - 1e-9:
+                    break
+                if total + rem(o) <= left_n + 1e-9:
                     keep.append(o)
                     total += rem(o)
-            extra = [o for o in orders if o["side"] == closing and o["status"] == "open" and o not in keep]
+                else:
+                    resize = (o, int(math.floor(left_n - total + 1e-9)))
+                    total = left_n
+            for o in sorted((o for o in stops if not works(o, last)), key=lambda o: -sign * float(o["triggerPrice"])):
+                if total + rem(o) <= left_n + 1e-9:
+                    keep.append(o)
+                    total += rem(o)
+            extra = [o for o in desk_closing if o["status"] == "open" and o not in keep and
+                     (resize is None or o is not resize[0])]
+            extra.sort(key=lambda o: bool(o.get("triggerPrice")) and works(o, last))     # what can't fill goes first
             left = [o for o in extra if not cancel(o)]
             orders[:] = [o for o in orders if o not in extra or o in left]
-            if left:
-                urgent("overclosing", f"the desk's closing orders on {PRODUCT} cover more than {what} held, and "
-                                      f"order {left[0]['id']} won't cancel: with no reduce-only, if they all fired "
-                                      f"they would open a position the other way. Cancel the extra in Coinbase now",
-                       protected=any(works(o, last) for o in keep))
-            elif extra:
+            if extra and not left:
                 self._say_safe(f"cancelled {len(extra)} desk order(s) closing more than {what} held (if they all "
                                f"fired they would have opened a position the other way)"
-                               + ("; the stop that can still fill was kept" if any(not works(o, last) for o in extra)
-                                  else ""))
-            return [o for o in stops if o in keep or o in left]
+                               + ("; the stops that can still fill were kept first" if any(
+                                   not works(o, last) for o in extra) else ""))
+            stays = None                    # the working stop too big for what's left, kept as it is: why
+            if resize is not None and not left:
+                o, k = resize
+                trig = float(o["triggerPrice"])
+                if k >= 1 and room([x for x in orders if x is not o], n) >= k:
+                    if not cancel(o):
+                        left = [o]
+                    else:
+                        orders[:] = [x for x in orders if x is not o]
+                        got = place(k, float(co.round_price(trig)))
+                        if got is None:
+                            self._say_safe(f"the desk's stop at {trig:,.0f} covered {rem(o):g} contracts, more than "
+                                           f"is left for it: placed again at {trig:,.0f} for {k}")
+                        else:
+                            urgent("no_stop", f"NO STOP: the desk's stop at {trig:,.0f} on {what} on {PRODUCT} covered "
+                                              f"more than the position, so it was cancelled to place it again for {k} "
+                                              f"contract(s), and that couldn't be placed ({got}). Place it or close "
+                                              f"the position in Coinbase now")
+                else:
+                    left, stays = [o], ("it still works, and the closing orders resting leave no room to place it "
+                                        "again for fewer contracts, so it stays as it is")
+            if left:
+                urgent("overclosing", f"the desk's closing orders on {PRODUCT} cover more than {what} held, and "
+                                      f"order {left[0]['id']} " + (stays or "won't cancel")
+                       + ": with no reduce-only, if they all fired they would open a position the other way. Cancel "
+                         "the extra in Coinbase now", protected=True)
+            return [o for o in orders if o["side"] == closing and o.get("triggerPrice") and o["status"] == "open"]
+
+        def top_up(k: int, trig: float) -> int:
+            """A stop for `k` contracts no working stop covers, at `trig` (the tightest working stop's), as far as
+            room allows; how many it covers (0: none placed, said)."""
+            space = min(k, room(orders, n))
+            if space <= 0:
+                return 0
+            trig = float(co.round_price(trig))
+            got = place(space, trig)
+            if got is not None:
+                self._say_safe(f"a stop for the {space} contract(s) no working stop covers couldn't be placed at "
+                               f"{trig:,.0f} ({got.split(':')[0]})")
+                return 0
+            self._say_safe(f"placed a stop at {trig:,.0f} for the {space} contract(s) no working stop covered")
+            return space
 
         def protect() -> None:
             """The stops on the position: one the price gapped past closes it at market first (the desk's own stop
             was hit); then desk stops covering more than the position are cut back (cut_back), and stops covering
-            less are topped up at the saved level (place_missing). Only stops count as cover (stop_cover)."""
+            less are topped up (place_missing; while the gapped close is held back, at the tightest working stop's
+            trigger, since the saved level is through). Only a stop that can still fill is cover (stop_cover)."""
             last = last_price()
             stops = [o for o in orders if o["side"] == closing and o.get("triggerPrice") and o["status"] == "open"]
             gapped = [o for o in stops if not works(o, last)]
@@ -2691,42 +2853,52 @@ class LiveRun(Run):
             cover = stop_cover(orders, last)
             working = sorted((o for o in stops if works(o, last)), key=lambda o: -sign * float(o["triggerPrice"]))
             if g is not None:
-                # the close is held back (Coinbase closed, unreadable, too slow): nothing was cancelled for it
+                # the close is held back (Coinbase closed, unreadable, too slow): every working stop stays, and the
+                # contracts none covers get one at the tightest working stop's trigger
+                added = top_up(n - math.ceil(cover - 1e-9), float(working[0]["triggerPrice"])) \
+                    if working and cover + 1e-9 < n else 0
+                cover += added
                 if cover + 1e-9 >= n and working:
                     urgent("gapped", f"the stop {g['id']} at {float(g['triggerPrice']):,.0f} on {what} on {PRODUCT} "
                                      f"is past its limit and the close at market can't go now ({held_back[0]}): the "
                                      f"desk's stop at {float(working[0]['triggerPrice']):,.0f} still rests and can "
-                                     f"still fill, so the position isn't left without one. Close it in Coinbase if "
-                                     f"you want out at the price the first stop missed", protected=True)
+                                     f"still fill" + (f" (topped up for the {added} contract(s) it didn't cover)"
+                                                      if added else "")
+                           + ", so the position isn't left without one. Close it in Coinbase if you want out at the "
+                             "price the first stop missed", protected=True)
                 else:
                     urgent("gapped", f"the stop {g['id']} at {float(g['triggerPrice']):,.0f} on {what} on {PRODUCT} "
                                      f"is past its limit and the close at market can't go now ({held_back[0]}): the "
-                                     f"position has no working stop"
-                                     + (f" on {n - cover:g} of its {n} contracts" if cover > 1e-9 else "")
-                                     + ". Close it in Coinbase as soon as you can")
+                                     f"position has no working stop{uncovered(cover)}. Close it in Coinbase as soon as "
+                                     f"you can")
                 return
-            if not stops and cover <= 1e-9:
-                return place_missing()
             if cover + 1e-9 < n:
                 return place_missing(n - math.ceil(cover - 1e-9))
+            ok_end()
             self.safety_state = (f"{what} have their stop resting at {float(working[0]['triggerPrice']):,.0f}"
                                  if working else f"{what} are covered by stops that aren't the desk's")
 
         with real.protecting():
             if kills.flat_kill:
-                if close("flat_kill"):
-                    return
-                if held_back and held_back[0].startswith("Coinbase is answering too slowly"):
-                    rest = [o for o in orders if o["side"] == closing and o.get("triggerPrice") and
-                            o["status"] == "open"]
-                    urgent("flat_kill", f"flat_kill is on, and the close of {what} on {PRODUCT} isn't started: "
-                                        f"{held_back[0]}. Nothing was cancelled" + (", the stop stays" if rest else "")
-                                        + "; the next run tries again. Close it in Coinbase if you can't wait",
-                           protected=bool(rest))
+                if not close("flat_kill"):
+                    if held_back and held_back[0].startswith("Coinbase is answering too slowly"):
+                        rest = [o for o in orders if o["side"] == closing and o.get("triggerPrice") and
+                                o["status"] == "open"]
+                        urgent("flat_kill", f"flat_kill is on, and the close of {what} on {PRODUCT} isn't started: "
+                                            f"{held_back[0]}. Nothing was cancelled"
+                                            + (", the stop stays" if rest else "")
+                                            + "; the next run tries again. Close it in Coinbase if you can't wait",
+                               protected=True)
+                    protect()
             elif self.protect_failed and saved.get("close_wanted") and sp.get("side") == pos["side"] and \
                     close(str(saved["close_wanted"])):      # a close the desk wanted before: it only shrinks the risk
-                return
-            protect()
+                pass
+            else:
+                protect()
+        if self.safety_end is None:
+            # (every way out above decides it; should one not, nothing says the position is protected)
+            self.safety_end = "unprotected"
+            self._say_safe("the pass couldn't tell that stops that can still fill cover the position")
 
     def exchange(self, rules, feed):
         return self.real

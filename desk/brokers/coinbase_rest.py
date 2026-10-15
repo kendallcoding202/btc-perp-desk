@@ -11,16 +11,18 @@ What it can't do is the point:
     OrdersLocked before a socket opens: SHADOW holds a client built with no token, so even a bug in its overlay can't
     reach the exchange. Whatever the token's scope, an order or a close is refused unless it is for the product the
     token was armed for, and an entry unless its contracts at Coinbase's price, read just before, are within the token's
-    cap (_scope_check). A PROTECT-ONLY token (an armed LIVE whose new-risk check failed this run) lets through only what
-    can't add risk, checked here against the position and every open order on the product read just before
-    (_protect_check: every open status, a QUEUED one included, a CANCEL_QUEUED one counted for nothing since Coinbase
-    cancels it at the reopen before anything trades; and every placement source the desk reads, the app's included),
-    and only in the exact shapes coinbase_orders builds: a cancel of the desk's own orders on the product (each read
-    first; not checked for the protection it takes away, which the caller puts back); a close of at most the contracts
-    held that leaves no more closing contracts resting than the position it leaves; a stop-limit on the closing side
-    (its stop_direction that side's, its limit on the closing side of its trigger) that, with the closing contracts
-    already resting, covers at most the position, and is no wider than the saved stop. An entry, an add, a stop on the
-    wrong side or one further from the price, a body with a key the desk never sends: OrdersLocked, before anything is
+    cap (_scope_check). Whatever the scope too, checked against the position and every open order on the product read
+    just before (_order_check: every open status, a QUEUED one included, a CANCEL_QUEUED one counted for nothing since
+    Coinbase cancels it at the reopen before anything trades; and every placement source the desk reads, the app's
+    included), and only in the exact shapes coinbase_orders builds: a cancel only of the desk's own orders on the
+    product (each read first; not checked for the protection it takes away, which the caller puts back); a stop-limit
+    only on the closing side of the position held (its stop_direction that side's, its limit on the closing side of its
+    trigger) that, with the closing contracts already resting, covers at most the position (never an entry by stop). A
+    PROTECT-ONLY token (an armed LIVE whose new-risk check failed this run) lets through only what can't add risk: those,
+    and a close of at most the contracts held that leaves no more closing contracts resting than the position it leaves;
+    its stop no wider than the saved stop, unless it's at the level of a desk stop resting, or of one it cancelled this
+    run (put back after a close that didn't go). An
+    entry, an add, a stop on the wrong side, a body with a key the desk never sends: OrdersLocked, before anything is
     sent. Never: /orders/preview (it needs only view, but this desk doesn't preview with credentials), /orders/edit
     (futures orders can't be edited: CANNOT_EDIT_FUTURES_ORDER), sweeps or any transfer (they need the Transfer
     permission the desk's keys never have), the intraday margin setting, portfolio moves, any v2 write. There is no
@@ -219,6 +221,7 @@ class CoinbaseREST:
         self.last_latency_ms = 0.0
         self.slowest_s = 0.0                    # the slowest try this run (an answer, an error or a timeout)
         self.learned_sources: list[str] = []    # placement sources the desk's own orders turned out to carry
+        self.cancelled_stops: list[tuple[str, float]] = []    # (side, trigger) of each desk stop this client cancelled
         self._last_call: float | None = None
         # The tests' fake runs on loopback: never through a proxy from the environment
         handlers = [_NoRedirect()] + ([urllib.request.ProxyHandler({})] if base_url != DEFAULT_BASE else [])
@@ -256,7 +259,8 @@ class CoinbaseREST:
 
     @property
     def protect_only(self) -> bool:
-        """This client holds a protect-only token (_protect_check reads the account before each order)."""
+        """This client holds a protect-only token (_order_check reads the account before each order, not only before
+        each stop and cancel)."""
         return self._armed is not None and getattr(self._armed, "scope", "trade") != "trade"
 
     def worst_s(self, requests: int, waits_s: float = 0.0) -> float:
@@ -345,8 +349,9 @@ class CoinbaseREST:
         """An order call. Refused before anything is sent unless this client holds a valid Armed token, and even then
         unless `path` is one of ORDER_PATHS. Whatever the token's scope: an order or a close for any product but the
         one the token was armed for is refused, and so is an entry (an order that isn't a stop-limit) bigger than the
-        token's cap at Coinbase's price read just before (_scope_check). A protect-only token's calls are checked
-        further (_protect_check)."""
+        token's cap at Coinbase's price read just before (_scope_check); a cancel goes only for the desk's own orders
+        on that product, and a stop-limit only on the closing side of the position Coinbase holds, never for more than
+        it leaves uncovered (_order_check). A protect-only token's calls are checked further there."""
         from ..coinbase_live import Armed       # the lock (imported here: coinbase_live imports this module)
 
         armed = self._armed
@@ -357,14 +362,13 @@ class CoinbaseREST:
         if path not in ORDER_PATHS:
             raise PathNotAllowed(f"POST {path} isn't an order call the desk makes; refused before anything was sent")
         self._scope_check(path, body, armed)
-        if armed.scope != "trade":
-            self._protect_check(path, body, armed)
+        self._order_check(path, body, armed)
         data = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()     # the same bytes on every retry
         return self._request("POST", path, None, data, auth=True, retries=POST_RETRIES)
 
     def _scope_check(self, path: str, body: dict, armed) -> None:
         """What every token names, checked for every scope before anything is sent: an order or a close is for the
-        product the token was armed for (a cancel names no product: a protect-only token's are read, _protect_check),
+        product the token was armed for (a cancel names no product: each is read, _order_check),
         and an entry (any order body that isn't the protective stop-limit) is no bigger than the token's cap: its
         contracts at Coinbase's price for its side, read now, may be at most the cap and CAP_MOVE more (the price can
         move between the desk sizing it and this read). No fresh price: refused, as LiveBroker skips an entry then."""
@@ -404,18 +408,27 @@ class CoinbaseREST:
             refuse(f"{n:g} contracts at {px:,.0f} is ${notional:,.2f}, over the ${armed.cap:,.2f} cap this run was "
                    f"armed with")
 
-    def _protect_check(self, path: str, body: dict, armed) -> None:
-        """A protect-only token's order: only a cancel of the desk's own orders on the armed product (each read first),
-        or an order that can only shrink the position Coinbase holds now, in the exact shape coinbase_orders builds.
-        The position and every open order on the product are read here, just before (every open status and every
-        placement source the desk reads: a stop queued while Coinbase is closed, or one placed in the app, closes as
-        much as any). Anything else raises OrdersLocked, before anything is sent. A cancel isn't checked for the
-        protection it removes (a stop cancelled for a close comes off before the close can go): the caller stays
-        responsible for putting back any protection a cancel took away (the safety pass's put_back)."""
+    def _order_check(self, path: str, body: dict, armed) -> None:
+        """Every scope: a cancel only of the desk's own orders on the armed product (each read first: a stop's level is
+        kept, cancelled_stops), and a stop-limit only in the exact shape coinbase_orders builds, on the closing side of
+        the position Coinbase holds now, for no more than the closing orders resting leave uncovered (an entry by stop,
+        or one that would open the other way, never goes). A protect-only token's order further: only those, or a close
+        that can only shrink the position, and no stop wider than the saved one (its floor) unless it's at the level
+        of a desk stop resting now, or of one this client cancelled this run (put back after a close that didn't go):
+        neither loosens anything. The position and
+        every open order on the product are read here, just before (every open status and every placement source the
+        desk reads: a stop queued while Coinbase is closed, or one placed in the app, closes as much as any). Anything
+        else raises OrdersLocked, before anything is sent. A cancel isn't checked for the protection it removes (a stop
+        cancelled for a close comes off before the close can go): the caller stays responsible for putting back any
+        protection a cancel took away (the safety pass's put_back, LiveBroker's _cb_protect_remainder)."""
         from .coinbase_orders import STOP_LIMIT_FALLBACKS, PRICE_STEP, amount, is_desk_cid, parse_order, \
             parse_position
 
+        protect = armed.scope != "trade"
+
         def refuse(why: str):
+            if not protect:
+                raise OrdersLocked(f"POST {path} refused before anything was sent: {why}")
             raise OrdersLocked(f"protect only: POST {path} refused before anything was sent: {why}. An armed LIVE whose "
                                f"new-risk check failed this run sends only cancels and orders that shrink the position")
 
@@ -431,13 +444,23 @@ class CoinbaseREST:
                 # close, desk/coinbase_run.py) puts it back if what it cancelled it for doesn't go through.
                 if not re.fullmatch(_ID, oid):
                     refuse(f"order id {oid[:40]!r} isn't one Coinbase gives")
-                o = parse_order(self.get(f"{_V3}/orders/historical/{oid}").get("order") or {})
+                try:
+                    o = parse_order(self.get(f"{_V3}/orders/historical/{oid}").get("order") or {})
+                except CoinbaseRejected as exc:
+                    refuse(f"order {oid} can't be read (HTTP {exc.status}), so it isn't known to be one of the desk's "
+                           f"own orders")
                 src = o.get("placement")
                 if o.get("symbol") != armed.product or not is_desk_cid(o.get("clientOrderId")) or \
                         src not in (None, "", "RETAIL_ADVANCED", *self.learned_sources):
                     refuse(f"order {oid} isn't one of the desk's own orders on {armed.product}")
+                if o.get("triggerPrice") is not None and o.get("side"):
+                    self.cancelled_stops.append((str(o["side"]), float(o["triggerPrice"])))
             return
         close = path == f"{_V3}/orders/close_position"
+        if not protect:
+            cfg = body.get("order_configuration") if isinstance(body, dict) else None
+            if close or not isinstance(cfg, dict) or set(cfg) != {"stop_limit_stop_limit_gtc"}:
+                return              # an entry (the cap is checked in _scope_check) or a close (the adapter's checks)
         want = {"client_order_id", "product_id", "size"} if close else \
             {"client_order_id", "product_id", "side", "order_configuration"}
         if set(b) != want or not is_desk_cid(b.get("client_order_id")):
@@ -458,27 +481,38 @@ class CoinbaseREST:
             refuse("its body isn't one the desk builds")
         if n is None or n < 1 or abs(n - round(n)) > 1e-9:
             refuse("its size isn't a whole number of contracts")
-        rows = self.get(f"{_V3}/cfm/positions").get("positions")
-        if not isinstance(rows, list):
-            raise CoinbaseDataError("Coinbase's positions answer has no positions list")
-        pos = next((q for q in (parse_position(r) for r in rows) if q and q["product_id"] == armed.product), None)
-        if pos is None:
-            refuse("there is no position to protect")
+        # a trade token's stop: read once, no retries, and a read that fails lets it through (the adapter sized it
+        # against the position it read, or, a read failing after a cancel-first move, the one it knew: a stop that
+        # move cancelled the old one for is never held back by a read)
+        tries = GET_RETRIES if protect else 0
+        try:
+            rows = self.get(f"{_V3}/cfm/positions", retries=tries).get("positions")
+            if not isinstance(rows, list):
+                raise CoinbaseDataError("Coinbase's positions answer has no positions list")
+            pos = next((q for q in (parse_position(r) for r in rows) if q and q["product_id"] == armed.product), None)
+            if pos is None:
+                refuse("there is no position to protect")
+            rows = []
+            for src in self.sources():
+                extra = {} if src is None else {"order_placement_source": src}
+                rows += self.get_pages(f"{_V3}/orders/historical/batch", {"order_status": "OPEN", "product_ids":
+                                       armed.product, "limit": 100, **extra}, "orders", retries=tries)
+                rows += self.get_pages(f"{_V3}/orders/historical/batch", {"order_status": list(OPEN_LIKE),
+                                       "product_ids": armed.product, "limit": 100, **extra}, "orders", retries=tries)
+        except CoinbaseUnavailable:
+            if protect:
+                raise
+            return
         closing = "SELL" if pos["side"] == "long" else "BUY"
-        rows = []
-        for src in self.sources():
-            extra = {} if src is None else {"order_placement_source": src}
-            rows += self.get_pages(f"{_V3}/orders/historical/batch", {"order_status": "OPEN", "product_ids":
-                                                                     armed.product, "limit": 100, **extra}, "orders")
-            rows += self.get_pages(f"{_V3}/orders/historical/batch", {"order_status": list(OPEN_LIKE), "product_ids":
-                                                                     armed.product, "limit": 100, **extra}, "orders")
-        seen, resting = set(), 0.0
+        seen, resting, desk_levels = set(), 0.0, []
         for o in (parse_order(r) for r in rows):
             if o["id"] in seen or o["symbol"] != armed.product or o["side"] != closing.lower() or \
                     o["status"] not in ("open", "canceling") or o.get("cancel_queued"):
                 continue            # (a CANCEL_QUEUED order is cancelled at the reopen, before anything trades)
             seen.add(o["id"])
             resting += o["remaining"] if o["remaining"] is not None else (o["amount"] or 0.0)
+            if o.get("triggerPrice") is not None and is_desk_cid(o.get("clientOrderId")):
+                desk_levels.append(float(o["triggerPrice"]))
         if close:
             if n > pos["contracts"]:
                 refuse(f"a close of {n:g} contracts is more than the {pos['contracts']} held")
@@ -497,10 +531,14 @@ class CoinbaseREST:
         if resting + n > pos["contracts"] + 1e-9:
             refuse(f"{resting:g} closing contracts already rest against the {pos['contracts']} held; {n:g} more could "
                    f"open a position")
-        floor = armed.floor
+        floor = armed.floor if protect else None
         if floor and floor.get("side") == pos["side"]:
-            if (trig - float(floor["stop"])) * sign < -PRICE_STEP:
-                refuse(f"the stop at {trig:,.0f} is wider than the saved one ({float(floor['stop']):,.0f})")
+            # a level a desk stop holds now, or held until this client cancelled it this run, loosens nothing
+            held = desk_levels + [level for side, level in self.cancelled_stops if side == closing.lower()]
+            if (trig - float(floor["stop"])) * sign < -PRICE_STEP and \
+                    not any(abs(trig - level) <= PRICE_STEP for level in held):
+                refuse(f"the stop at {trig:,.0f} is wider than the saved one ({float(floor['stop']):,.0f}), and no desk "
+                       f"stop rests at that level or was cancelled from it this run")
 
     # ---- transport
     def _pace(self) -> None:

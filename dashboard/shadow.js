@@ -38,7 +38,7 @@
   // ---- the public status: no amounts, no key needed
   // board: whether the encrypted board is published (a board with no status: BTC/status.json is gone from the branch)
   function statusHtml(st, now, board) {
-    if (!st && board) return `<b class="bad">NOT SAVED: the SHADOW status is missing from the coinbase-state branch</b> (BTC/status.json deleted, say), so this page stops moving. The next SHADOW run writes it back from the saved state (your phone gets BTC SHADOW: NOT SAVED, then working again). If it doesn't come back, put BTC/status.json back as it was (revert the commit that deleted it), or delete the coinbase-state branch to start over (docs/coinbase-setup.md, step 25).`;
+    if (!st && board) return `<b class="bad">NOT SAVED: the SHADOW status is missing from the coinbase-state branch</b> (BTC/status.json deleted, say), so this page stops moving. The next SHADOW run that opens the saved state writes it back from it (your phone gets BTC SHADOW: NOT SAVED, then working again); a run refused over a secret first writes nothing, so fix the secret and wait for the next run. If it doesn't come back, put BTC/status.json back as it was (revert the commit that deleted it), or delete the coinbase-state branch to start over (docs/coinbase-setup.md, step 25).`;
     if (!st) return "No SHADOW status yet: SHADOW starts once the COINBASE_CDP_KEY and DESK_STATE_KEY secrets are set (docs/coinbase-setup.md).";
     const stale = now - st.updated > STALE_MS;
     const state = !st.ok ? `<b class="bad">NOT WORKING (${esc(st.problem || "error")})</b>` + (st.note ? `: ${esc(st.note)}` : "") : stale ? `<b class="bad">NOT UPDATED for ${ago(st.updated, now)}</b>` : `<b class="ok">OK</b>` + (st.note ? ` · <b class="bad">${esc(st.note)}</b>` : "");

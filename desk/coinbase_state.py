@@ -80,6 +80,8 @@ STATUS_KEYS = {"v": int, "mode": str, "coin": str, "product": str, "updated": in
                "checks_passed": (int, type(None)), "checks_total": (int, type(None)), "opened": bool,
                "note": (str, type(None)), "armed": (bool, type(None))}
 PROBLEMS = {None, "auth", "permissions", "clock", "read", "state", "refused", "key"}
+# the note of the status a run writes back from the state it opened, BTC/status.json having gone from beside it
+STATUS_BACK = f"{COIN}/status.json was missing on the coinbase-state branch: this run wrote it back, the next run saves"
 LINK = "120000"                         # git's mode for a symlink (its blob is the link's target)
 KILLS = f"{COIN}/kills.json"
 DESK_KILLS = f"{COIN}/kills.desk.json"
@@ -555,7 +557,13 @@ def check(state_dir: str | Path, remote_ref: str | None = None, branch=None, loa
     if old_raw is None:
         if b.show(f"{COIN}/{state}") is not None and status_only and files[state] == b.show(f"{COIN}/{state}"):
             # you deleted the status: the run that found it gone wrote it back from the state it opened, and saved
-            # that state as it is (nothing replaced: the state on the branch stays exactly as it was)
+            # that state as it is (nothing replaced: the state on the branch stays exactly as it was). Only that run's
+            # status: one written by a run that couldn't open the state (refused over a secret) has none of the
+            # state's counts, and would leave every later run's save refused as another account
+            if new.get("problem") != "state" or new.get("note") != STATUS_BACK or new["runs"] < 1:
+                raise StateCheckError(f"{COIN}/status.json isn't on the branch beside {COIN}/{state}, and this one "
+                                      f"isn't written back from that state (the run couldn't open it): not saving it. "
+                                      f"The next run that opens the state writes it back")
             said.append(f"{COIN}/status.json written back beside the branch's {COIN}/{state}, which is unchanged")
             return said
         if b.show(f"{COIN}/{state}") is not None:

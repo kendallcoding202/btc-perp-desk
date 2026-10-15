@@ -313,6 +313,8 @@ class LiveBroker:
         self._simulated = bool(getattr(self.ex, "is_shadow", False))
         self.unexplained_as_flow = unexplained_as_flow
         self._said: set[str] = set()          # this process's once-only alerts
+        self._cb_cancelled: list[float] = []    # Coinbase: the triggers of the stops cancelled this run (since the last
+        #                                           move): where a stop goes back when the close they went for fails
         self.alerts = []
         self._load_market()
         if max_notional_usd is not None and self.min_cost and max_notional_usd < self.min_cost:
@@ -1548,8 +1550,10 @@ class LiveBroker:
             if lim is None:
                 continue
             if (px - float(lim)) * pos.side.sign < 0:
+                how = ("so the desk closes it at market as soon as Coinbase takes market orders (it's closed now; the "
+                       "stop stays meanwhile)" if self._closed_now() else "so the position is closed at market")
                 self.order_alert(f"the stop at {_trigger(o):,.0f} is past its limit {float(lim):,.0f} ({self.coin} at "
-                                 f"{px:,.2f}): a stop-limit can't fill there, so the position is closed at market")
+                                 f"{px:,.2f}): a stop-limit can't fill there, {how}")
                 self._close(px, self.clock(), "stop")
                 return
 
@@ -1651,6 +1655,8 @@ class LiveBroker:
                 continue
             try:
                 self.ex.cancel_order(o["id"], self.symbol)
+                if _trigger(o) is not None:
+                    self._cb_cancelled.append(_trigger(o))
             except StopAlreadyFilled:
                 return None, []
             except CancelPending as exc:
@@ -1660,6 +1666,8 @@ class LiveBroker:
             except Exception as exc:
                 state = self._cb_order_state(str(o["id"]))
                 if state == "gone":
+                    if _trigger(o) is not None:
+                        self._cb_cancelled.append(_trigger(o))
                     continue
                 if state == "filled":
                     return None, []
@@ -1724,6 +1732,7 @@ class LiveBroker:
         if not self.ex.fits(CB_MOVE_WORST_S + CB_CLOSE_WORST_S):
             self.log(f"{self.coin}: not enough of the run left to move the stop safely; it stays, moved next run")
             return False
+        self._cb_cancelled = []         # what this move cancels: put back if the stop it moves to can't rest
         last = self._last_trade_px()
         if last is not None and (last - stop) * pos.side.sign <= 0:
             self.order_alert(f"{self.coin} last traded {last:,.2f}, already through the stop's new level {stop:,.2f}: "
@@ -1848,17 +1857,29 @@ class LiveBroker:
 
     def _cb_protect_remainder(self) -> None:
         """After a close that failed or went part way: a stop back on what Coinbase still holds (never on more), with
-        no close-at-market fallback (a close is what just failed). Never resting: the urgent alert."""
+        no close-at-market fallback (a close is what just failed): at the desk's level, else, when the price is
+        through it (the stop was hit: that's why it closed), at the trigger of a stop the close (or the move before
+        it) cancelled, the tightest the price isn't through. Never resting: the urgent alert."""
         from .coinbase import StopThroughMarket
 
         pos = self.position
         if pos is None or not pos.stop:
             return
+        sign = pos.side.sign
+        levels = [pos.stop] + sorted({t for t in self._cb_cancelled if (pos.stop - t) * sign > 1e-9},
+                                     key=lambda t: -sign * t)
+        ok, err = False, ""
         with self._protecting():
-            try:
-                ok, err = self._cb_place_until_rests(pos.stop)
-            except StopThroughMarket as exc:
-                ok, err = False, str(exc)
+            for level in levels:
+                try:
+                    ok, err = self._cb_place_until_rests(level)
+                except StopThroughMarket as exc:
+                    ok, err = False, str(exc)
+                    continue
+                break
+        if ok and not math.isclose(self._px(levels[0]), self.stop_px or 0.0, rel_tol=1e-9):
+            self.log(f"{self.coin}: the price is through the stop's level {pos.stop:,.2f}: the stop went back at "
+                     f"{self.stop_px:,.2f}, where the stop cancelled for the close was")
         if not ok and err != "flat":
             self._cb_no_stop(f"a close didn't go through and its stop couldn't be put back ({err})")
 

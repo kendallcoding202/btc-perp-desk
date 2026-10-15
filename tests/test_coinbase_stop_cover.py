@@ -303,4 +303,4 @@ def test_a_protect_scope_client_cancels_only_the_desks_own_orders_on_the_product
     assert fake.orders[mine]["status"] == "CANCELLED"
     from desk.brokers.coinbase_rest import CoinbaseREST
     assert "the caller stays responsible for putting back any protection" in " ".join(
-        CoinbaseREST._protect_check.__doc__.split())
+        CoinbaseREST._order_check.__doc__.split())

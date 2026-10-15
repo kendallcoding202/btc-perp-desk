@@ -130,7 +130,8 @@ def test_a_state_key_with_a_line_break_is_refused_status_only_and_said(first, ta
 
 def test_the_guide_says_a_refused_first_run_saves_no_state_and_a_missing_secret_skips_the_job():
     guide = (ROOT / "docs" / "coinbase-setup.md").read_text()
-    assert "Until SHADOW has had a run that works, a refused run saves only its status, never a state" in guide
+    assert "Until SHADOW has had a run that works, a run that's refused or stops part way saves only its status, " \
+           "never a state" in guide
     assert "Keep the same `DESK_STATE_KEY` while you do" not in guide
     assert "**DESK_STATE_KEY looks like the key file:**" in guide and "**DESK_STATE_KEY has a line break" in guide
     assert "the `shadow` job is skipped and stays green. It sends no push and writes no status" in guide
