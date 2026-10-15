@@ -710,4 +710,4 @@ def test_ops5_a_short_state_key_writes_a_status_and_the_save_check_takes_it_alon
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
     monkeypatch.chdir(repo)
     assert cs.check(sh.dir, "refs/remotes/origin/coinbase-state") == [
-        "a status-only save: SHADOW was refused over its secrets before it had a state"]
+        "a status-only save: SHADOW was refused before it ever had a state"]

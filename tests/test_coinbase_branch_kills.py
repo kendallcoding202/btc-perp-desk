@@ -17,6 +17,7 @@ Everything runs against the local fake Coinbase (tests/fake_coinbase.py) on 127.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -346,7 +347,7 @@ def test_renaming_kills_json_then_deleting_the_renamed_one_never_clears_a_desk_k
     assert json.loads(br.files()["BTC/kills.json"])["entry_kill"] is True
 
 
-def test_a_kills_json_you_delete_while_a_run_is_under_way_stays_deleted(world):
+def test_a_kills_json_you_delete_while_a_run_is_under_way_turns_your_switches_off(world):
     sh, fake, br, job = world
     br.edit(_kills(b'{"flat_kill": true}'))
     _next(fake)
@@ -356,6 +357,10 @@ def test_a_kills_json_you_delete_while_a_run_is_under_way_stays_deleted(world):
     assert saved, br.errors
     k = cs.read_kills(br.files().get("BTC/kills.json"))[0]
     assert k["flat_kill"] is False                                       # before: written back from the load
+    # the save writes a fresh kills.json, every switch false (docs/coinbase-setup.md step 24 says so)
+    assert json.loads(br.files()["BTC/kills.json"]) == {"flat_kill": False, "entry_kill": False, "jev_kill": False}
+    guide = (Path(__file__).resolve().parents[1] / "docs" / "coinbase-setup.md").read_text()
+    assert "turns your switches off: that run acted on the copy it loaded, and its save writes a fresh" in guide
     _next(fake)
     code, r, changed, saved = job.run()
     assert r.kills_now().flat_kill is False

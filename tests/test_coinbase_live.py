@@ -36,7 +36,7 @@ def fake():
 
 
 def broker(fake, tmp_path, rest=None, *, cap=1_000.0, alerts=None, rules=True, **kw):
-    rest = rest or arm_rest(fake)
+    rest = rest or arm_rest(fake, cap=cap or 1_000.0)    # the cap arm() was given, as LiveRun passes both the same
     ex = cb.CoinbaseExchange(rest)
     alerts = alerts if alerts is not None else []
     b = LiveBroker(params_for("BTC"), exchange=ex, state_path=tmp_path / "BTC" / "live_position.json",

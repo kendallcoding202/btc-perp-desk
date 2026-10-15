@@ -2,8 +2,9 @@
 
 CoinbaseREST (desk/brokers/coinbase_rest.py) refuses every POST, before a socket opens, unless it was built with a valid
 Armed token; this module is the only place one is made (tests/test_coinbase_lock.py scans desk/ for any other
-"Armed(" or "armed="). A token names the product and the cap it was armed for and lives 15 minutes: one run. Its scope
-is "trade" (every order the desk sends) or "protect" (only cancels and orders that can only shrink the position held:
+"Armed(" or "armed="). A token names the product and the cap it was armed for and lives 15 minutes: one run; the client
+sends no order for another product and no entry over that cap, whatever the scope. Its scope is "trade" (every order
+the desk sends) or "protect" (only cancels of the desk's own orders, and orders that can only shrink the position held:
 the client checks each one against the position it reads just before, below).
 
 arm() makes one only after the checks pass, and prints each as PASS or FAIL. The local ones come first, before any
@@ -309,4 +310,5 @@ def arm(key: CdpKey, *, env, max_notional: float | None, gate, force_unproven: b
     client = CoinbaseREST(key, armed=token, base_url=base_url, clock=clock, sleep=sleep, deadline_s=deadline_s,
                           emit=emit)
     client.skew_s, client.slowest_s = rest.skew_s, rest.slowest_s
+    client.key_perms = dict(ex.permissions or {})       # read and checked above: the run doesn't read them again
     return client, token

@@ -146,7 +146,7 @@ def test_open_orders_read_open_then_pending_queued_and_cancel_queued(fake):
 
 
 def test_fills_are_this_products_by_entry_id_and_adjusted_rows_are_alerted_once(fake):
-    rest = arm_rest(fake)
+    rest = arm_rest(fake, cap=5_000.0)     # two contracts: within the token's cap
     alerts: list[str] = []
     ex = adapter(rest, alerts)
     ex.load_markets()
@@ -198,7 +198,7 @@ def test_without_an_armed_client_no_order_goes_out(fake):
 
 
 def test_a_stop_that_would_be_more_than_the_position_or_with_no_position_is_refused_unsent(fake):
-    rest = arm_rest(fake)
+    rest = arm_rest(fake, cap=5_000.0)     # two contracts: within the token's cap
     ex = adapter(rest)
     ex.load_markets()
     with pytest.raises(cb.OrderRefused, match="no position"):

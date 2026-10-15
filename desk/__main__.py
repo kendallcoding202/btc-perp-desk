@@ -385,14 +385,21 @@ def _live_confirmed() -> bool:
     return os.environ.get("DESK_LIVE_CONFIRM") == LIVE_CONFIRM_PHRASE
 
 
+_PLAIN_USD = re.compile(r"\$?\s*(?:\d+(?:\.\d+)?|\d{1,3}(?:,\d{3})+(?:\.\d+)?)")
+
+
 def max_notional(text) -> float | None:
-    """--max-notional as given, read leniently: a number of USD, with any $, commas, underscores and spaces left out
-    ("1,000", "$1000"); blank, not a number, or not above 0: None. (A repository variable that's deleted or mistyped
-    must never stop Coinbase LIVE before its run starts: once armed, a missing cap is a protect-only run.)"""
-    t = re.sub(r"[\s$,_]", "", str(text or ""))
-    try:
-        v = float(t)
-    except ValueError:
+    """--max-notional as given: a plain number of USD ("1000", "1000.50"), with an optional $ and spaces around it
+    ("$1000", " 1000 "), or with commas only in whole thousands groups ("1,000", "$1,000.50"). Anything else ("1,5",
+    "1000,50", "10 00", "1_000", "1e3"), blank, or not above 0: None, a missing cap, never a cap read 10 or 100 times
+    too large. (A repository variable that's deleted or mistyped must never stop Coinbase LIVE before its run starts:
+    once armed, a missing cap is a protect-only run; at a first start, and on Hyperliquid, a refusal.)"""
+    t = str(text if text is not None else "").strip()
+    if isinstance(text, (int, float)) and not isinstance(text, bool):
+        v = float(text)
+    elif _PLAIN_USD.fullmatch(t):
+        v = float(re.sub(r"[\s$,]", "", t))
+    else:
         return None
     return v if math.isfinite(v) and v > 0 else None
 

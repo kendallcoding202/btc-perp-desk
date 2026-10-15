@@ -395,12 +395,14 @@ class CoinbaseExchange:
 
     def close_worst_s(self, cancels: int) -> float:
         """The worst case of a close that cancels its stop first, in seconds (CoinbaseREST.worst_s): each cancel and
-        two reads of it, the position and orders read again, a protect-only client's own reads, close_position and two
-        reads of it, the position read again after it; and, if the close is refused, the same again to put the stop
-        back. None of it may stop half way, so none of it starts without the time for all of it."""
+        two reads of it (a protect-only client reads the order first too), the position and orders read again, a
+        protect-only client's own reads, close_position and two reads of it, the position read again after it; and, if
+        the close is refused, the same again to put the stop back. None of it may stop half way, so none of it starts
+        without the time for all of it."""
         fresh = 1 + 2 * len(self._sources())
-        check = fresh if getattr(self.rest, "protect_only", False) else 0
-        reqs = 3 * cancels + fresh + check + 3 + fresh + (fresh + check + 3)
+        protect = getattr(self.rest, "protect_only", False)
+        check = fresh if protect else 0
+        reqs = (4 if protect else 3) * cancels + fresh + check + 3 + fresh + (fresh + check + 3)
         worst = getattr(self.rest, "worst_s", None)
         return worst(reqs, (cancels + 3) * READBACK_WAIT_S) if worst is not None else 45.0
 
@@ -651,9 +653,10 @@ class CoinbaseExchange:
     def watchdog(self) -> list[tuple[str, str]]:
         """Read only: what is wrong with the account's protection right now. Any run that can still read the account
         runs this, even one that refuses to act. A stop-limit that triggered and didn't fill, or whose limit the price
-        is past, is no working stop ("gapped"). Closing orders resting for more contracts than the position holds
-        (the desk's and anyone's: with no reduce-only, if they all fire they open the other way) are "overclosing".
-        What it read is kept in `watched` (position, the desk's orders)."""
+        is past, is no working stop ("gapped"). Stops covering less than the position holds leave the rest with none
+        ("unprotected", like no stop at all: only a stop counts, never a limit). Closing orders resting for more
+        contracts than the position holds (the desk's and anyone's: with no reduce-only, if they all fire they open
+        the other way) are "overclosing". What it read is kept in `watched` (position, the desk's orders)."""
         pos, orders = self._fresh()
         self.watched = (pos, orders)
         out = []
@@ -677,7 +680,9 @@ class CoinbaseExchange:
                                            f"the {pos['side']} {pos['contracts']:g} held: Coinbase has no reduce-only, "
                                            f"so if they all fired they would open a position the other way. Cancel the "
                                            f"extra in Coinbase now"))
-            if not stops:
+            theirs = sum(float(o.get("contracts") or 0) for o in self.foreign_on_product(closing)
+                         if o.get("stop") is not None)          # stops that aren't the desk's protect too
+            if not stops and theirs <= 1e-9:
                 out.append(("unprotected", f"the {pos['side']} {pos['contracts']:g} contracts on {self.product} have "
                                            f"no stop resting on Coinbase"))
             else:
@@ -686,15 +691,25 @@ class CoinbaseExchange:
                 except CoinbaseError:
                     last = None
                 sign = 1 if pos["side"] == "long" else -1
+                gapped = False
+                cover = theirs
                 for o in stops:
                     hit = o.get("triggerStatus") == "STOP_TRIGGERED"
                     if hit or (last is not None and o.get("price") is not None and (last[0] - o["price"]) * sign < 0):
+                        gapped = True
                         out.append(("gapped", f"the stop {o['id']} at {o['triggerPrice']:,.0f} on the {pos['side']} "
                                               f"{pos['contracts']:g} contracts on {self.product} "
                                               + ("triggered and didn't fill" if hit else
                                                  f"is past its limit {o['price']:,.0f}")
                                               + ": a stop-limit doesn't fill past its limit, so the position has no "
                                                 "working stop. Close it in Coinbase now"))
+                    elif not o.get("cancel_queued"):
+                        cover += float(o["remaining"] if o.get("remaining") is not None else (o.get("amount") or 0))
+                if not gapped and cover + 1e-9 < pos["contracts"]:
+                    # only part of the position has a stop (it grew in the app, say): the rest has none
+                    out.append(("unprotected", f"the stops resting on the {pos['side']} {pos['contracts']:g} contracts "
+                                               f"on {self.product} cover only {cover:g} of them: "
+                                               f"{pos['contracts'] - cover:g} have no stop on Coinbase"))
         for p in self.foreign["positions"]:
             out.append(("foreign", f"a {p['side']} {p['contracts']} on {p['product_id']} (not the desk's)"))
         for o in self.foreign["orders"]:

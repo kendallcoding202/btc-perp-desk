@@ -9,11 +9,14 @@ What it can't do is the point:
   * POST only with a valid Armed token (desk/coinbase_live.py, the one place that makes one, after every arming check),
     and even then only to ORDER_PATHS: create an order, batch-cancel, close a position. Without it every POST raises
     OrdersLocked before a socket opens: SHADOW holds a client built with no token, so even a bug in its overlay can't
-    reach the exchange. A PROTECT-ONLY token (an armed LIVE whose new-risk check failed this run) lets through only what
+    reach the exchange. Whatever the token's scope, an order or a close is refused unless it is for the product the
+    token was armed for, and an entry unless its contracts at Coinbase's price, read just before, are within the token's
+    cap (_scope_check). A PROTECT-ONLY token (an armed LIVE whose new-risk check failed this run) lets through only what
     can't add risk, checked here against the position and every open order on the product read just before
     (_protect_check: every open status, a QUEUED one included, a CANCEL_QUEUED one counted for nothing since Coinbase
     cancels it at the reopen before anything trades; and every placement source the desk reads, the app's included),
-    and only in the exact shapes coinbase_orders builds: a cancel; a close of at most the contracts
+    and only in the exact shapes coinbase_orders builds: a cancel of the desk's own orders on the product (each read
+    first; not checked for the protection it takes away, which the caller puts back); a close of at most the contracts
     held that leaves no more closing contracts resting than the position it leaves; a stop-limit on the closing side
     (its stop_direction that side's, its limit on the closing side of its trigger) that, with the closing contracts
     already resting, covers at most the position, and is no wider than the saved stop. An entry, an add, a stop on the
@@ -65,6 +68,7 @@ POST_RETRIES = 2
 BACKOFF_S = 2.0
 BACKOFF_CAP_S = 20.0
 PROTECT_S = 60.0            # how far past the run's deadline a protective sequence may go (protecting())
+CAP_MOVE = 0.01             # an entry may be this much over the cap at the price the client reads (_scope_check)
 MIN_REQUEST_S = 2.0         # what one request is counted as, at least, in a sequence's worst case (worst_s)
 ERROR_BODY_MAX = 64_000
 USER_AGENT = "btc-perp-desk"
@@ -208,6 +212,7 @@ class CoinbaseREST:
         self.min_gap_s = min_gap_s
         self._emit, self._env = emit, env
         self.skew_s: float | None = None        # Coinbase's clock minus this machine's, once measured
+        self.key_perms: dict | None = None      # the key's permissions, as arm() read them for an order client
         self.requests = 0
         self.posts_sent = 0                     # non-GET requests that left this process (each try)
         self.posts_paths: list[str] = []        # each order call asked for (its path's last part), for the run's report
@@ -338,7 +343,10 @@ class CoinbaseREST:
 
     def post(self, path: str, body: dict) -> dict:
         """An order call. Refused before anything is sent unless this client holds a valid Armed token, and even then
-        unless `path` is one of ORDER_PATHS."""
+        unless `path` is one of ORDER_PATHS. Whatever the token's scope: an order or a close for any product but the
+        one the token was armed for is refused, and so is an entry (an order that isn't a stop-limit) bigger than the
+        token's cap at Coinbase's price read just before (_scope_check). A protect-only token's calls are checked
+        further (_protect_check)."""
         from ..coinbase_live import Armed       # the lock (imported here: coinbase_live imports this module)
 
         armed = self._armed
@@ -348,17 +356,62 @@ class CoinbaseREST:
                                f"Going live on Coinbase)")
         if path not in ORDER_PATHS:
             raise PathNotAllowed(f"POST {path} isn't an order call the desk makes; refused before anything was sent")
+        self._scope_check(path, body, armed)
         if armed.scope != "trade":
             self._protect_check(path, body, armed)
         data = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()     # the same bytes on every retry
         return self._request("POST", path, None, data, auth=True, retries=POST_RETRIES)
 
+    def _scope_check(self, path: str, body: dict, armed) -> None:
+        """What every token names, checked for every scope before anything is sent: an order or a close is for the
+        product the token was armed for (a cancel names no product: a protect-only token's are read, _protect_check),
+        and an entry (any order body that isn't the protective stop-limit) is no bigger than the token's cap: its
+        contracts at Coinbase's price for its side, read now, may be at most the cap and CAP_MOVE more (the price can
+        move between the desk sizing it and this read). No fresh price: refused, as LiveBroker skips an entry then."""
+        from ..thresholds import COINBASE
+        from .coinbase_orders import amount
+
+        def refuse(why: str):
+            raise OrdersLocked(f"POST {path} refused before anything was sent: {why}")
+
+        b = body if isinstance(body, dict) else {}
+        if path == f"{_V3}/orders/batch_cancel":
+            return
+        if b.get("product_id") != armed.product:
+            refuse(f"it is for {str(b.get('product_id'))[:40]!r}, not {armed.product}, the one product this run was "
+                   f"armed for")
+        if path != f"{_V3}/orders":
+            return
+        cfg = b.get("order_configuration") if isinstance(b.get("order_configuration"), dict) else {}
+        if set(cfg) == {"stop_limit_stop_limit_gtc"}:
+            return              # the protective stop (the adapter sizes it against the position it reads first)
+        sizes = [v.get("base_size") for v in cfg.values() if isinstance(v, dict)]
+        try:
+            n = sum(amount(s, "base_size") for s in sizes) if sizes else None
+        except CoinbaseDataError:
+            n = None
+        if not n or n <= 0:
+            refuse("its size can't be read, so it can't be checked against the cap")
+        r = self.get(f"{_V3}/best_bid_ask", {"product_ids": armed.product})
+        book = next((x for x in r.get("pricebooks") or [] if x.get("product_id") == armed.product), {}) \
+            if isinstance(r, dict) else {}
+        side = book.get("asks" if b.get("side") == "BUY" else "bids") or []
+        px = amount((side[0] or {}).get("price"), "price", required=False) if side else None
+        if not px or px <= 0:
+            refuse("there's no price from Coinbase to check it against the cap")
+        notional = n * COINBASE.contract_size * px
+        if not armed.cap or notional > armed.cap * (1 + CAP_MOVE):
+            refuse(f"{n:g} contracts at {px:,.0f} is ${notional:,.2f}, over the ${armed.cap:,.2f} cap this run was "
+                   f"armed with")
+
     def _protect_check(self, path: str, body: dict, armed) -> None:
-        """A protect-only token's order: only a cancel, or an order that can only shrink the position Coinbase holds
-        now, in the exact shape coinbase_orders builds. The position and every open order on the product are read
-        here, just before (every open status and every placement source the desk reads: a stop queued while Coinbase
-        is closed, or one placed in the app, closes as much as any). Anything else raises OrdersLocked, before
-        anything is sent."""
+        """A protect-only token's order: only a cancel of the desk's own orders on the armed product (each read first),
+        or an order that can only shrink the position Coinbase holds now, in the exact shape coinbase_orders builds.
+        The position and every open order on the product are read here, just before (every open status and every
+        placement source the desk reads: a stop queued while Coinbase is closed, or one placed in the app, closes as
+        much as any). Anything else raises OrdersLocked, before anything is sent. A cancel isn't checked for the
+        protection it removes (a stop cancelled for a close comes off before the close can go): the caller stays
+        responsible for putting back any protection a cancel took away (the safety pass's put_back)."""
         from .coinbase_orders import STOP_LIMIT_FALLBACKS, PRICE_STEP, amount, is_desk_cid, parse_order, \
             parse_position
 
@@ -372,6 +425,17 @@ class CoinbaseREST:
             if set(b) != {"order_ids"} or not isinstance(ids, list) or not ids or \
                     not all(isinstance(i, str) and i for i in ids):
                 refuse("its body isn't a cancel the desk builds")
+            for oid in ids:
+                # only the desk's own orders on the armed product: never one placed in the app, or on another product.
+                # Not checked: the protection a cancel takes away. The caller that cancels a stop (the safety pass's
+                # close, desk/coinbase_run.py) puts it back if what it cancelled it for doesn't go through.
+                if not re.fullmatch(_ID, oid):
+                    refuse(f"order id {oid[:40]!r} isn't one Coinbase gives")
+                o = parse_order(self.get(f"{_V3}/orders/historical/{oid}").get("order") or {})
+                src = o.get("placement")
+                if o.get("symbol") != armed.product or not is_desk_cid(o.get("clientOrderId")) or \
+                        src not in (None, "", "RETAIL_ADVANCED", *self.learned_sources):
+                    refuse(f"order {oid} isn't one of the desk's own orders on {armed.product}")
             return
         close = path == f"{_V3}/orders/close_position"
         want = {"client_order_id", "product_id", "size"} if close else \

@@ -301,9 +301,12 @@ def test_the_documented_live_step_runs_its_safety_pass_whatever_max_notional_say
 def test_max_notional_is_read_leniently():
     from desk.__main__ import max_notional
 
-    assert [max_notional(v) for v in ("1000", "1,000", "$1,000.50", " 1_000 ", 50.0)] == [1000.0, 1000.0, 1000.5,
-                                                                                          1000.0, 50.0]
+    assert [max_notional(v) for v in ("1000", "1,000", "$1,000.50", " 1000 ", "$ 1000", "12,345,678", 50.0)] == \
+        [1000.0, 1000.0, 1000.5, 1000.0, 1000.0, 12345678.0, 50.0]
     assert [max_notional(v) for v in ("", None, "abc", "0", "-5", "nan", "inf", "1.2.3")] == [None] * 8
+    # a decimal comma, a stray comma or space, an underscore: a missing cap, never one read 10 or 100 times too large
+    assert [max_notional(v) for v in ("1,5", "1000,50", "10 00", " 1_000 ", "1,0000", "1e3", "$$1000", "1000$",
+                                      ",100", "1,000,00")] == [None] * 10
 
 
 def test_a_go_live_gate_that_cant_be_read_is_a_gate_that_doesnt_pass_never_a_crash(world, monkeypatch, capsys):

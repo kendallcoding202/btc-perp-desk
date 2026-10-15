@@ -24,8 +24,11 @@ the load extracted it (the run wrote something it never saves; without the loade
 branch), an encrypted file that isn't an envelope, a status or kills.set.json that isn't what the desk writes
 (status keys and values are whitelisted, so a bug can't put an amount in it), and a younger state: the same start
 time as the branch's, and more runs, or as many runs with the very same state file. A run refused over its secrets
-(problem "key") saves its status alone: the state file as loaded, or none yet on a first save; such a status with no
-state beside it (runs 0) is no account, so the first run that has a state (the secret fixed) saves as a first save.
+(problem "key"), or a SHADOW refused before it ever had a working run (any problem), saves its status alone: the state
+file as loaded, or none yet on a first save; such a status with no state beside it (runs 0) is no account, so the
+first run that has a state (whatever was refused, fixed) saves as a first save. A status you deleted beside the state
+is written back by the next run, the state as it was (nothing else saved); with no status and a state changed, check
+refuses (not replacing a state blind).
 stage copies the desk's files into a fresh tree, keeps every file of yours on the branch as it is now (any file that
 isn't the desk's: notes, say; one you deleted since the load stays deleted; a .gitattributes is dropped, since it would
 change how git stores the desk's files; .github/ is kept exactly as it is), writes the branch's kills.json (your edits)
@@ -41,11 +44,11 @@ exactly as you wrote it, so every run reads it the same way and says so until yo
 can't read the file is kept in kills.desk.json and written into kills.json at the first save that can: fixing the typo
 never turns it off, nor does deleting or renaming kills.json (the next save writes a new one with it on); setting it to
 false in a kills.json the desk can read, once it's there, does (kills_effective). A kills.json you delete while a run is
-under way stays deleted, your switches with it. A file of yours named like a kill switch anywhere on the branch
-(kill_like) turns entry_kill on, said so. LIVE counts on this branch only once it has armed: its status says "armed":
-true. A LIVE run that never armed saves nothing (desk/coinbase_run.py), check refuses a LIVE status that isn't armed,
-and a LIVE status without it (a LIVE attempt that never armed, before this rule) is no LIVE start: SHADOW saves over it
-and stage drops its files.
+under way turns your switches off: that run's save writes a fresh one, every switch false (the desk's own kills on). A
+file of yours named like a kill switch anywhere on the branch (kill_like) turns entry_kill on, said so. LIVE counts on
+this branch only once it has armed: its status says "armed": true. A LIVE run that never armed saves nothing
+(desk/coinbase_run.py), check refuses a LIVE status that isn't armed, and a LIVE status without it (a LIVE attempt that
+never armed, before this rule) is no LIVE start: SHADOW saves over it and stage drops its files.
 
 check runs against the branch as git has it (GitBranch) or, inside a run, as the run loaded it (Loaded: the load step
 extracts the branch into the state dir), so a run can tell before the save step that its save would be refused.
@@ -534,27 +537,38 @@ def check(state_dir: str | Path, remote_ref: str | None = None, branch=None, loa
     new = check_status(_json(files["status.json"], f"{COIN}/status.json"))
     mode = new["mode"].lower()
     state = f"state-{mode}.enc.json"
-    status_only = new.get("problem") == "key" and new.get("ok") is False
+    # a run refused before it could save a state (over its secrets, or before SHADOW ever worked) saves its status
+    # alone: never a state, only the status beside the state as it was (or none)
+    status_only = new.get("problem") is not None and new.get("ok") is False
     if new["mode"] == "LIVE" and new.get("armed") is not True:
         raise StateCheckError(f"{COIN}/status.json is a LIVE status that isn't armed: a LIVE run that never armed "
                               f"saves nothing (it isn't a LIVE start)")
     if state not in files:
         if status_only and new["runs"] == 0 and b.show(f"{COIN}/{state}") is None:
-            said.append(f"a status-only save: {new['mode']} was refused over its secrets before it had a state")
+            said.append(f"a status-only save: {new['mode']} was refused before it ever had a state")
             return said
+        if b.show(f"{COIN}/{state}") is not None:
+            raise StateCheckError(f"{COIN}/{state} is on the branch but this run has none: not saving a status beside "
+                                  f"a state it didn't load")
         raise StateCheckError(f"{COIN}/{state} is missing next to a {new['mode']} status")
     old_raw = b.show(f"{COIN}/status.json")
     if old_raw is None:
+        if b.show(f"{COIN}/{state}") is not None and status_only and files[state] == b.show(f"{COIN}/{state}"):
+            # you deleted the status: the run that found it gone wrote it back from the state it opened, and saved
+            # that state as it is (nothing replaced: the state on the branch stays exactly as it was)
+            said.append(f"{COIN}/status.json written back beside the branch's {COIN}/{state}, which is unchanged")
+            return said
         if b.show(f"{COIN}/{state}") is not None:
-            raise StateCheckError(f"the branch has {COIN}/{state} but no status.json: not replacing it blind")
+            raise StateCheckError(f"the branch has {COIN}/{state} but no status.json (deleted?): not replacing the "
+                                  f"state blind. Put {COIN}/status.json back as it was (revert the commit that deleted "
+                                  f"it), or delete the coinbase-state branch to start over")
         said.append("no saved state on the branch: a first save")
         return said
     old = check_status(_json(old_raw, f"saved {COIN}/status.json"), f"saved {COIN}/status.json")
     if old["mode"] == new["mode"] and old["runs"] == 0 and b.show(f"{COIN}/{state}") is None:
-        # the status-only save of a run refused over its secrets before it ever had a state: no account yet, so the
-        # first run that has one (its secrets fixed) is the first save, whatever start it gives
-        said.append(f"a first save: the branch's {old['mode']} status is a run refused over its secrets before it had "
-                    f"a state")
+        # the status-only save of a run refused before it ever had a state: no account yet, so the first run that has
+        # one (its secrets fixed) is the first save, whatever start it gives
+        said.append(f"a first save: the branch's {old['mode']} status is a run refused before it ever had a state")
         return said
     if _never_armed(old):
         # the files of a LIVE attempt that never armed (saved before LIVE saved only once armed): no LIVE start
@@ -578,16 +592,21 @@ def check(state_dir: str | Path, remote_ref: str | None = None, branch=None, loa
             return said
         raise StateCheckError(f"the branch's state is {old['mode']}, this run's {new['mode']}: not saving over it")
     if new["started_ts"] != old["started_ts"]:
+        gone = b.show(f"{COIN}/{state}") is None
         raise StateCheckError(f"{COIN}/{state} would replace the saved {old['mode']} account (started "
                               f"{old['started_ts']}, {old['runs']} runs) with one started {new['started_ts']}: "
-                              f"not saving (a reset needs a deliberate manual edit of the branch)")
+                              f"not saving. " + (f"{COIN}/{state} isn't on the branch (deleted?): put it back as it "
+                                                 f"was (revert the commit that deleted it), or delete the "
+                                                 f"coinbase-state branch to start over" if gone else
+                                                 "To start over, delete the coinbase-state branch"))
     if new["runs"] < old["runs"]:
         raise StateCheckError(f"{COIN}/{state} has {new['runs']} runs, the saved one {old['runs']}: a younger state, "
                               f"not saving")
     if new["runs"] == old["runs"] and files[state] != (b.show(f"{COIN}/{state}") or b""):
         raise StateCheckError(f"{COIN}/{state} changed but its run count didn't: not saving")
     if status_only and new["runs"] == old["runs"]:
-        said.append(f"a status-only save: {new['mode']} was refused over its secrets; its state is as loaded")
+        said.append(f"a status-only save: {new['mode']} was refused before it could save a state; its state is as "
+                    f"loaded")
         return said
     said.append(f"{new['mode']} state: {old['runs']} -> {new['runs']} runs, same start")
     return said

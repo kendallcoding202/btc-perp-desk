@@ -36,11 +36,14 @@
   }
 
   // ---- the public status: no amounts, no key needed
-  function statusHtml(st, now) {
+  // board: whether the encrypted board is published (a board with no status: BTC/status.json is gone from the branch)
+  function statusHtml(st, now, board) {
+    if (!st && board) return `<b class="bad">NOT SAVED: the SHADOW status is missing from the coinbase-state branch</b> (BTC/status.json deleted, say), so this page stops moving. The next SHADOW run writes it back from the saved state (your phone gets BTC SHADOW: NOT SAVED, then working again). If it doesn't come back, put BTC/status.json back as it was (revert the commit that deleted it), or delete the coinbase-state branch to start over (docs/coinbase-setup.md, step 25).`;
     if (!st) return "No SHADOW status yet: SHADOW starts once the COINBASE_CDP_KEY and DESK_STATE_KEY secrets are set (docs/coinbase-setup.md).";
     const stale = now - st.updated > STALE_MS;
     const state = !st.ok ? `<b class="bad">NOT WORKING (${esc(st.problem || "error")})</b>` + (st.note ? `: ${esc(st.note)}` : "") : stale ? `<b class="bad">NOT UPDATED for ${ago(st.updated, now)}</b>` : `<b class="ok">OK</b>` + (st.note ? ` · <b class="bad">${esc(st.note)}</b>` : "");
-    return `${esc(st.mode)} ${state} · updated ${when(st.updated)} (${ago(st.updated, now)}) · run ${esc(st.runs)}` +
+    return `${esc(st.mode)} ${state} · updated ${when(st.updated)} (${ago(st.updated, now)}) · ` +
+      (st.runs ? `run ${esc(st.runs)}` : "no run has worked yet") +
       (st.failed_runs ? ` (${esc(st.failed_runs)} failed)` : "") +
       ` · key ${st.key_view_only ? "View only" : st.key_view_only === false ? "<b class='bad'>NOT view only</b>" : "not checked"}` +
       ` · checks ${esc(st.checks_passed ?? "—")}/${esc(st.checks_total ?? "—")}` +
@@ -144,9 +147,10 @@
     const $ = (id) => document.getElementById(id);
     const now = Date.now();
     let st = null, env = null;
-    try { st = await fetchJson("boards/BTC-SHADOW.status.json"); } catch (e) { $("status").textContent = `couldn't read the status (${e.message})`; }
-    $("status").innerHTML = statusHtml(st, now);
+    let unread = false;
+    try { st = await fetchJson("boards/BTC-SHADOW.status.json"); } catch (e) { unread = true; $("status").textContent = `couldn't read the status (${e.message})`; }
     try { env = await fetchJson("boards/BTC-SHADOW.enc.json"); } catch { env = null; }
+    if (!unread) $("status").innerHTML = statusHtml(st, now, !!env);
     if (!env) { $("lock").hidden = true; $("board").hidden = true; $("foot").textContent = "no SHADOW board published yet"; return; }
     if (!password) { $("lock").hidden = false; $("board").hidden = true; return; }
     try {

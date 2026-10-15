@@ -9,11 +9,14 @@ the real deposits and withdrawals, a virtual book for the orders), and records t
 Nothing is sent: its client can't POST at all, and SHADOW refuses any key that can trade or move money.
 
 One run (run_shadow):
-  1. refuse, before any network call, without COINBASE_CDP_KEY or DESK_STATE_KEY (32+ characters), when LIVE runs on
-     this account (state-live.enc.json that has armed, or that DESK_STATE_KEY doesn't open), or when DESK_STATE_KEY
-     doesn't open the saved state (never a new state over it); a LIVE state that never armed is no LIVE start;
+  1. refuse, before any network call, without COINBASE_CDP_KEY or DESK_STATE_KEY (32+ characters, no line break, not
+     the key file: the two secrets swapped), when LIVE runs on this account (state-live.enc.json that has armed, or
+     that DESK_STATE_KEY doesn't open), or when DESK_STATE_KEY doesn't open the saved state (never a new state over
+     it); a LIVE state that never armed is no LIVE start;
   2. from here every run saves (changed=true is written first): the state, the board and a public status (LIVE: only
-     once it has armed; a LIVE run that stops before it ever armed saves nothing, so it changes nothing for SHADOW);
+     once it has armed; a LIVE run that stops before it ever armed saves nothing, so it changes nothing for SHADOW).
+     A SHADOW that has never had a working run, refused at step 3, saves its status alone: never a state that a later,
+     corrected DESK_STATE_KEY would have to open;
   3. the key, its masks on Actions, the clock against Coinbase's, and the key's permissions (View only, or refuse);
   4. the real account: balance, positions, open orders, fills, the fee tier, sweeps, the margin window, the USD wallet
      and its deposits and withdrawals; each read is one line of the checklist on the board;
@@ -31,13 +34,15 @@ board; what reaches the Actions log is the masks and one fixed line with no amou
 ntfy.sh, where anyone who knows the topic's name can read them: without NTFY_TOKEN (an ntfy access token, for a
 reserved topic) their amounts are left out (redact_amounts); the encrypted board has them.
 
-LIVE also runs a safety pass first, right after its arming and the key's permissions, before any market read: the
-position and the open orders, read fresh; a stop put back on a position that has none, any desk order left resting
-with no position cancelled, desk stops covering more than the position cut back, flat_kill honoured. Its close cancels
-the stop first (no reduce-only), so it starts only when it can go through (Coinbase reads open, and there's the time
-for the whole sequence at the speed Coinbase answers), puts the stop back if the close is refused, and is said as it
-happened. A run that then can't read the candles or the product still leaves the position protected; and a run that
-fails after it looks once more (the watchdog) and pushes urgently.
+LIVE also runs a safety pass first, right after its arming (the clock and the key's permissions as arm() read them,
+not read again: nothing between the two can stop the run), before any market read: the position and the open orders,
+read fresh; a stop put back on a position that has none, or topped up on one its stops cover only in part (only a
+stop is cover), any desk order left resting with no position cancelled, desk stops covering more than the position
+cut back (a stop that can still fill kept before one that can't), flat_kill honoured. Its close cancels the stop
+first (no reduce-only), so it starts only when it can go through (Coinbase reads open, and there's the time for the
+whole sequence at the speed Coinbase answers), puts the stop back if the close is refused, and is said as it
+happened: never "protected" unless the pass left it so. A run that then can't read the candles or the product still
+leaves the position protected; and a run that fails after it looks once more (the watchdog) and pushes urgently.
 """
 
 from __future__ import annotations
@@ -48,6 +53,7 @@ import re
 import shutil
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -123,6 +129,8 @@ KILLS_UNREADABLE = "BTC/kills.json on the coinbase-state branch can't be read: r
 KILLS_UNREADABLE_FLAT = KILLS_UNREADABLE + "; flat_kill on: any position is closed"
 KILLS_STRAY = ("a file on the coinbase-state branch looks like a kill switch but isn't BTC/kills.json: read as "
                "entry_kill on, no new entries")
+# the public status's note of a run that wrote BTC/status.json back beside the state (status_written_back)
+STATUS_BACK = "BTC/status.json was missing on the coinbase-state branch: this run wrote it back, the next run saves"
 # DESK_COINBASE_KILL (a repository variable) reads kills.json's switch words (coinbase_state.named_switches): flat,
 # close or flatten anywhere in it is flat_kill, entry (entries, no_entries) entry_kill, both can be set together; a
 # value with neither is entry_kill, alerted (failing closed)
@@ -146,23 +154,36 @@ def redact_amounts(text: str) -> str:
     return _MONEY.sub("…", text)
 
 
-def ntfy_push(title: str, body: str, priority: str = "default", tags: str = "robot", env=None) -> bool:
-    """To the owner's phone (ntfy.sh, NTFY_TOPIC), if set; with NTFY_TOKEN (an ntfy access token), authenticated. A
+NO_TOPIC = "NTFY_TOPIC isn't set"
+
+
+def ntfy_send(title: str, body: str, priority: str = "default", tags: str = "robot", env=None,
+              token: bool = True) -> str | None:
+    """To the owner's phone (ntfy.sh, NTFY_TOPIC), if set; with NTFY_TOKEN (an ntfy access token) and `token`,
+    authenticated. None when it went out; else why not: NO_TOPIC, "HTTP 401" or "HTTP 403" (ntfy.sh refused it: a
+    wrong or expired token), another status, or the error's name (never its text: it could carry the URL's topic). A
     failed push never stops a run."""
     e = env if env is not None else os.environ
     topic = (e.get("NTFY_TOPIC") or "").strip()
     if not topic:
-        return False
+        return NO_TOPIC
     headers = {"Title": title, "Priority": priority, "Tags": tags}
-    token = (e.get("NTFY_TOKEN") or "").strip()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    tok = (e.get("NTFY_TOKEN") or "").strip() if token else ""
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
     req = urllib.request.Request(f"https://ntfy.sh/{topic}", data=body.encode(), method="POST", headers=headers)
     try:
         urllib.request.urlopen(req, timeout=10).read()
-        return True
-    except Exception:
-        return False
+        return None
+    except urllib.error.HTTPError as exc:
+        return f"HTTP {exc.code}"
+    except Exception as exc:        # noqa: BLE001
+        return type(exc).__name__
+
+
+def ntfy_push(title: str, body: str, priority: str = "default", tags: str = "robot", env=None) -> bool:
+    """ntfy_send, with NTFY_TOKEN when it's set: True when it went out."""
+    return ntfy_send(title, body, priority, tags, env) is None
 
 
 def github_output(changed: bool, env=None) -> None:
@@ -633,6 +654,11 @@ class Run:
         self.live_leftover = False          # SHADOW: a never-armed LIVE attempt's files are here (dropped on save)
         self.replaces_leftover = False      # LIVE: the saved LIVE state is one, and this run doesn't carry on from it
         self.refused_before_state = False
+        self.never_worked = False           # SHADOW has never had a working run here (execute)
+        self.push_failures: list[str] = []  # pushes that didn't go out this run (push): the log and the board say so
+        self._log_before: list = []
+        self._board_base: dict | None = None
+        self.key_passed = False             # the key and its permissions passed this run (body)
         self.protect_failed: tuple = ()     # LIVE: the new-risk checks this armed run failed (a protect-only run)
         self.safety_state = ""              # LIVE: what the safety pass found when it had nothing to do
         self.safety_end: str | None = None  # LIVE: the position after it: flat, protected, unprotected, unknown
@@ -644,14 +670,41 @@ class Run:
         self.lines.append(f"{_utc(int(self.clock() * 1000), '%H:%M:%S')} {text}")
 
     def push(self, title: str, body: str, priority: str = "default", tags: str = "robot") -> None:
-        """To the phone. Without NTFY_TOKEN the topic is readable by anyone who knows its name: no amounts."""
-        if not (self.env.get("NTFY_TOKEN") or "").strip():
+        """To the phone. Without NTFY_TOKEN the topic is readable by anyone who knows its name: no amounts. A push
+        with NTFY_TOKEN that doesn't go out (ntfy.sh refuses a wrong or expired token, even on a public topic) is sent
+        again without it, its amounts left out, saying the token was refused; one that still doesn't go out is
+        recorded (push_failed): the run's log and the board say so."""
+        token = bool((self.env.get("NTFY_TOKEN") or "").strip())
+        if not token:
             clean = redact_amounts(body)
             body = clean if clean == body else f"{clean}\n\n{REDACTED_NOTE.format(mode=self.mode.upper())}"
+        why = self._send(title, body, priority, tags, token)
+        if why is None or why == NO_TOPIC:
+            return
+        if not token:
+            return self.push_failed(title, why)
+        refused = why in ("HTTP 401", "HTTP 403")
+        note = (f"NTFY_TOKEN was refused by ntfy.sh ({why})" if refused else
+                f"the push with NTFY_TOKEN didn't go out ({why})") + \
+            (f": this one came without it, so its amounts are left out (they're on the {self.mode.upper()} board, "
+             f"encrypted). Check the NTFY_TOKEN secret (docs/coinbase-setup.md, step 22)")
+        again = self._send(title, f"{redact_amounts(body)}\n\n({note})", priority, tags, False)
+        self.push_failed(title, f"with NTFY_TOKEN: {why}" +
+                         ("; sent again without it" if again is None else f"; again without it: {again}"))
+
+    def _send(self, title: str, body: str, priority: str, tags: str, token: bool) -> str | None:
+        """One push: None when it went out, else why not (ntfy_send). The tests' hook: whatever it returns, a text
+        being why it didn't go out."""
         if self._push is not None:
-            self._push(title, body, priority, tags)
-        else:
-            ntfy_push(title, body, priority, tags, self.env)
+            got = self._push(title, body, priority, tags)
+            return got if isinstance(got, str) else None
+        return ntfy_send(title, body, priority, tags, self.env, token=token)
+
+    def push_failed(self, title: str, why: str) -> None:
+        text = f"a push to your phone didn't go out: {title!r} ({why})"
+        self.push_failures.append(text)
+        self.log(text)
+        self.alerts.append(text)
 
     def on_urgent(self, kind: str, text: str) -> None:
         """The broker's urgent cases (a position with no stop, a stop with no position, an order on the product that
@@ -698,6 +751,11 @@ class Run:
             short = bool(self.env.get("DESK_STATE_KEY"))
             raise Stop("key", str(exc), public="DESK_STATE_KEY is too short (it needs thirty-two characters or more)"
                        if short else "DESK_STATE_KEY is not set") from None
+        trouble = self.state_key_trouble(password)
+        if trouble:
+            if live:
+                raise Stop("refused", unsure.format("DESK_STATE_KEY isn't set right"))
+            raise Stop("key", trouble[0], public=trouble[1])
         if live:
             # LIVE counts only once it has armed: a LIVE attempt that refused before it ever armed is no LIVE start
             try:
@@ -714,6 +772,24 @@ class Run:
             raise Stop("key", "COINBASE_CDP_KEY is not set: SHADOW needs the View-only key's file (README, Coinbase "
                               "SHADOW)", public="COINBASE_CDP_KEY is not set")
         return password, raw
+
+    def state_key_trouble(self, password: str) -> tuple[str, str] | None:
+        """(why, its public phrase) when DESK_STATE_KEY, long enough, still can't be the password it must be: the key
+        file (the two secrets swapped, or the file pasted into both), or a password with a line break (the SHADOW
+        page's password field drops line breaks, so the board would never open). Refused as it is, never stripped: a
+        state already sealed with it keeps its key. None: fine."""
+        cdp = (self.env.get("COINBASE_CDP_KEY") or "").strip()
+        low = password.lower()
+        if "privatekey" in low or "-----begin" in low or (cdp and password.strip() == cdp):
+            return ("DESK_STATE_KEY looks like the key file: the two secrets are swapped (or the file was pasted into "
+                    "both). Put the whole downloaded key file in COINBASE_CDP_KEY and a random password of 32 "
+                    "characters or more in DESK_STATE_KEY (docs/coinbase-setup.md, steps 12 and 13)",
+                    "DESK_STATE_KEY looks like the key file (the two secrets are swapped)")
+        if "\r" in password or "\n" in password:
+            return ("DESK_STATE_KEY has a line break in it: set it again without one. The SHADOW page's password "
+                    "field can't hold a line break, so a board sealed with it would never open",
+                    "DESK_STATE_KEY has a line break in it (set it again without one)")
+        return None
 
     def branch_loaded(self):
         """The coinbase-state branch's BTC/ as the load step extracted it here (taken before this run writes)."""
@@ -785,6 +861,18 @@ class Run:
             self.checks.add("key", CHECKS["key"], False, ED25519_REFUSED)
             raise Stop("key", ED25519_REFUSED, public="COINBASE_CDP_KEY isn't an ECDSA key")
         self.rest = self.client_for(key)
+        armed = self.read_by_arm()
+        if armed is not None:
+            # LIVE: arm() has just read Coinbase's clock and the key's permissions, and checked them. They aren't read
+            # again: a read failing now would stop the run before its safety pass, with an order client in hand
+            skew, perms = armed
+            self.checks.add("answered", CHECKS["answered"], True)
+            self.checks.add("clock", CHECKS["clock"], True, f"{-skew + 0.0:+.1f} s")
+            self.now = int(self.rest.now_s() * 1000)
+            self.real = CoinbaseExchange(self.rest, memo=self.account.setdefault("adapter", {}), on_alert=self.on_alert)
+            self.real.permissions = dict(perms)
+            self.checks.add("key", CHECKS["key"], True, f"…{key.tail}")
+            return key, dict(perms)
         try:
             skew = self.rest.server_skew()
             self.checks.add("answered", CHECKS["answered"], True)
@@ -816,6 +904,11 @@ class Run:
                        public="the key's permissions couldn't be read (the next run tries again)") from None
         self.checks.add("key", CHECKS["key"], True, f"…{key.tail}")
         return key, perms
+
+    def read_by_arm(self):
+        """(Coinbase's clock skew, the key's permissions) as arm() read them for the client it just unlocked, or None:
+        SHADOW reads them itself (connect)."""
+        return None
 
     def check_permissions(self, perms: dict) -> None:
         """SHADOW's key: View only, on the Default portfolio (where US futures are), or refused before the account is
@@ -975,13 +1068,29 @@ class Run:
             self.meta = {"started_ts": self.now, "start_equity": 0.0, "last_bar_ts": 0, "runs": 0, "failed_runs": 0,
                          "mode": self.mode, "product": PRODUCT, "opened": None, **(saved_desk.get("meta") or {})}
             self.recorded = list(saved_desk.get("flows") or [])
+            if self.mode == "shadow" and bundle is not None and self.status_gone():
+                return self.status_written_back()
             if self.saves_from_the_start():
                 self.begin_saving()             # written ahead: from here this run is saved, whatever happens
+            # A SHADOW that has never had a working run (no state, or one whose every run failed before any money was
+            # in it): a refusal over the key itself saves its status alone (refused_unworked), never a state a later,
+            # corrected DESK_STATE_KEY would have to open
+            st = self.saved_status() or {}
+            try:
+                worked = st.get("mode") == "SHADOW" and (st.get("opened") is True or
+                                                         int(st.get("runs") or 0) > int(st.get("failed_runs") or 0))
+            except (TypeError, ValueError):
+                worked = False
+            self.never_worked = self.mode == "shadow" and not worked and (bundle is None or (
+                int(self.meta.get("runs") or 0) == int(self.meta.get("failed_runs") or 0)
+                and not self.meta.get("opened") and not float(self.meta.get("start_equity") or 0) > 0))
             ok = False
             try:
                 self.body(work, password, saved_desk)
                 ok = True
             except Stop as s:
+                if self.never_worked and not self.key_passed:
+                    return self.refused_unworked(s)
                 self.problem, self.code = s.problem, s.code
                 self.public_why = s.public
                 self.log(f"stopped: {s.text}")
@@ -1022,46 +1131,108 @@ class Run:
         self.changed = True
         github_output(True, self.env)
 
-    def refused_early(self, s: Stop) -> int:
+    def refused_early(self, s: Stop, status: bool | None = None) -> int:
         """Refused before the state was opened: the saved state stays exactly as it was. A setup slip with the secrets
         (problem "key") still writes the public status (no amount, no digit), so the dashboard says what's wrong
-        instead of nothing: the save step then saves the status alone, the state file as loaded."""
+        instead of nothing: the save step then saves the status alone, the state file as loaded. `status`: write it
+        whatever the problem (refused_unworked)."""
         self.refused_before_state = True
         self.problem, self.code = s.problem, s.code
         self.public_why = s.public
         self.log(f"refused: {s.text}")
-        wrote = s.problem == "key" and self.status_only(s)
+        wrote = (s.problem == "key" if status is None else status) and self.status_only(s)
         github_output(wrote, self.env)
         self.changed = False
         self.public_note = s.text
-        self.refused_push(s)
+        self.refused_push(s, wrote)
+        return self.code
+
+    def refused_unworked(self, s: Stop) -> int:
+        """A SHADOW that has never had a working run, refused over the key itself (connect, check_permissions: the
+        key file, a 401, its permissions, its portfolio, the clock, Coinbase not answering): its status alone, the
+        state as loaded (none, on a first run). Nothing it read is worth keeping, and a state saved now would be sealed
+        with whatever DESK_STATE_KEY holds now (the key file, if the two secrets are swapped), so a corrected one
+        couldn't open it. The next run that works is a first save (coinbase_state.check)."""
+        self.log("SHADOW hasn't had a working run yet: this refusal saves only the status, no state")
+        return self.refused_early(s, status=True)
+
+    def status_gone(self) -> bool:
+        """BTC/status.json isn't on the branch as loaded, but this mode's state is (you deleted the status, say): the
+        save step refuses any new state beside a state with no status ("not replacing it blind"). Only in a state dir
+        that is the coinbase-state branch as the load step extracted it (its README.md, which every save writes, is
+        there): a state dir of your own isn't one."""
+        tree = self.branch_loaded().tree()
+        return "README.md" in tree and f"{COIN}/state-{self.mode}.enc.json" in tree and \
+            f"{COIN}/status.json" not in tree
+
+    def status_written_back(self) -> int:
+        """SHADOW, BTC/status.json gone beside the state it just opened: this run writes the status back from that
+        state's own counts (its start, its runs) and saves nothing else (the save step takes a status written next to
+        the branch's state, unchanged: coinbase_state.check), so the next run saves as usual. Pushed at once (NOT
+        SAVED: this run's own reads aren't saved); nothing is read or sent."""
+        s = Stop("state", f"{COIN}/status.json isn't on the coinbase-state branch (deleted?), beside the saved "
+                          f"state, so the save step would refuse any state saved now. This run wrote the status back "
+                          f"from the state it opened and saved nothing else; the next run saves as usual",
+                 code=1, public=STATUS_BACK)
+        self.refused_before_state = True
+        self.problem, self.code, self.public_why = s.problem, s.code, s.public
+        self.log(f"refused: {s.text}")
+        wrote = self.status_only(s, counts=self.meta)
+        github_output(wrote, self.env)
+        self.changed = False
+        self.public_note = s.text
+        self.push(f"{COIN} SHADOW: NOT SAVED",
+                  f"SHADOW didn't save this run: {COIN}/status.json was missing on the coinbase-state branch "
+                  f"(deleted?), beside the saved state. This run wrote it back from that state and saved nothing else, "
+                  f"so the next run saves as usual (BTC SHADOW: working again). If it doesn't, put {COIN}/status.json "
+                  f"back as it was (revert the commit that deleted it), or delete the coinbase-state branch to start "
+                  f"over. Nothing was sent. Paper is unaffected.", "high", "warning")
         return self.code
 
     def in_window(self) -> bool:
         return self.now % PUSH_EVERY_MS < PUSH_WINDOW_MS
 
-    def first_refusal(self, s: Stop) -> bool:
+    def _shows(self, st: dict, s: Stop) -> bool:
+        """Whether the status `st` is this refusal's own (status_only wrote it)."""
+        return st.get("mode") == self.mode.upper() and st.get("ok") is False and st.get("problem") == s.problem and \
+            st.get("note") == (s.public or "a secret isn't set right")
+
+    def first_refusal(self, s: Stop, wrote: bool | None = None) -> bool:
         """Whether this refusal is news, pushed now rather than only in the 6-hourly window: the public status as
-        loaded (BTC/status.json, plain, readable without DESK_STATE_KEY) is the memo. A refusal over a secret writes
-        itself there (status_only), so it's news when the loaded status doesn't show it yet (an OK one, another reason,
-        or none). Any other refusal writes nothing: it's news when the loaded status was saved by the run before."""
+        loaded (BTC/status.json, plain, readable without DESK_STATE_KEY) is the memo. A refusal that writes itself
+        there (status_only: over a secret, or before SHADOW ever worked) is news when the loaded status doesn't show it
+        yet (an OK one, another reason, or none). Any other refusal writes nothing: it's news when the loaded status
+        was saved by the run before."""
+        wrote = s.problem == "key" if wrote is None else wrote
         st = self.saved_status()
         if not st:
-            return s.problem == "key"
+            return wrote
         if st.get("mode") != self.mode.upper():
             return False
-        if s.problem == "key":
-            return st.get("ok") is not False or st.get("problem") != "key" or \
-                st.get("note") != (s.public or "a secret isn't set right")
+        if wrote:
+            return not self._shows(st, s)
         try:
             return st.get("ok") is True and self.now - int(st.get("updated") or 0) < FRESH_STATUS_MS
         except (TypeError, ValueError):
             return False
 
-    def refused_push(self, s: Stop) -> None:
-        """No state to remember a push in: at the first such refusal (first_refusal), then every 6 hours by the clock
+    def pushed_this_window(self, s: Stop) -> bool:
+        """A refusal that writes its status: the run that wrote the loaded one (this same refusal) ran in this same
+        6-hour window, so it pushed it already. Its "updated" is the memo: one push a window, not one a run."""
+        st = self.saved_status() or {}
+        try:
+            then = int(st.get("updated") or 0)
+        except (TypeError, ValueError):
+            return False
+        return self._shows(st, s) and then // PUSH_EVERY_MS == self.now // PUSH_EVERY_MS and \
+            then % PUSH_EVERY_MS < PUSH_WINDOW_MS and then <= self.now
+
+    def refused_push(self, s: Stop, wrote: bool | None = None) -> None:
+        """No state to remember a push in: at the first such refusal (first_refusal), then once every 6 hours by the
+        clock, in the window's first run (a refusal that writes nothing has no memo: each run in the window pushes)
         (LiveRun: see its own)."""
-        if self.first_refusal(s) or self.in_window():
+        wrote = s.problem == "key" if wrote is None else wrote
+        if self.first_refusal(s, wrote) or (self.in_window() and not (wrote and self.pushed_this_window(s))):
             self.push(f"{COIN} {self.mode.upper()}: not working",
                       f"{self.mode.upper()} didn't run: {s.text.rstrip('. ')}. Nothing was sent. Paper is unaffected.",
                       "high", "warning")
@@ -1074,12 +1245,17 @@ class Run:
             return None
         return st if isinstance(st, dict) else None
 
-    def status_only(self, s: Stop) -> bool:
-        """The public status of a run refused over the secrets, on the last status's counts (same start, same runs:
-        the save step's check takes it with the state file unchanged)."""
+    def status_only(self, s: Stop, counts: dict | None = None) -> bool:
+        """The public status of a run refused over the secrets (or before SHADOW ever worked), on the last status's
+        counts (same start, same runs: the save step's check takes it with the state file unchanged, or with none on
+        the branch while its runs are 0). `counts`: the opened state's meta instead (status_written_back)."""
         p = self.paths["status"]
         old = {}
-        if p.exists():
+        if counts is not None:
+            old = {"mode": self.mode.upper(), "started_ts": counts.get("started_ts"), "runs": counts.get("runs"),
+                   "failed_runs": counts.get("failed_runs"),
+                   "opened": float(counts.get("start_equity") or 0) > 0, "armed": bool(counts.get("armed_at"))}
+        elif p.exists():
             try:
                 old = json.loads(p.read_text())
             except ValueError:
@@ -1089,11 +1265,15 @@ class Run:
         if self.mode == "live" and old.get("armed") is not True:
             return False            # a LIVE that never armed saves nothing, not even a status
         self.dir.mkdir(parents=True, exist_ok=True)
+        rows = self.checks.rows
+        view = next((r["ok"] for r in rows if r["key"] == "view_only"), None) if self.mode == "shadow" else None
         st = {"v": 1, "mode": self.mode.upper(), "coin": COIN, "product": PRODUCT, "updated": self.now,
               "started_ts": int(old.get("started_ts") or self.now), "runs": int(old.get("runs") or 0),
-              "failed_runs": int(old.get("failed_runs") or 0), "ok": False, "problem": "key",
-              "key_view_only": None, "decision": None, "would_send_last_24h": None,
-              "alerts_open": int(old.get("alerts_open") or 0), "checks_passed": None, "checks_total": None,
+              "failed_runs": int(old.get("failed_runs") or 0), "ok": False,
+              "problem": s.problem if s.problem in coinbase_state.PROBLEMS - {None} else "key",
+              "key_view_only": view if isinstance(view, bool) else None, "decision": None,
+              "would_send_last_24h": None, "alerts_open": int(old.get("alerts_open") or 0),
+              "checks_passed": self.checks.passed if rows else None, "checks_total": len(rows) if rows else None,
               "opened": bool(old.get("opened")), "note": s.public or "a secret isn't set right",
               **({"armed": True} if self.mode == "live" else {})}
         tmp = p.with_name(p.name + ".tmp")
@@ -1133,6 +1313,8 @@ class Run:
             found = [("unprotected", f"LIVE stopped part way and couldn't read {PRODUCT}'s position and orders "
                                      f"back: check in Coinbase that the position (if any) has its stop")] \
                 if getattr(self.rest, "posts_paths", None) else []
+            if self.meta.get("armed_at") and hasattr(self, "flat_kill_unread"):
+                self.flat_kill_unread(type(exc).__name__, "LIVE stopped part way")
         pos = (getattr(self.real, "watched", None) or (None, []))[0]
         if pos is not None and self.meta.get("armed_at") and self.kills_now().flat_kill:
             found.append(("flat_kill", f"flat_kill is on and the {pos['side']} {pos['contracts']:g} contracts on "
@@ -1158,12 +1340,16 @@ class Run:
         self.work = work
         key, perms = self.connect()
         self.check_permissions(perms)
+        self.key_passed = True
         self.note_portfolio(perms, work)
         self.safety_pass(work)
         if self.protect_failed:
-            # an armed LIVE whose new-risk check failed: the safety pass protected the position; nothing else is sent
-            raise Stop("refused", f"protect only: {'; '.join(self.protect_failed)}. No new trades this run; the safety "
-                                  f"pass protected the position", public=protect_note(self.protect_failed))
+            # an armed LIVE whose new-risk check failed: the safety pass was all of it; nothing else is sent
+            end = {"flat": "no position is open", "protected": "the safety pass protected the position",
+                   "unprotected": "the position may be without a working stop",
+                   "unknown": "the position couldn't be read"}.get(self.safety_end or "", "the safety pass didn't run")
+            raise Stop("refused", f"protect only: {'; '.join(self.protect_failed)}. No new trades this run; {end}",
+                       public=protect_note(self.protect_failed))
         vstate, rules, feed, bars, funding, ctx = self.market(work)
         self.read_account()
         self.extras = read_extras(self.real, self.account, self.now, self.log)
@@ -1562,8 +1748,7 @@ class Run:
             self.account["first_ok_ts"] = self.account.get("first_ok_ts") or now
         printed = [ln for ln in (self.stray.getvalue().splitlines() if self.stray is not None else []) if ln.strip()]
         self.lines += [f"printed: {ln}" for ln in printed[-50:]]
-        self.account["log"] = (list(self.account.get("log") or []) + [f"--- run {self.meta['runs']} {_utc(now)}"]
-                               + self.lines)[-LOG_KEEP:]
+        self._log_before = list(self.account.get("log") or [])
         if self.desk is None:
             # stopped before the desk was built: the saved desk stays as it was, only the meta moves
             saved = _read(work, "desk.json") or {}
@@ -1571,49 +1756,68 @@ class Run:
                 _write(work, "desk.json", {**saved, "meta": self.meta})
         else:
             self.save_desk(work)
-        _write(work, "account.json", self.account)
-        self.dir.mkdir(parents=True, exist_ok=True)
-        it = self.iterations
-        tmp = paths["state"].with_name(paths["state"].name + ".tmp")
-        tmp.write_text(statebox.seal_json(pack(work), password, statebox.state_aad(self.mode), iterations=it))
-        tmp.replace(paths["state"])
-        board = self.board_state
-        if board is None:
-            # stopped before a board: the last one stays (its own "updated" says how old it is), with this run's checks
-            try:
-                if self.replaces_leftover:
-                    raise FileNotFoundError("a never-armed LIVE attempt's board isn't this LIVE's")
-                board = statebox.open_json(paths["board"].read_text(), password, statebox.board_aad(self.mode))
-            except (OSError, statebox.BoxError):
-                board = {"updated": None, "header": {"mode": self.mode.upper(), "coin": COIN,
-                                                     "title": "COINBASE · BTC PERP",
-                                                     "tagline": board_mod.tagline_for(self.mode)}}
-            part = board.setdefault(self.mode, {})
-            part.update({"checks": self.checks.ordered(), "alerts": self.alerts[-20:], "log": self.lines[-120:]})
-        board.setdefault(self.mode, {})["problem"] = self.problem
-        board["status"] = {"ok": ok, "problem": self.problem, "runs": self.meta["runs"], "checked": now,
-                           "why": None if ok else (self.lines[-1] if self.lines else None)}
-        tmp = paths["board"].with_name(paths["board"].name + ".tmp")
-        tmp.write_text(statebox.seal_json(board, password, statebox.board_aad(self.mode), compress=False,
-                                          iterations=it))
-        tmp.replace(paths["board"])
+        self.seal(work, password, ok)
         for name, d in (("status", self.status(ok)), ("kills_set", {k: True for k, v in self.kills_set.items() if v})):
             tmp = paths[name].with_name(paths[name].name + ".tmp")
             tmp.write_text(json.dumps(d, indent=1 if name == "status" else None) + "\n")
             tmp.replace(paths[name])        # never through a symlink the branch put there
         self.check_own_save()
+        failed0 = len(self.push_failures)
         if ok and was_down and not first_ok and not self.save_refused_why:
+            bad = [r["label"] for r in self.checks.ordered() if r["ok"] is False]
             self.push(f"{COIN} {self.mode.upper()}: working again",
-                      f"{self.mode.upper()} ran and saved this run, every read OK (the runs before had stopped: "
-                      f"{before.get('note') or was_down}). {self.sent_note()}", "default", "white_check_mark")
-        if first_ok:
+                      f"{self.mode.upper()} ran and saved this run (the runs before had stopped: "
+                      f"{before.get('note') or was_down})."
+                      + (f" Not every read was OK: {'; '.join(bad)} failed (the board says why)." if bad else "")
+                      + f" {self.sent_note()}", "default", "white_check_mark")
+        if first_ok and not self.save_refused_why:
+            # (a first run whose save will be refused, a state deleted on the branch say, is no start: NOT SAVED says
+            # why, and its "connected" would come again at every run, none of them saved)
             self.push(f"{COIN} {self.mode.upper()}: connected (read only)" if self.mode == "shadow" else
                       f"{COIN} LIVE: armed and connected",
                       "\n".join(self.checks.lines()) + ("\n\nNo orders were sent; none can be with this key. Paper is "
                                                         "unaffected." if self.mode == "shadow" else ""),
                       "default", "white_check_mark")
         self.push_trades()
+        if len(self.push_failures) > failed0:
+            self.seal(work, password, ok)       # a push that didn't go out after the seal: in the log and board too
         self.public_note = "" if ok else (self.problem or "")
+
+    def seal(self, work: Path, password: str, ok: bool) -> None:
+        """This run's state and board, encrypted (statebox), with its log as it stands."""
+        paths, now, it = self.paths, self.now, self.iterations
+        self.account["log"] = (self._log_before + [f"--- run {self.meta['runs']} {_utc(now)}"] + self.lines)[-LOG_KEEP:]
+        _write(work, "account.json", self.account)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        tmp = paths["state"].with_name(paths["state"].name + ".tmp")
+        tmp.write_text(statebox.seal_json(pack(work), password, statebox.state_aad(self.mode), iterations=it))
+        tmp.replace(paths["state"])
+        board = self.board_state
+        if board is None:
+            # stopped before a board: the last one stays (its own "updated" says how old it is), with this run's checks
+            if self._board_base is None:
+                try:
+                    if self.replaces_leftover:
+                        raise FileNotFoundError("a never-armed LIVE attempt's board isn't this LIVE's")
+                    self._board_base = statebox.open_json(paths["board"].read_text(), password,
+                                                          statebox.board_aad(self.mode))
+                except (OSError, statebox.BoxError):
+                    self._board_base = {"updated": None, "header": {"mode": self.mode.upper(), "coin": COIN,
+                                                                    "title": "COINBASE · BTC PERP",
+                                                                    "tagline": board_mod.tagline_for(self.mode)}}
+            board = self._board_base
+            part = board.setdefault(self.mode, {})
+            part.update({"checks": self.checks.ordered(), "alerts": self.alerts[-20:], "log": self.lines[-120:]})
+        elif self.push_failures:
+            board.setdefault(self.mode, {}).update({"alerts": self.alerts[-20:], "log": self.lines[-120:]})
+        board.setdefault(self.mode, {})["problem"] = self.problem
+        board[self.mode]["push_failed"] = list(self.push_failures[-20:])
+        board["status"] = {"ok": ok, "problem": self.problem, "runs": self.meta["runs"], "checked": now,
+                           "why": None if ok else (self.lines[-1] if self.lines else None)}
+        tmp = paths["board"].with_name(paths["board"].name + ".tmp")
+        tmp.write_text(statebox.seal_json(board, password, statebox.board_aad(self.mode), compress=False,
+                                          iterations=it))
+        tmp.replace(paths["board"])
 
     def check_own_save(self) -> None:
         """On GitHub Actions the state dir is the branch as the load step extracted it, so the save step's own check
@@ -1648,7 +1852,8 @@ class Run:
 
     def first_unsaved(self) -> bool:
         """A save that will be refused is news when the run before saved (the state it opened, or the status as
-        loaded, is that recent): nothing this run remembers is saved, so it can't remember the push."""
+        loaded, is that recent): nothing this run remembers is saved, so it can't remember the push. (BTC/status.json
+        missing beside the state isn't one of these: the run writes it back, status_written_back.)"""
         st = self.saved_status() or {}
         try:
             last = max(int(getattr(self, "saved_run_ts", 0) or 0),
@@ -1725,7 +1930,9 @@ class Run:
                        else ""))
         if not self.changed:
             why = self.public_why or self.problem or "error"
-            return f"{m} BTC: refused before reading the account: {why} (nothing read or sent; the state is unchanged)"
+            what = "" if self.problem in (None, "key") else f" ({self.problem})"     # the key's own: auth, permissions
+            return (f"{m} BTC: refused{what} before reading the account: {why} (nothing read or sent; the state is "
+                    f"unchanged)")
         if self.public_why and self.problem:
             return (f"{m} BTC: stopped ({self.problem}): {self.public_why} (details on your phone and in the encrypted "
                     f"board)")
@@ -1764,6 +1971,14 @@ class LiveRun(Run):
         password, raw = super().preflight()
         self.password = password
         return password, raw
+
+    def state_key_trouble(self, password: str) -> tuple[str, str] | None:
+        """As SHADOW's, until LIVE has armed. An armed LIVE keeps the DESK_STATE_KEY its state was sealed with (never
+        change it once armed): refusing it here would leave the position to its resting stop alone."""
+        st = self.saved_status() or {}
+        if st.get("mode") == "LIVE" and st.get("armed") is True:
+            return None
+        return super().state_key_trouble(password)
 
     def counted(self, bundle: dict | None) -> dict | None:
         """A LIVE state with no armed_at is what a LIVE attempt that never armed left (before LIVE saved only once
@@ -1824,8 +2039,10 @@ class LiveRun(Run):
         if got is None:
             fail = next((ln.split("Not going live on Coinbase:", 1)[1].strip() for ln in out
                          if "Not going live on Coinbase:" in ln), "an arming check failed")
-            self.watchdog(key, fail, after_arming=bool(self.meta.get("armed_at")))
-            raise Stop("refused", f"not armed: {fail}")
+            armed_before = bool(self.meta.get("armed_at"))
+            self.watchdog(key, fail, after_arming=armed_before)
+            # an armed LIVE that refuses this run is still armed: it didn't arm this run (no order client), that's all
+            raise Stop("refused", f"didn't arm this run: {fail}" if armed_before else f"not armed: {fail}")
         client, token = got
         self.meta["armed_at"] = self.meta.get("armed_at") or int(self.clock() * 1000)
         if token.scope == "protect":
@@ -1834,14 +2051,27 @@ class LiveRun(Run):
             self.begin_saving()         # LIVE's first start: from its arming on, the run is saved
         return client
 
-    SAFETY_END = {"flat": "No position is open", "unprotected": "The position may be without a working stop",
+    def read_by_arm(self):
+        """The clock skew and the key's permissions arm() read and checked for this run's order client: connect()
+        doesn't read them again, so nothing between arming and the safety pass can stop the run."""
+        perms = getattr(self.rest, "key_perms", None)
+        skew = getattr(self.rest, "skew_s", None)
+        return None if perms is None or skew is None else (skew, perms)
+
+    # what the safety pass left the position as (safety_end): never "protected" unless it said so
+    SAFETY_END = {"flat": "No position is open", "protected": "It protected the position it holds",
+                  "unprotected": "The position may be without a working stop",
                   "unknown": "The position couldn't be read"}
+    SAFETY_DIDNT_RUN = "The safety pass didn't run this run: check the position and its stop in Coinbase"
 
     def protect_push(self) -> None:
         """A protect-only run (an armed LIVE whose new-risk check failed): urgent, at every run, naming the check and
-        what the safety pass did, as it happened (safety_said, safety_end)."""
+        what the safety pass did, as it happened (safety_said, safety_end). Only safety_end "protected" says the
+        position is protected; a pass that didn't run says so."""
         done = "; ".join(s.rstrip(". ") for s in self.safety_said) or self.safety_state or "nothing it could read to do"
-        lead = self.SAFETY_END.get(self.safety_end or "", "It protected the position it holds")
+        lead = self.SAFETY_END.get(self.safety_end or "", self.SAFETY_DIDNT_RUN)
+        if self.safety_end is None:
+            done = "; ".join(s.rstrip(". ") for s in self.safety_said) or "nothing was read or sent for it"
         self.push(f"{COIN} LIVE: PROTECT ONLY",
                   f"{'; '.join(self.protect_failed)}: no new trades this run (no entry, no add, no stop moved). "
                   f"{lead}: {done}. {self.sent_note()} To trade again, fix that. To close the position, set flat_kill "
@@ -1872,13 +2102,13 @@ class LiveRun(Run):
             self.watchdog(key, s.public or s.text, after_arming=True)
         return code
 
-    def refused_push(self, s: Stop) -> None:
+    def refused_push(self, s: Stop, wrote: bool | None = None) -> None:
         """Refused before the state was opened (DESK_STATE_KEY not set, say). A LIVE that has armed (its public status
         says so): as SHADOW, once every 6 hours. One that never armed: the same push as any never-armed refusal."""
         st = self.saved_status() or {}
         if (st.get("mode") == "LIVE" and st.get("armed") is True) or (
                 not st and f"{COIN}/state-live.enc.json" in self.branch_loaded().tree()):
-            return super().refused_push(s)      # armed (or a LIVE state with no status to say it never armed)
+            return super().refused_push(s, wrote)   # armed (or a LIVE state with no status to say it never armed)
         self.not_armed_push(s.text)
 
     def shadow_last_run(self) -> int:
@@ -1915,9 +2145,10 @@ class LiveRun(Run):
 
     def public_line(self) -> str:
         if self.protect_failed and self.code != 0:
-            how = {"flat": "no position is open", "unprotected": "the position may be without a working stop: check "
-                   "Coinbase now", "unknown": "the position couldn't be read: check Coinbase now"}.get(
-                self.safety_end or "", "the open position is protected")
+            how = {"flat": "no position is open", "protected": "the open position is protected",
+                   "unprotected": "the position may be without a working stop: check Coinbase now",
+                   "unknown": "the position couldn't be read: check Coinbase now"}.get(
+                self.safety_end or "", "the safety pass didn't run: check Coinbase now")
             return (f"LIVE BTC: {protect_note(self.protect_failed)} ({how}; details on your phone and in the encrypted "
                     f"board)")
         if self.code != 0 and not self.changed and not self.refused_before_state:
@@ -1946,6 +2177,8 @@ class LiveRun(Run):
             found = ex.watchdog()
         except CoinbaseError as exc:
             self.log(f"watchdog: {type(exc).__name__}")
+            if after_arming:
+                self.flat_kill_unread(type(exc).__name__, f"this run refused ({why or 'an arming check failed'})")
             return
         pos = ex.watched[0]
         if after_arming and pos is not None and self.kills_now().flat_kill:
@@ -1959,6 +2192,21 @@ class LiveRun(Run):
                           f"{text}. LIVE didn't run this check (it refused), so nothing else will fix it.", "urgent",
                           "rotating_light")
             self.alerts.append(text)
+
+    def flat_kill_unread(self, err: str, what: str) -> None:
+        """Coinbase can't be read at all, but the kill switches can: a flat_kill that's on, with the position the desk
+        last saved, is pushed urgently from that (FLAT_KILL NOT DONE), once a run."""
+        last = ((_read(self.work, "live_position.json") or {}) if getattr(self, "work", None) else {}).get(
+            "position") or {}
+        if not last.get("side") or "flat_kill" in self._urgent_kinds or not self.kills_now().flat_kill:
+            return
+        text = (f"flat_kill is on, but Coinbase didn't answer this run ({err}) and {what}: the {last['side']} "
+                f"position the desk last saw on {PRODUCT} may still be open, its stop as it was (nothing was cancelled "
+                f"or sent). The next run tries again; close it in Coinbase if you can't wait")
+        self._urgent_texts.add(text)
+        self._urgent_kinds.add("flat_kill")
+        self.push(f"{COIN} LIVE: {URGENT_TITLES['flat_kill']}", text, "urgent", "rotating_light")
+        self.alerts.append(text)
 
     def check_permissions(self, perms: dict) -> None:
         ok = perms["can_view"] and perms["can_trade"] and not perms["can_transfer"]
@@ -1977,10 +2225,14 @@ class LiveRun(Run):
           flat      every desk order left resting is cancelled (Coinbase has no reduce-only: it would open a
                     position); one that won't cancel, or one that isn't the desk's, is pushed urgently
           flat_kill close() (protect-only: a close the desk wanted too)
-          too many  desk stops covering more than the position: the loosest beyond it cancelled
-          gapped    a stop-limit that triggered and didn't fill, or whose limit the price is past: close()
+          gapped    a stop-limit that triggered and didn't fill, or whose limit the price is past: close(); held
+                    back, every stop that can still fill stays (cut back below keeps them first)
+          too many  desk stops covering more than the position: kept up to it, the ones that can still fill first
+                    and the tightest of those first; the rest cancelled
           no stop   one placed: at the saved stop, else the stop distance from the entry at the last ATR seen; the
                     price already through it: close(). None placed: the urgent push
+          too few   stops covering only part of the position (only a stop is cover, never a limit): one placed for
+                    the rest at the saved level, as far as the closing orders resting leave room; the rest pushed
         close() never cancels the stop for a close that may not go through: not while Coinbase reads closed, or its
         product can't be read to tell (market orders can't be queued); not with an order that isn't the desk's on the
         closing side covering the position; not without the time for the whole sequence, the stop put back included
@@ -2082,6 +2334,26 @@ class LiveRun(Run):
         def foreign_closing() -> float:
             return sum(float(o.get("contracts") or 0) for o in real.foreign_on_product(closing))
 
+        def works(o, last) -> bool:
+            """A stop that can still fill as a stop: not triggered, and the price (when read) not past its limit."""
+            if o.get("triggerStatus") == "STOP_TRIGGERED":
+                return False
+            return not (last is not None and o.get("price") is not None and (last[0] - float(o["price"])) * sign < 0)
+
+        def stop_cover(now_orders, last=None) -> float:
+            """The contracts stops cover, on the closing side: the desk's that can still fill, and any stop that isn't
+            the desk's (yours, in the app). A limit or any other order that isn't a stop is no cover: it doesn't
+            close the position when the price falls through the stop."""
+            mine = sum(rem(o) for o in now_orders if o["side"] == closing and o.get("triggerPrice") and
+                       o["status"] == "open" and works(o, last))
+            return mine + sum(float(o.get("contracts") or 0) for o in real.foreign_on_product(closing)
+                              if o.get("stop") is not None)
+
+        def room(now_orders, held: int) -> int:
+            """How many contracts a new stop may cover beside every closing order resting (the desk's and anyone's):
+            with no reduce-only, more than the position held could open one the other way."""
+            return held - math.ceil(foreign_closing() + sum(rem(o) for o in now_orders if o["side"] == closing) - 1e-9)
+
         def saved_level() -> float | None:
             if sp.get("side") == pos["side"] and sp.get("stop"):
                 return float(sp["stop"])
@@ -2091,6 +2363,15 @@ class LiveRun(Run):
             return None
 
         session: list = []                # the product read once a pass: closed_now's answer
+        price: list = []                  # the last trade read once a pass (None: not fresh, or not readable)
+
+        def last_price():
+            if not price:
+                try:
+                    price.append(real.last_trade())
+                except CoinbaseError:
+                    price.append(None)
+            return price[0]
 
         def closed_now() -> str | None:
             """Why a close at market can't go now (Coinbase reads closed, or whether it's open can't be read), or
@@ -2147,11 +2428,17 @@ class LiveRun(Run):
             if now is None:
                 return clear_flat(now_orders, why)
             held = int(now["contracts"])
-            k = held - math.ceil(foreign_closing() + sum(rem(o) for o in now_orders if o["side"] == closing) - 1e-9)
-            if k <= 0:
-                self._say_safe(f"{held} contract(s) still held after the {why} close: covered by the closing orders "
-                               f"resting")
+            need = held - math.ceil(stop_cover(now_orders) - 1e-9)       # only a stop is cover
+            if need <= 0:
+                self._say_safe(f"{held} contract(s) still held after the {why} close: covered by the stops resting")
                 return
+            k = min(need, room(now_orders, held))
+            if k <= 0:
+                return urgent("no_stop", f"NO STOP: {need} of the {held} contract(s) still held on {PRODUCT} after a "
+                                         f"{why} close have no stop: the closing orders resting on them aren't stops "
+                                         f"(yours in the app, a take-profit limit, say), and with no reduce-only a "
+                                         f"stop beside them could open a position. Cancel them and place a stop, or "
+                                         f"close the position, in Coinbase now")
             if trig is None:
                 return urgent("no_stop", f"NO STOP: {held} contract(s) on {PRODUCT} are still held after a {why} close "
                                          f"that didn't take them all, and the desk has no level for their stop. Place "
@@ -2162,7 +2449,12 @@ class LiveRun(Run):
                                   {"stopLossPrice": trig, "known": {"side": now["side"], "contracts": held,
                                                                     "orders": now_orders},
                                    "clientOrderId": real.client_order_id("stop-safety", ets, trig, seq())})
-                self._say_safe(f"the stop is back at {trig:,.0f} on the {held} contract(s) still held")
+                self._say_safe(f"the stop is back at {trig:,.0f} on {k} of the {held} contract(s) still held")
+                if k < need:
+                    urgent("no_stop", f"NO STOP: {need - k} of the {held} contract(s) still held on {PRODUCT} have no "
+                                      f"stop: closing orders that aren't stops rest on them, and a bigger stop could "
+                                      f"open a position. Cancel them and place a stop, or close the position, in "
+                                      f"Coinbase now")
             except StopThroughMarket as exc:
                 urgent("no_stop", f"NO STOP: {held} contract(s) on {PRODUCT} are still held after a {why} close that "
                                   f"didn't take them all, and their stop can't go back at {trig:,.0f}: the price is "
@@ -2193,7 +2485,10 @@ class LiveRun(Run):
             why = reason.replace("_", " ")
             mine = [o for o in orders if o["side"] == closing and not o.get("cancel_queued")]
             trigs = [float(o["triggerPrice"]) for o in mine if o.get("triggerPrice") and o["status"] == "open"]
-            back = (max(trigs) if sign > 0 else min(trigs)) if trigs else saved_level()
+            # the stop put back if the close fails: at the tightest stop that could still fill, else the saved level
+            good = [float(o["triggerPrice"]) for o in mine if o.get("triggerPrice") and o["status"] == "open" and
+                    works(o, price[0] if price else None)]
+            back = (max(good) if sign > 0 else min(good)) if good else saved_level()
             held_back.clear()
             wait = closed_now()
             if wait:
@@ -2291,25 +2586,34 @@ class LiveRun(Run):
             put_back(back, why)
             return True
 
-        def place_missing() -> None:
+        def place_missing(k: int | None = None) -> None:
+            """A stop for the contracts no stop covers: all of them (none rests), or the `k` the resting stops leave
+            (the position grew in the app, say), at the saved level. Never more than the closing orders resting leave
+            room for (room): what it can't cover is pushed (NO STOP)."""
+            k = n if k is None else k
+            whom = what if k >= n else f"{k} of {what}"
             level = saved_level()
             later = "at the next run that isn't protect only" if self.protect_failed else \
                 "later this run if it can read the market"
             if level is None:
-                urgent("no_stop", f"NO STOP: {what} on {PRODUCT} have no stop resting and the desk has no level for "
+                urgent("no_stop", f"NO STOP: {whom} on {PRODUCT} have no stop resting and the desk has no level for "
                                   f"one yet; it places one {later}. Check it in Coinbase")
                 return
-            try:
-                last = real.last_trade()
-            except CoinbaseError:
-                last = None
+            last = last_price()
             if last is not None and (last[0] - level) * sign <= 0:
-                self._say_safe(f"no stop resting, and {COIN} at {last[0]:,.2f} is already through its level "
+                self._say_safe(f"no stop resting on {whom}, and {COIN} at {last[0]:,.2f} is already through its level "
                                f"{level:,.2f}: the desk closes the position at market")
                 if not close("stop"):
-                    urgent("no_stop", f"NO STOP: {what} on {PRODUCT} have no stop resting, {COIN} is already through "
+                    urgent("no_stop", f"NO STOP: {whom} on {PRODUCT} have no stop resting, {COIN} is already through "
                                       f"its level {level:,.0f}, and the close at market can't go now ({held_back[0]}). "
                                       f"Close it in Coinbase as soon as you can")
+                return
+            space = min(k, room(orders, n))
+            if space <= 0:
+                urgent("no_stop", f"NO STOP: {whom} on {PRODUCT} have no stop resting, and the closing orders resting "
+                                  f"on them aren't stops (yours in the app, a take-profit limit, say): with no "
+                                  f"reduce-only a stop beside them could open a position. Cancel them in Coinbase so "
+                                  f"the desk can place the stop, or close the position there")
                 return
             trig = float(co.round_price(level))
             err = ""
@@ -2317,66 +2621,96 @@ class LiveRun(Run):
                 if attempt:
                     self.sleep(STOP_BACKOFF_S * 2 ** (attempt - 1))
                 try:
-                    real.create_order(PRODUCT, "market", closing, n, trig,
+                    real.create_order(PRODUCT, "market", closing, space, trig,
                                       {"stopLossPrice": trig,
                                        "clientOrderId": real.client_order_id("stop-safety", ets, trig, seq())})
-                    self._say_safe(f"no stop was resting on {what}: placed one at {trig:,.0f}")
+                    self._say_safe(f"no stop was resting on {whom}: placed one at {trig:,.0f}"
+                                   + (f" for {space} of them" if space < k else ""))
+                    if space < k:
+                        urgent("no_stop", f"NO STOP: {k - space} of {what} on {PRODUCT} have no stop: closing orders "
+                                          f"that aren't stops rest on them, and a bigger stop could open a position. "
+                                          f"Cancel them and place a stop, or close the position, in Coinbase now")
                     return
                 except StopThroughMarket:
                     if not close("stop"):
-                        urgent("no_stop", f"NO STOP: {what} on {PRODUCT} have no stop resting, the price is already "
+                        urgent("no_stop", f"NO STOP: {whom} on {PRODUCT} have no stop resting, the price is already "
                                           f"through its level {trig:,.0f}, and the close at market can't go now "
                                           f"({held_back[0]}). Close it in Coinbase as soon as you can")
                     return
                 except CoinbaseError as exc:
                     err = f"{type(exc).__name__}: {exc}"
-            urgent("no_stop", f"NO STOP: {what} on {PRODUCT} have no stop resting and one couldn't be placed ({err}). "
+            urgent("no_stop", f"NO STOP: {whom} on {PRODUCT} have no stop resting and one couldn't be placed ({err}). "
                               f"Place it or close the position in Coinbase now; the desk tries again "
                               + ("at the next run" if self.protect_failed else "later this run and at the next one"))
 
+        def cut_back(stops: list, last) -> list:
+            """The desk's own closing orders covering more than the position (no reduce-only: if they all fired they
+            would open it the other way): kept up to the position, the stops that can still fill first (works) and the
+            tightest of them first, so a stop that can still work is never cancelled for one that can't; the rest
+            cancelled. Returns the stops still resting; `orders` is left as what still rests."""
+            if sum(rem(o) for o in orders if o["side"] == closing) <= n + 1e-9:
+                return stops
+            keep, total = [], 0.0
+            for o in sorted(stops, key=lambda o: (not works(o, last), -sign * float(o["triggerPrice"]))):
+                if total + rem(o) <= n + 1e-9:
+                    keep.append(o)
+                    total += rem(o)
+            extra = [o for o in orders if o["side"] == closing and o["status"] == "open" and o not in keep]
+            left = [o for o in extra if not cancel(o)]
+            orders[:] = [o for o in orders if o not in extra or o in left]
+            if left:
+                urgent("overclosing", f"the desk's closing orders on {PRODUCT} cover more than {what} held, and "
+                                      f"order {left[0]['id']} won't cancel: with no reduce-only, if they all fired "
+                                      f"they would open a position the other way. Cancel the extra in Coinbase now",
+                       protected=any(works(o, last) for o in keep))
+            elif extra:
+                self._say_safe(f"cancelled {len(extra)} desk order(s) closing more than {what} held (if they all "
+                               f"fired they would have opened a position the other way)"
+                               + ("; the stop that can still fill was kept" if any(not works(o, last) for o in extra)
+                                  else ""))
+            return [o for o in stops if o in keep or o in left]
+
         def protect() -> None:
+            """The stops on the position: one the price gapped past closes it at market first (the desk's own stop
+            was hit); then desk stops covering more than the position are cut back (cut_back), and stops covering
+            less are topped up at the saved level (place_missing). Only stops count as cover (stop_cover)."""
+            last = last_price()
             stops = [o for o in orders if o["side"] == closing and o.get("triggerPrice") and o["status"] == "open"]
-            if sum(rem(o) for o in orders if o["side"] == closing) > n + 1e-9:
-                # the desk's own closing orders cover more than the position (no reduce-only: if they all fired they
-                # would open it the other way): the tightest kept up to the position, the rest cancelled
-                keep, total = [], 0.0
-                for o in sorted(stops, key=lambda o: -sign * float(o["triggerPrice"])):
-                    if total + rem(o) <= n + 1e-9:
-                        keep.append(o)
-                        total += rem(o)
-                extra = [o for o in orders if o["side"] == closing and o["status"] == "open" and o not in keep]
-                left = [o for o in extra if not cancel(o)]
-                if left:
-                    urgent("overclosing", f"the desk's closing orders on {PRODUCT} cover more than {what} held, and "
-                                          f"order {left[0]['id']} won't cancel: with no reduce-only, if they all fired "
-                                          f"they would open a position the other way. Cancel the extra in Coinbase now",
-                           protected=bool(keep))
-                elif extra:
-                    self._say_safe(f"cancelled {len(extra)} desk order(s) closing more than {what} held (if they all "
-                                   f"fired they would have opened a position the other way)")
-                stops = keep
-            if not stops:
-                return place_missing()
-            try:
-                last = real.last_trade()
-            except CoinbaseError:
-                last = None
-            for o in stops:
-                hit = o.get("triggerStatus") == "STOP_TRIGGERED"
-                past = last is not None and o.get("price") is not None and (last[0] - float(o["price"])) * sign < 0
-                if hit or past:
-                    self._say_safe(f"the stop at {float(o['triggerPrice']):,.0f} on {what} "
-                                   + ("triggered and didn't fill" if hit else
-                                      f"is past its limit {float(o['price']):,.0f} ({COIN} at {last[0]:,.2f})")
-                                   + ": a stop-limit doesn't fill past its limit, so the desk closes the position at "
-                                     "market")
-                    if not close("stop"):
-                        urgent("gapped", f"the stop {o['id']} at {float(o['triggerPrice']):,.0f} on {what} on "
-                                         f"{PRODUCT} is past its limit and the close at market can't go now "
-                                         f"({held_back[0]}): the position has no working stop. Close it in Coinbase "
-                                         f"as soon as you can")
+            gapped = [o for o in stops if not works(o, last)]
+            g = max(gapped, key=lambda o: sign * float(o["triggerPrice"])) if gapped else None
+            if g is not None:
+                hit = g.get("triggerStatus") == "STOP_TRIGGERED"
+                self._say_safe(f"the stop at {float(g['triggerPrice']):,.0f} on {what} "
+                               + ("triggered and didn't fill" if hit else
+                                  f"is past its limit {float(g['price']):,.0f} ({COIN} at {last[0]:,.2f})")
+                               + ": a stop-limit doesn't fill past its limit, so the desk closes the position at "
+                                 "market")
+                if close("stop"):
                     return
-            self.safety_state = f"{what} have their stop resting at {float(stops[0]['triggerPrice']):,.0f}"
+            stops = cut_back(stops, last)
+            cover = stop_cover(orders, last)
+            working = sorted((o for o in stops if works(o, last)), key=lambda o: -sign * float(o["triggerPrice"]))
+            if g is not None:
+                # the close is held back (Coinbase closed, unreadable, too slow): nothing was cancelled for it
+                if cover + 1e-9 >= n and working:
+                    urgent("gapped", f"the stop {g['id']} at {float(g['triggerPrice']):,.0f} on {what} on {PRODUCT} "
+                                     f"is past its limit and the close at market can't go now ({held_back[0]}): the "
+                                     f"desk's stop at {float(working[0]['triggerPrice']):,.0f} still rests and can "
+                                     f"still fill, so the position isn't left without one. Close it in Coinbase if "
+                                     f"you want out at the price the first stop missed", protected=True)
+                else:
+                    urgent("gapped", f"the stop {g['id']} at {float(g['triggerPrice']):,.0f} on {what} on {PRODUCT} "
+                                     f"is past its limit and the close at market can't go now ({held_back[0]}): the "
+                                     f"position has no working stop"
+                                     + (f" on {n - cover:g} of its {n} contracts" if cover > 1e-9 else "")
+                                     + ". Close it in Coinbase as soon as you can")
+                return
+            if not stops and cover <= 1e-9:
+                return place_missing()
+            if cover + 1e-9 < n:
+                return place_missing(n - math.ceil(cover - 1e-9))
+            self.safety_state = (f"{what} have their stop resting at {float(working[0]['triggerPrice']):,.0f}"
+                                 if working else f"{what} are covered by stops that aren't the desk's")
 
         with real.protecting():
             if kills.flat_kill:

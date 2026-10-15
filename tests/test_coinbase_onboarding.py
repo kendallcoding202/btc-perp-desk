@@ -88,15 +88,16 @@ def test_a_short_state_key_then_another_secret_wrong_then_both_fixed(first):
     sh, fake, br, job = first
     assert job.run(over={"DESK_STATE_KEY": "short"})[3]
     _next(fake)
-    code, r, changed, saved = job.run(over={"COINBASE_CDP_KEY": "{not a key}"})     # a state now: its first save
+    code, r, changed, saved = job.run(over={"COINBASE_CDP_KEY": "{not a key}"})
     assert code != 0 and saved, br.errors
-    st0 = job.status()
-    assert st0["runs"] == 1 and st0["failed_runs"] == 1
+    st0 = job.status()      # SHADOW hasn't worked yet: its status alone, no state (round 5: never one a later key
+    assert st0["runs"] == 0 and st0["problem"] == "key"         # can't open)
+    assert "BTC/state-shadow.enc.json" not in br.files()
     _next(fake)
     code, r, changed, saved = job.run()
     assert code == 0 and saved, br.errors
     st = job.status()
-    assert st["started_ts"] == st0["started_ts"] and st["runs"] == 2 and st["ok"] is True
+    assert st["runs"] == 1 and st["ok"] is True
 
 
 def test_a_saved_status_with_runs_and_no_state_file_still_refuses_a_younger_state(tmp_path, monkeypatch):
@@ -271,8 +272,9 @@ def test_a_shadow_save_that_will_be_refused_is_pushed_at_its_first_run_outside_t
     _next(fake)
     n0 = len(sh.pushes)
     code, r, changed, saved = job.run(over={"GITHUB_ACTIONS": "true"})
-    assert saved is False and _titles(sh, n0) == ["BTC SHADOW: NOT SAVED"]   # before: nothing until 18:04
+    assert _titles(sh, n0) == ["BTC SHADOW: NOT SAVED"]   # before: nothing until 18:04
+    assert saved                                          # round 5: the status written back, nothing else saved
     _next(fake)
     n0 = len(sh.pushes)
     job.run(over={"GITHUB_ACTIONS": "true"})
-    assert _titles(sh, n0) == []
+    assert _titles(sh, n0) == ["BTC SHADOW: working again"]       # never NOT SAVED again

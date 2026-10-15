@@ -411,12 +411,14 @@ def test_a_file_the_run_wrote_that_isnt_the_desks_or_the_branchs_is_still_refuse
 # ---------------------------------------------------------------- a save the save step will refuse is pushed
 
 def test_a_shadow_save_that_will_be_refused_is_pushed_by_the_run(world):
+    # (round 5: a deleted status.json is written back by the next run, test_coinbase_first_runs.py; a deleted state
+    # is a save the check still refuses)
     sh, fake, br, job = world
-    br.edit(lambda d: (d / "BTC" / "status.json").unlink())         # you delete status.json on the branch
+    br.edit(lambda d: (d / "BTC" / "state-shadow.enc.json").unlink())    # you delete SHADOW's state on the branch
     fake.now_s = (fake.now_s // 21600) * 21600 + 21600 + 4 * 60     # 18:04 UTC: SHADOW's 6-hour push slot
     code, r, changed, saved = job.run(over={"GITHUB_ACTIONS": "true"})
-    assert code == 0 and changed and saved is False and "no status.json" in br.errors[-1]
-    assert any(t == "BTC SHADOW: NOT SAVED" and "no status.json" in b for t, b, *_ in sh.pushes)
+    assert code == 0 and changed and saved is False and "isn't on the branch (deleted?)" in br.errors[-1]
+    assert any(t == "BTC SHADOW: NOT SAVED" and "put it back as it was" in b for t, b, *_ in sh.pushes)
     assert "its save is refused" in r.public_line()       # before: "state saved", and nothing said anywhere else
     _next(fake, 45)
     n0 = len(sh.pushes)
