@@ -286,9 +286,11 @@ def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=
                                 "funding_prints": len(funding),
                                 "requests": feed.requests, "latency_ms": feed.last_latency_ms,
                                 "age_s": (now - (f.bars[-1].ts + f.bar_ms)) / 1000}, venue_state=vstate)
+    if spec is not None:    # Coinbase's forming candle for the chart (after the ledger is saved: display only)
+        board_mod.with_forming(state, forming, now)
     state["paper"] = {"days": (now - meta["started_ts"]) / 86400_000, "start_equity": meta["start_equity"],
                       "runs": meta["runs"], "bars_processed_this_run": processed,
-                      "new_events": [{"ts": e.ts, "agent": e.agent, "text": e.text} for e in new_events],
+                      "new_events": board_mod.events(new_events),       # times in Mountain Time
                       "changed": bool(processed or new_events or logged or holes_changed or warned)}
     _write(ledger_dir / "board.json", state)
     return state
@@ -561,7 +563,7 @@ def step_basket(vt: VolTrend = VOLTREND, ledger_dir: str | Path = "ledger/VT", f
         "age_s": (now - (meta["last_bar_ts"] + day)) / 1000})
     state["paper"] = {"days": (now - meta["started_ts"]) / 86400_000, "start_equity": meta["start_equity"],
                       "runs": meta["runs"], "bars_processed_this_run": processed,
-                      "new_events": [{"ts": e.ts, "agent": e.agent, "text": e.text} for e in new_events],
+                      "new_events": board_mod.events(new_events),       # times in Mountain Time
                       # or the memory reaches a newer bar (once a day, with the close): saved, so the next run knows
                       # an answer reached past a bar that's missing
                       "changed": bool(processed or new_events or any(memory[c][-1].ts > seen[c] for c in vt.coins))}

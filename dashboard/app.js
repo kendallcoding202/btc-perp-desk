@@ -58,9 +58,80 @@
   const pct = (x, dp = 2) => x == null || isNaN(x) ? "—" : `${x >= 0 ? "+" : ""}${(x * 100).toFixed(dp)}%`;
   const num = (x, dp = 2) => x == null || isNaN(x) ? "—" : nf(dp).format(Number(x));
   const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-  const hhmm = (ms) => new Date(ms).toISOString().slice(11, 16);
-  const mmddhhmm = (ms) => new Date(ms).toISOString().slice(5, 16).replace("T", " ");
   const DAY_MS = 86400000;
+
+  // ---- Mountain Time: every time the page shows ----------------------------------------------------------------
+  // The owner reads times in Mountain Time, whatever zone the phone itself is in: America/Denver's own rules from the
+  // browser's time zone data (MDT in summer, MST from the first Sunday of November: never a fixed offset), labelled
+  // MT. Stored times stay epoch ms; the desk's day still turns at 00:00 UTC (6:00 pm MT in summer, 5:00 pm in winter).
+  // A browser without the zone (none current) shows UTC, labelled UTC, never a wrong time called MT. activity.js uses
+  // the same helper (window.deskMT), so the two never disagree.
+  const deskMT = (() => {
+    const MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let f = null;
+    try {
+      f = new Intl.DateTimeFormat("en-US", { timeZone: "America/Denver", year: "numeric", month: "numeric", day: "numeric",
+        weekday: "short", hour: "numeric", minute: "numeric", second: "numeric", hourCycle: "h23" });
+    } catch { f = null; }
+    const memo = new Map();   // a second's parts, made once: the chart's axis asks for the same candles every redraw
+    const parts = (ms) => {
+      const k = Math.floor(ms / 1000);
+      let p = memo.get(k);
+      if (p) return p;
+      if (f) {
+        const o = {};
+        for (const x of f.formatToParts(new Date(k * 1000))) o[x.type] = x.value;
+        p = { y: +o.year, mo: +o.month, d: +o.day, h: +o.hour % 24, mi: +o.minute, s: +o.second, wd: o.weekday };
+      } else {
+        const d = new Date(k * 1000);
+        p = { y: d.getUTCFullYear(), mo: d.getUTCMonth() + 1, d: d.getUTCDate(), h: d.getUTCHours(), mi: d.getUTCMinutes(),
+          s: d.getUTCSeconds(), wd: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d.getUTCDay()] };
+      }
+      if (memo.size > 5000) memo.clear();
+      memo.set(k, p);
+      return p;
+    };
+    const two = (n) => String(n).padStart(2, "0");
+    // "6:04 pm", "6:04:09 pm" (sec), "6:04 PM" (up), "6 pm" (short, on the hour: a close, in a line that's tight)
+    const clock = (ms, o = {}) => {
+      const p = parts(ms), hm = o.short && !p.mi && !o.sec ? "" : `:${two(p.mi)}${o.sec ? ":" + two(p.s) : ""}`;
+      const t = `${p.h % 12 || 12}${hm} ${p.h < 12 ? "am" : "pm"}`;
+      return o.up ? t.toUpperCase() : t;
+    };
+    const day = (ms) => { const p = parts(ms); return `${MON[p.mo - 1]} ${p.d}`; };              // "Oct 15"
+    const key = (ms) => { const p = parts(ms); return p.y * 10000 + p.mo * 100 + p.d; };         // the MT date, as a number
+    return {
+      zone: f ? "MT" : "UTC", parts, clock, day, key,
+      md: (ms) => { const p = parts(ms); return `${two(p.mo)}-${two(p.d)}`; },                    // "10-15"
+      ymd: (ms) => { const p = parts(ms); return `${p.y}-${two(p.mo)}-${two(p.d)}`; },            // "2026-10-15"
+      wd: (ms) => parts(ms).wd,                                                                 // "Fri"
+      when: (ms) => `${day(ms)}, ${clock(ms)}`,                                                 // "Oct 15, 6:04 pm"
+      // from a to b: "3:00–4:00 pm", "11:00 pm–1:00 am", a day apart "Sat 8:00 pm–Sun 2:00 am"; days: the first day too
+      span: (a, b, days = false) => {
+        const pa = parts(a), pb = parts(b), same = key(a) === key(b), mer = (pa.h < 12) === (pb.h < 12);
+        const head = same && mer ? clock(a).slice(0, -3) : clock(a);
+        return `${days || !same ? pa.wd + " " : ""}${head}–${same ? "" : pb.wd + " "}${clock(b)}`;
+      },
+      // the start of ms's Mountain Time day (its midnight), as epoch ms. Stepped back by the clock's time of day until
+      // it reads 0:00 on the same date: on the two days a year the clocks change, that time of day isn't how long ago
+      // midnight was (1:00 am MST on Nov 1 is 2 h after it; 4:00 am MDT on a March Sunday 3 h)
+      midnight: (ms) => {
+        const k = key(ms);
+        let t = Math.floor(ms / 1000) * 1000;
+        for (let i = 0; i < 4; i++) {
+          const p = parts(t), into = ((p.h * 60 + p.mi) * 60 + p.s) * 1000;
+          if (key(t) !== k) t += DAY_MS - into;   // back into the day before: on to its next midnight
+          else if (into) t -= into;
+          else break;
+        }
+        return t;
+      },
+      nextUtcDay: (ms) => Math.floor(ms / DAY_MS + 1) * DAY_MS,   // the desk's day turns: VT's close, the daily loss lock
+    };
+  })();
+  window.deskMT = deskMT;
+  const MT = deskMT, TZ = deskMT.zone;
+  const hhmm = (ms) => MT.clock(ms);
   // theme hook: a signed amount's classes. ok / bad exactly as before (style.css colors them: below zero is bad), plus
   // its direction for a theme: up, down, or flat when it is zero at the shown `dp` decimals (neither a gain nor a loss)
   const tone = (x, dp = 2) => `${x < 0 ? "bad" : "ok"}${x == null || isNaN(x) ? "" : Math.abs(x) * 10 ** dp < 0.5 ? " flat" : x < 0 ? " down" : " up"}`;
@@ -104,7 +175,7 @@
     const { g, w, h } = fit(canvas);
     const cs = chart.candles;
     if (!cs.length) return;
-    const padR = 64, padT = 8, padB = 18;
+    const padT = 8, padB = 18;
     const vals = [];
     cs.forEach((c) => vals.push(c[2], c[3]));
     [chart.ema_fast, chart.ema_slow, chart.don_hi].forEach((s) => s.forEach((v) => v != null && vals.push(v)));
@@ -112,15 +183,23 @@
     if (chart.live) vals.push(chart.live);
     let lo = Math.min(...vals), hi = Math.max(...vals);
     const pad = (hi - lo) * 0.06; lo -= pad; hi += pad;
-    const cw = (w - padR) / cs.length;
-    const X = (k) => k * cw + cw / 2;
+    const lastC = cs[cs.length - 1][4], ct = closeTag(chart), padR = rightPad(g, chart, ct.text, lo, hi);
+    // BTC's provisional newest candle(s) (formingBars, drawn dashed): each gets a slot at least 8 px wide, so its dashes
+    // read on a phone (the others' slots are about 2 px there); the rest share what's left
+    const prov = new Set(chart.prov || []);
+    let np = 0;
+    while (np < cs.length - 1 && prov.has(cs.length - 1 - np)) np++;
+    const ps = np ? Math.max((w - padR) / cs.length, 8) : 0, n0 = cs.length - np;
+    const cw = (w - padR - np * ps) / n0;
+    const X = (k) => k < n0 ? k * cw + cw / 2 : n0 * cw + (k - n0) * ps + ps / 2;
+    const slot = (k) => k < n0 ? cw : ps;
     const Y = (p) => padT + (hi - p) / (hi - lo) * (h - padT - padB);
     const tsIndex = new Map(cs.map((c, k) => [c[0], k]));
     // BTC on Coinbase: its live price's tag at the right edge goes at its price, else at the nearest place clear of the
     // close's and the stop's tags and on the same side of each as its price (the tags read in order); none if there's
     // no such place, only its line. An axis label under it isn't drawn
     let liveY = null;
-    if (chart.live) {
+    if (chart.live && chart.live !== cs[cs.length - 1][4]) {   // the newest candle carried on to it: its close tag says it
       const y = Y(chart.live), top = padT + 8, bot = h - padB - 8, taken = [Y(cs[cs.length - 1][4]), chart.stop ? Y(chart.stop) : null].filter((o) => o != null);
       const ok = (t) => t >= top && t <= bot && taken.every((o) => Math.abs(t - o) >= 17 && (y === o || (t - o) * (y - o) > 0));
       liveY = [y, top, bot, ...taken.flatMap((o) => [o - 17, o + 17])].filter(ok).sort((a, b) => Math.abs(a - y) - Math.abs(b - y))[0] ?? null;
@@ -133,12 +212,18 @@
       if (liveY != null && Math.abs(y - liveY) < 13) continue;
       g.fillStyle = css("--dim"); g.fillText(pxAxis(p), w - padR + 6, y + 3);
     }
-    const step = Math.max(1, Math.round(cs.length / 6));
+    // the x axis in Mountain Time days: a tick where each day starts (its midnight, inside the candle it falls in: 5 am
+    // MT is a 2h candle's open in winter, not in summer), its date under as many as fit 44 px apart, and "MT" under
+    // the price axis to say whose days they are
     g.fillStyle = css("--dim");
-    for (let k = 0; k < cs.length; k += step) {
-      const d = new Date(cs[k][0]);
-      g.fillText(`${d.toISOString().slice(5, 10)}`, X(k) - 14, h - 4);
+    let lastDate = -1e9;
+    for (let k = 1; k < cs.length; k++) {
+      if (MT.key(cs[k][0]) === MT.key(cs[k - 1][0])) continue;
+      const mid = MT.midnight(cs[k][0]), x = X(k) - slot(k) / 2 - Math.max(0, Math.min(1, (cs[k][0] - mid) / chart.bar_ms)) * slot(k - 1);
+      line(g, [[x, h - padB], [x, h - padB + 4]], css("--dim"), 1);
+      if (x - lastDate >= 44 && x + 32 <= w - padR) { g.fillText(MT.md(cs[k][0]), x + 2, h - 4); lastDate = x; }
     }
+    g.fillText(TZ, w - padR + 6, h - 4);
 
     line(g, chart.don_hi.map((v, k) => [X(k), v == null ? null : Y(v)]), css("--channel") || rgba("--muted", .55), 1, [3, 4]);
     line(g, chart.don_lo.map((v, k) => [X(k), v == null ? null : Y(v)]), css("--channel") || rgba("--muted", .35), 1, [3, 4]);
@@ -151,6 +236,7 @@
     const hw = bw >= 3 ? bw : Math.max(bw, cw * 0.92), hl = bw >= 3 ? 1 : 1 / (window.devicePixelRatio || 1);
     cs.forEach(([, o, hgh, l, c], k) => {
       const up = c >= o, col = up ? css("--green") : css("--red");
+      if (prov.has(k)) { provCandle(g, X(k), Y, o, hgh, l, c, col, Math.max(bw, slot(k) * 0.72), up && hollow); return; }
       g.strokeStyle = col; g.lineWidth = up && hollow ? hl : 1; g.beginPath(); g.moveTo(X(k), Y(hgh)); g.lineTo(X(k), Y(l)); g.stroke();
       g.fillStyle = col;
       const y1 = Y(Math.max(o, c)), y2 = Y(Math.min(o, c));
@@ -185,17 +271,57 @@
       }
     }
     const last = cs[cs.length - 1];
-    tag(g, w - padR, Y(last[4]), pxAxis(last[4]), css(last[4] >= last[1] ? "--green" : "--red"), true);
+    tag(g, w - padR, Y(lastC), ct.text, css(lastC >= last[1] ? "--green" : "--red"), !ct.held, ct.held);
     // BTC on Coinbase: its live price from Coinbase's feed, as a line and an outlined tag at the right edge (placed
-    // above). Only a marker: no candle is made up for the bar that's still forming
+    // above; none when the newest candle's close already says it). The candle still forming is formingBars'
     if (chart.live) {
       const y = Y(chart.live), cyan = css("--cyan") || "#2ee6ff";
       line(g, [[0, y], [w - padR, y]], rgba("--cyan", .7), 1, [2, 3]);
       g.save(); g.font = "bold 9px JetBrains Mono, monospace"; g.fillStyle = cyan; g.textAlign = "right";
-      g.fillText("LIVE", w - padR - 4, (liveY != null && liveY < y ? liveY : y) - 4); g.restore();
+      // its word clear above the wicks of the newest candles under it (BTC's forming candle runs up to the line), unless
+      // that's far from the line: then on it, as before
+      const x1 = w - padR - 4, x0 = x1 - g.measureText("LIVE").width - 2, ty0 = (liveY != null && liveY < y ? liveY : y) - 4;
+      let ty = ty0;
+      for (let k = cs.length - 1; k >= 0 && X(k) + slot(k) / 2 >= x0; k--) if (X(k) - slot(k) / 2 <= x1) ty = Math.min(ty, Y(cs[k][2]) - 3);
+      g.fillText("LIVE", x1, ty0 - ty > 36 || ty < padT + 9 ? ty0 : ty); g.restore();
       if (liveY != null) tag(g, w - padR, liveY, pxAxis(chart.live), cyan);
     }
     lastGeom = { X, Y, cs, w, h, padR };
+  }
+
+  // The newest candle's close tag. Filled, as on every chart, when that close is a closed candle's or the live price;
+  // outlined in dashes, like the candle, when it is a provisional candle's that nothing live has carried on (BTC's
+  // forming candle with the feed down, on the proxy, or Coinbase closed since): then it is a price from before now,
+  // never shown as the current one, and "RUN" when it is the run's own as it answered. {text, held}
+  function closeTag(chart) {
+    const cs = chart.candles, k = cs.length - 1, c = cs[k][4];
+    const held = (chart.prov || []).includes(k) && !(chart.live && chart.live === c);
+    return { text: (held && chart.runIdx === k ? "RUN " : "") + pxAxis(c), held };
+  }
+
+  // The price axis's width: room for its widest tag ("STOP 77,970" is wider than a price) and label, so none is cut off
+  // at the canvas's right edge on a phone. A tag is drawn from 2 px past the axis line, 8 px wider than its text (tag()),
+  // and keeps 2 px clear of the edge; an axis label starts 6 px past it. At least today's 64 px
+  function rightPad(g, chart, closeText, lo, hi) {
+    g.font = "bold 10px JetBrains Mono, monospace";
+    const tags = [closeText, chart.stop ? `STOP ${pxAxis(chart.stop)}` : "", chart.live ? pxAxis(chart.live) : ""];
+    const tagW = Math.max(...tags.map((t) => g.measureText(t).width + 12));
+    g.font = "10px JetBrains Mono, monospace";
+    const axisW = Math.max(g.measureText(pxAxis(hi)).width, g.measureText(pxAxis(lo)).width) + 8;
+    return Math.ceil(Math.max(64, tagW, axisW));
+  }
+
+  // A provisional candle (BTC's newest, carried on from Coinbase's feed until the next run): its wick and its body's
+  // outline in dashes, up or down in its usual color, in both editions. The body is the paper (--ink) where the theme
+  // draws that candle hollow (an up one, --candle-up: hollow), else a pale wash of its color: filled stays filled
+  function provCandle(g, x, Y, o, h, l, c, col, pw, hollowBody) {
+    const y1 = Y(Math.max(o, c)), y2 = Y(Math.min(o, c)), bh = Math.max(3, y2 - y1);
+    g.save(); g.strokeStyle = col; g.lineWidth = 1; g.setLineDash([2, 2]);
+    g.beginPath(); g.moveTo(x, Y(h)); g.lineTo(x, y1); g.moveTo(x, y1 + bh); g.lineTo(x, Y(l)); g.stroke();
+    g.fillStyle = css("--ink") || "#070b10"; g.fillRect(x - pw / 2, y1, pw, bh);
+    if (!hollowBody) { g.globalAlpha = 0.3; g.fillStyle = col; g.fillRect(x - pw / 2, y1, pw, bh); g.globalAlpha = 1; }
+    g.strokeRect(x - pw / 2 + 0.5, y1 + 0.5, pw - 1, bh - 1);
+    g.restore();
   }
 
   function nearest(index, ts, barMs, cs) {
@@ -217,12 +343,12 @@
     g.fillText(short ? "S" : "L", x, top + 9); g.restore();
   }
 
-  function tag(g, x, y, text, color, filled = false) {
+  function tag(g, x, y, text, color, filled = false, dashed = false) {
     g.save(); g.font = "bold 10px JetBrains Mono, monospace";
     const tw = g.measureText(text).width + 8;
     const ink = css("--ink") || "#070b10";
     g.fillStyle = filled ? color : ink; g.strokeStyle = color;
-    g.fillRect(x + 2, y - 8, tw, 16); g.strokeRect(x + 2, y - 8, tw, 16);
+    g.fillRect(x + 2, y - 8, tw, 16); if (dashed) g.setLineDash([2, 2]); g.strokeRect(x + 2, y - 8, tw, 16); g.setLineDash([]);
     g.fillStyle = filled ? ink : color; g.fillText(text, x + 6, y + 4); g.restore();
   }
 
@@ -393,12 +519,13 @@
       ` · ${pnlHtml(s)} · FEES ${usd(t.fees)}${v ? " (EST.)" : ""} · FUNDING ${v ? "(EST.) " : ""}${usd(t.funding)}`);
     txt($("chart-title"), `${v ? v.product : coin + "-PERP"} · ${s.header.interval} · ${px(t.price)}${proxy ? " (HL proxy)" : ""}`);
     put($("chart-sub"), `<span class="${chgCls}">24h ${pct(t.change_24h)}</span>` +
-      ` · fast <i class="swatch fast"></i> · slow <i class="swatch slow"></i> · channel <i class="swatch channel"></i> · stop <i class="swatch stop"></i>`);
+      ` · fast <i class="swatch fast"></i> · slow <i class="swatch slow"></i> · channel <i class="swatch channel"></i> · stop <i class="swatch stop"></i>` +
+      (s.chart.prov && s.chart.prov.length ? ` · newest candle${s.chart.prov.length > 1 ? "s" : ""} <i class="swatch prov"></i> provisional` : ""));
     const chips = $("chips");
     put(chips, s.agents.map((a) => `<span class="chip ${a.state === "idle" ? "off" : ""}" title="${esc(a.name)}: ${esc(a.state)}"
       style="background:var(${COLORS[a.key]})">${esc(a.name[0])}</span>`).join(""));
     if (!$("chief-sprite").children.length) $("chief-sprite").append(sprite("chief", 4));
-    txt($("mini-time"), s.header.time);
+    txt($("mini-time"), `${MT.clock(s.updated)} ${TZ}`);
     put($("kill-state"), [
       ["flat_kill", k.flat_kill], ["entry_kill", k.entry_kill], ["jev_kill", k.jev_kill],
       ["drawdown halt", k.halted], ["daily loss lock", k.daily_locked], ["cooldown", k.cooldown],
@@ -456,7 +583,18 @@
     return `${v}${t}`;
   };
 
-  const DAYF = new Intl.DateTimeFormat("en-US", { weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "UTC" });
+  // BTC on Coinbase: its session in the venue line, as the price on screen has it (lp: livePrice at this redraw), not
+  // only as the run found it. A scheduled closure that began since the run is CLOSED NOW (the board's closed_now is
+  // still empty), one the run found is CLOSED AT THE LAST RUN once Coinbase's feed shows it trading, and the next
+  // closure is named only while it is still ahead: one that is under way or over isn't "next"
+  function closureNote(v, lp, now) {
+    const nc = v.session && v.session.next_closure, cn = v.closed_now, shut = lp && lp.closed;
+    const closed = shut && shut.by === "schedule" ? ` · <b>CLOSED NOW: ${esc(shut.why)} until ${hhmm(shut.until)} ${TZ}</b>`
+      : cn ? ` · <b>${shut || !lp ? "CLOSED NOW" : "CLOSED AT THE LAST RUN"}: ${esc(cn.why)}${cn.until ? ` until ${hhmm(cn.until)} ${TZ}` : ""}</b>` : "";
+    const next = nc && now < nc.start && !(cn && cn.scheduled) ? ` · next ${cn ? "scheduled " : ""}closure ${esc(nc.why)} ${MT.span(nc.start, nc.end, true)} ${TZ}` : "";
+    return closed + next;
+  }
+
   // light: a redraw for a new price only (the gates and events are the board's)
   function renderAnalysis(s, light = false) {
     const st = s.analysis.stats, basket = s.header.kind === "basket", t = s.ticker;
@@ -465,7 +603,7 @@
     const v = s.venue, lp = s.livePx || {};   // BTC on Coinbase: whole contracts, its margin, funding estimated from logged rates
     const cells = basket ? [
       ["$" + s.header.coin, "basket", "sym"], ["Cash", usd(t.cash)], ["Held", usd(t.notional)],
-      ["Exposure", `${num(t.exposure)}x`], ["Unrealised", usd(t.unrealised), t.unrealised < 0 ? "bad" : "ok"], ["Fees", usd(t.fees)], ["Funding", usd(t.funding)],
+      ["Exposure", `${num(t.exposure)}x`], ["Unrealised", usd(t.unrealised), `h-pnl ${tone(t.unrealised)}`], ["Fees", usd(t.fees)], ["Funding", usd(t.funding)],
     ] : v ? [
       ["$" + (s.header.coin || "BTC"), "perp · " + s.header.venue, "sym"],
       [lp.closed ? "Price" : lp.source === "coinbase" ? "Price (Coinbase live)" : live.at ? "Price (HL proxy)" : "Price", px(st.price)],
@@ -481,28 +619,27 @@
     ];
     put($("stats"), cells.map(([k, v, cls]) => `<div class="${cls || ""}"><span>${k}</span><b>${esc(v)}</b></div>`).join(""));
     const ol = s.analysis.outlook || [];
-    const day = (ms) => DAYF.format(new Date(ms));
+    const day = (ms) => `${MT.wd(ms)} ${MT.clock(ms)}`;   // "Fri 6:00 pm"
     const olHead = s.analysis.outlook_side === "short"
       ? `SHORT LINE · a 2h close below it shorts; steps up as old lows age out (if ${esc(s.header.coin || "BTC")} makes no new low)`
       : `BUY LINE · steps down as old highs age out (if ${esc(s.header.coin || "BTC")} makes no new high)`;
-    const nc = v && v.session.next_closure, sk = v && v.skipping, cn = v && v.closed_now, fs = v && v.funding.stale_since;
+    const sk = v && v.skipping, fs = v && v.funding.stale_since;
     const venueLine = v ? `<div class="ol-exp">${esc(v.display)} RULES · whole ${v.contract_size} BTC contracts (one is ${usd(v.one_contract_usd, 0)}), ` +
       `≤${v.max_leverage}x, overnight margin ${(v.margin_rate * 100).toFixed(1)}% · fees est. ${esc(v.fee_estimate)} · funding est. from ${v.funding.logged} logged hourly rates` +
-      (fs ? ` <b>(none new since ${mmddhhmm(fs)} UTC)</b>` : "") + (v.stop_fill ? ` · ${esc(v.stop_fill)}` : "") +
-      (cn ? ` · <b>${lp.closed || !s.livePx ? "CLOSED NOW" : "CLOSED AT THE LAST RUN"}: ${esc(cn.why)}${cn.until ? ` until ${hhmm(cn.until)} UTC` : ""}</b>` : "") +
-      (nc && !(cn && cn.scheduled) ? ` · next ${cn ? "scheduled " : ""}closure ${esc(nc.why)} ${day(nc.start)}–${hhmm(nc.end)} UTC` : "") +
-      (v.waiting_for ? ` · <b>WAITING for Coinbase's ${mmddhhmm(v.waiting_for)} UTC candle</b>` : "") +
+      (fs ? ` <b>(none new since ${MT.when(fs)} ${TZ})</b>` : "") + (v.stop_fill ? ` · ${esc(v.stop_fill)}` : "") +
+      closureNote(v, s.livePx, Date.now()) +
+      (v.waiting_for ? ` · <b>WAITING for Coinbase's ${MT.when(v.waiting_for)} ${TZ} candle</b>` : "") +
       (sk ? ` · <b>SKIPPING: ${esc(sk.note)}</b>` : "") + `</div>` : "";
     put($("outlook"), venueLine + (s.header.experiment ? `<div class="ol-exp">EXPERIMENT · ${esc(s.header.experiment)}</div>` : "") +
       (ol.length ? `<div class="ol-head">${olHead}</div>` +
-      `<div class="ol-rows">` + ol.map((r, k) => `<div class="${k === 0 ? "now" : ""}"><span>${k === 0 ? "next close" : day(r.ts) + " UTC"}</span>` +
+      `<div class="ol-rows">` + ol.map((r, k) => `<div class="${k === 0 ? "now" : ""}"><span>${k === 0 ? "next close" : day(r.ts) + " " + TZ}</span>` +
       `<b>${px(r.level)}</b><i>${pct(r.level / st.price - 1, 1)}</i></div>`).join("") + `</div>` : ""));
     if (light) return;
     put($("gates"), s.analysis.gates.map((g) =>
       `<li><span>${esc(g.name.replace(/_/g, " "))} <i class="na">${esc(GATE_FMT(g))}</i></span><span class="v ${g.verdict}">${g.verdict}</span></li>`).join(""));
-    const when = basket ? mmddhhmm : hhmm;   // the basket trades once a day: its events need the date
+    const when = basket ? MT.when : hhmm;   // the basket trades once a day: its events need the date
     put($("events"), s.events.slice().reverse().map((e) =>
-      `<li><b style="color:var(${COLORS[e.agent] || "--muted"})">${esc(e.agent.toUpperCase())}</b>${when(e.ts)} ${esc(e.text)}</li>`).join("") ||
+      `<li><b style="color:var(${COLORS[e.agent] || "--muted"})">${esc(e.agent.toUpperCase())}</b>${when(e.ts)} ${TZ} ${esc(e.text)}</li>`).join("") ||
       `<li>no events yet — the desk speaks when something happens.</li>`);
   }
 
@@ -530,8 +667,9 @@
       `<span class="hl ${posCls}">${esc(t.position)}${t.position_detail ? " " + esc(t.position_detail) : ""}</span>` +
       ` · ${esc(t.record)} · HOLD <span class="${tone(t.hold_pct, 4)}">${pct(t.hold_pct)}</span>` +
       ` · ${pnlHtml(s)} · FEES ${usd(t.fees)} · FUNDING ${usd(t.funding)}`;
-    const next = Math.floor(now / DAY_MS + 1) * DAY_MS, left = next - now;   // every 00:00 UTC
-    $("vt-next").textContent = `NEXT DECISION 00:00 UTC · IN ${Math.floor(left / 3600000)}H ${Math.floor(left % 3600000 / 60000)}M`;
+    const next = MT.nextUtcDay(now), left = next - now;   // every 00:00 UTC: 6:00 pm MT in summer, 5:00 pm in winter
+    txt($("vt-head"), `HOLDINGS · AT THE ${MT.clock(next, { up: true })} ${TZ} DAILY CLOSE`);
+    $("vt-next").textContent = `NEXT DECISION ${MT.clock(next, { up: true })} ${TZ} · IN ${Math.floor(left / 3600000)}H ${Math.floor(left % 3600000 / 60000)}M`;
     $("vt-exp").textContent = s.header.experiment ? `EXPERIMENT · ${s.header.experiment}` : "";
     $("vt-rule").textContent = `A ${r.coins.length === 3 ? "third" : "share"} of the book per coin. A coin is held while its daily close ` +
       `is above its ${r.sma_bars}-day average, sized ${r.target_vol.toFixed(2)} ÷ its ${r.vol_lookback}-day vol (at most ${r.max_units} units; ` +
@@ -546,7 +684,7 @@
       const verb = o && (o.kind === "exit" ? "SELL ALL" : o.kind === "entry" ? "BUY" : o.usd > 0 ? "ADD" : "TRIM");
       const order = o ? [o.kind === "exit" ? verb : `${verb} ${usd(Math.abs(o.usd))}`, "fills at the next open"]
         : h.decided_ts == null ? ["PREVIEW", "the first decision is at the next close"]
-        : h.qty > 0 ? ["HOLD", h.entry_ts ? `since ${new Date(h.entry_ts).toISOString().slice(0, 10)}` : ""]
+        : h.qty > 0 ? ["HOLD", h.entry_ts ? `since ${MT.day(h.entry_ts)}` : ""]
         : h.target_units > 0 ? ["FLAT", `entry under the $${r.min_order_usd} minimum; checked again at the next close`]
         : ["FLAT", h.warm ? `waits for a close above the ${r.sma_bars}-day average` : "warming up the averages"];
       return `<div class="h-row">` +
@@ -555,19 +693,19 @@
         cell(2, h.vol10 == null ? "—" : `${(h.vol10 * 100).toFixed(0)}%`, "annualised") +
         cell(3, `${num(h.held_units)} held`, `target ${num(h.target_units ?? 0)}${band}`) +
         cell(4, usd(h.notional), h.qty > 0 ? `${(h.weight * 100).toFixed(1)}% of the bank · ${num(h.qty, 5)} ${esc(h.coin)}` : "") +
-        cell(5, h.qty > 0 ? `<span class="${h.unrealised >= 0 ? "ok" : "bad"}">${usd(h.unrealised)}</span>` : "—", h.qty > 0 ? `avg entry ${px(h.avg_entry)}` : "") +
+        cell(5, h.qty > 0 ? `<span class="h-pnl ${tone(h.unrealised)}">${usd(h.unrealised)}</span>` : "—", h.qty > 0 ? `avg entry ${px(h.avg_entry)}` : "") +
         cell(6, order[0], order[1], o ? "pend" : "") + `</div>`;
     });
     $("holdings").innerHTML = `<div class="h-row h-head">${head.map((x) => `<div>${x}</div>`).join("")}</div>` + rows.join("");
     const caught = b.last_close_ts && b.last_close_ts < Math.floor(now / DAY_MS) * DAY_MS
-      ? " The latest 00:00 close is picked up on the desk's next run." : "";
+      ? ` The latest daily close (${MT.when(Math.floor(now / DAY_MS) * DAY_MS)} ${TZ}) is picked up on the desk's next run.` : "";
     $("vt-note").textContent = `Prices live from Hyperliquid; averages, vol and units are from the last close` +
-      (b.last_close_ts ? ` (${new Date(b.last_close_ts).toISOString().slice(0, 10)} 00:00 UTC)` : "") + `. ` +
+      (b.last_close_ts ? ` (${MT.when(b.last_close_ts)} ${TZ})` : "") + `. ` +
       `${b.orders.filled} fills, ${b.orders.blocked} orders skipped by the $${r.min_order_usd} minimum.${caught}`;
   }
 
   const RULES = {
-    coins: "one sleeve each, an equal share of the book", interval: "decided at the 00:00 UTC close, filled at the next open",
+    coins: "one sleeve each, an equal share of the book", interval: "decided at the daily close ({close}), filled at the next open",
     vol_lookback: "days of returns in the realised vol (x √365)", target_vol: "units = this ÷ the coin's realised vol",
     max_units: "no coin gets more units than this", sma_bars: "held only while the close is above this many days' average",
     band: "held units change only when the new size is further away than this", book_leverage: "a coin's notional = bank x this ÷ 3 x units",
@@ -576,8 +714,9 @@
   };
   function renderRules(rules) {
     const fmt = (k, v) => Array.isArray(v) ? v.join(" · ") : /usd|equity/.test(k) ? usd(v, 0) : String(v);
+    const close = `${MT.clock(MT.nextUtcDay(Date.now()))} ${TZ}`;   // the next daily close, in MT (an hour earlier in winter)
     $("thr").innerHTML = `<div class="thr-sec">VolTrend — frozen: these exact numbers passed the edge hunt's pre-set bar; not tuned</div>` +
-      Object.entries(rules).map(([k, v]) => `<div class="rule"><span class="n">${esc(k)}</span><b>${esc(fmt(k, v))}</b><i>${esc(RULES[k] || "")}</i></div>`).join("");
+      Object.entries(rules).map(([k, v]) => `<div class="rule"><span class="n">${esc(k)}</span><b>${esc(fmt(k, v))}</b><i>${esc((RULES[k] || "").replace("{close}", close))}</i></div>`).join("");
   }
 
   function renderKills(k) {
@@ -655,11 +794,16 @@
   const CB_BASE = 2000, CB_MAX = 60000, CB_GAP = 1000;   // retries: 2 s doubling to 60 s, jittered; never two a second
   const STALE = 20000;      // the proxy's price older than this (Hyperliquid not answering) isn't called live, as the
                             // desk monitor says "no live price" after as long
+  const CB_SKEW = 300000;   // a ticker stamp further than 5 min from its arrival: the arrival time places its price
+  // how long ago the latest of these times was, measured either way: a wall clock set back (the phone's own clock
+  // corrected) makes a time ahead of now, which is no fresher for it, so nothing stays "fresh" or waits until the clock
+  // catches up; the next message, about a second away, is
+  const near = (now, ...ts) => Math.min(...ts.map((t) => Math.abs(now - t)));
   // quiet: the ticker went quiet or Coinbase was closed, so a snapshot (the price from before) doesn't count until an
   // update does. calm: when a quiet ticker was last expected (a closure the board knows of). mode: where the price on
   // screen comes from, as last drawn (cbMode)
-  const cb = { ws: null, sub: null, product: null, venue: null, price: NaN, at: 0, ts: 0, beat: 0, opened: 0, last: 0, tries: 0,
-    retry: 0, dog: 0, due: 0, painted: 0, mode: "", quiet: false, calm: 0 };
+  const cb = { ws: null, sub: null, product: null, venue: null, price: NaN, at: 0, beat: 0, opened: 0, last: 0, tries: 0,
+    retry: 0, dog: 0, due: 0, painted: 0, mode: "", quiet: false, calm: 0, bars: new Map(), barMs: 7200000 };
   // Coinbase's RFC 3339 times carry nanoseconds: cut to milliseconds first (Safari's Date.parse takes no more)
   const cbTime = (s) => {
     const m = typeof s === "string" && /^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d{1,3})?\d*Z$/.exec(s);
@@ -667,7 +811,7 @@
     return isFinite(t) ? t : 0;
   };
   const cbFresh = (product, now = Date.now()) => !!cb.ws && cb.ws.readyState === 1 && cb.sub === product && cb.at > 0 &&
-    now - cb.beat < CB_BEAT && now - cb.at < CB_QUIET;
+    near(now, cb.beat) < CB_BEAT && near(now, cb.at) < CB_QUIET;
   // Coinbase closed: as the last run found it (the board's own price until a run finds it open, or, for a scheduled
   // closure, until its end), or inside a closure the board's schedule lists (its weekly break or a maintenance window)
   // that began since the run
@@ -688,7 +832,7 @@
     if (v.name === "coinbase" && cbFresh(v.product, now)) return { source: "coinbase", price: cb.price, at: cb.at };
     // past the end of a scheduled closure the run found: closed, as it found it, until Coinbase's feed shows it trading
     if (v.closed_now) return { source: null, price: NaN, at: 0, closed: { ...v.closed_now, by: "run" } };
-    return { source: "hyperliquid", price: hlMid, at: live.at, stale: !!live.at && now - live.at > STALE };
+    return { source: "hyperliquid", price: hlMid, at: live.at, stale: !!live.at && near(now, live.at) > STALE };
   }
   const cbMode = (lp) => JSON.stringify(lp, ["source", "closed", "by", "stale"]);
   const cbWanted = () => !document.hidden && !!cb.product && (!!(base && base.venue && base.venue.product === cb.product) ||
@@ -702,12 +846,12 @@
   function cbConnect() {
     cb.retry = 0;
     if (!cbWanted() || cb.ws || !("WebSocket" in window)) return;
-    const wait = cb.last + CB_GAP - Date.now();
+    const wait = Math.min(CB_GAP, cb.last + CB_GAP - Date.now());   // (a clock set back: still at most a second)
     if (wait > 0) { cb.retry = setTimeout(cbConnect, wait); return; }
     cb.last = Date.now();
     let ws;
     try { ws = new WebSocket(CB_WS); } catch { cbRetry(); return; }
-    Object.assign(cb, { ws, sub: cb.product, at: 0, ts: 0, beat: 0, opened: 0 });
+    Object.assign(cb, { ws, sub: cb.product, at: 0, beat: 0, opened: 0 });
     ws.onopen = () => {
       if (cb.ws !== ws) return;
       cb.opened = Date.now();
@@ -748,15 +892,18 @@
   // going quiet, a closure starting, the proxy going stale) is redrawn at once, and the BTC tab's footer counts its age
   function cbWatch() {
     const now = Date.now();
-    if (cb.ws && now - Math.max(cb.opened || cb.last, cb.beat) > CB_DEAD) { cbDrop(); return; }
+    if (cb.ws && near(now, cb.opened || cb.last, cb.beat) > CB_DEAD) { cbDrop(); return; }
     if (cbClosed(cb.venue, now)) { cb.at = 0; cb.quiet = true; cb.calm = now; }   // nothing from before it is live after it
-    else if (cb.ws && cb.opened && now - Math.max(cb.at, cb.opened, cb.calm) > CB_QUIET) { cb.quiet = true; cbDrop(true); return; }
+    else if (cb.ws && cb.opened && near(now, cb.at, cb.opened, cb.calm) > CB_QUIET) { cb.quiet = true; cbDrop(true); return; }
     const on = base && base.venue ? base : { venue: cb.venue, header: { coin: "BTC" } };   // another tab: the BTC card
     if (cbMode(livePrice(on, now)) !== cb.mode) cbPaint(true);
     else if (on === base && state && state.venue) txt($("foot"), foot(state));
   }
   // Parsed defensively: text only, JSON only; heartbeats and the ticker for this product only (acks, errors and
-  // any new kind of message are ignored, as Coinbase asks); a price is a positive decimal; nothing older than shown
+  // any new kind of message are ignored, as Coinbase asks); a price is a positive decimal. Newest is the last to
+  // arrive (one socket delivers in order) and how fresh it is is when it arrived here (cb.at): Coinbase's own stamp
+  // never decides either, so a message stamped in the future (a clock off at either end) can't hold back the ones
+  // after it. The stamp only places a price in its 2h window for the forming candle, when it's near the arrival time
   function cbMessage(raw) {
     if (typeof raw !== "string" || raw.length > 65536) return;
     let m;
@@ -766,7 +913,6 @@
     if (m.channel === "heartbeats") { cb.beat = now; return; }
     if (m.channel !== "ticker") return;
     const ts = cbTime(m.timestamp);
-    if (ts && ts < cb.ts) return;
     let p = NaN, upd = false;
     m.events.forEach((e) => (e && Array.isArray(e.tickers) ? e.tickers : []).forEach((k) => {
       const x = !k || k.product_id !== cb.sub ? NaN : typeof k.price === "number" ? k.price   // Coinbase sends "80835": plain decimals only
@@ -778,8 +924,18 @@
     // after a quiet spell or a closure (or past the end of one the run found), a snapshot is only the price from before
     // it: it takes an update, a trade or the book moving, to count as live again
     if (!upd && (cb.quiet || (cb.venue && cb.venue.closed_now))) return;
-    cb.quiet = false; cb.price = p; cb.at = now; if (ts) cb.ts = ts;
+    cb.quiet = false; cb.price = p; cb.at = now;
+    cbSeen(p, ts && Math.abs(ts - now) <= CB_SKEW ? ts : now);
     cbPaint();
+  }
+  // Coinbase's prices this page has seen, by 2h window (its open -> {o, h, l, c, at}, at = the newest one's time): what
+  // carries BTC's forming candle on between runs (formingBars). Only the ticker's prices as they come, never Coinbase's
+  // candles channel (measured incomplete); the newest three windows are kept
+  function cbSeen(p, t) {
+    const w = Math.floor(t / cb.barMs) * cb.barMs, x = cb.bars.get(w);
+    if (x) { x.h = Math.max(x.h, p); x.l = Math.min(x.l, p); x.c = p; x.at = t; return; }
+    cb.bars.set(w, { o: p, h: p, l: p, c: p, at: t });
+    [...cb.bars.keys()].sort((a, b) => b - a).slice(3).forEach((k) => cb.bars.delete(k));
   }
   function cbPaint(now = false) {   // now: where the price comes from changed, drawn at once rather than within a second
     if (cb.due && !now) return;
@@ -793,7 +949,7 @@
         state.livePx.at = cb.at; txt($("foot"), foot(state));
       } else render(true);                          // only what the price moves; render says when its source changed
       if (state.livePx.source === "coinbase" && (!told || told.priceAt !== cb.at)) ticked();   // a new Coinbase message
-    }, now ? 0 : Math.max(0, cb.painted + CB_PAINT - Date.now()));
+    }, now ? 0 : Math.min(CB_PAINT, Math.max(0, cb.painted + CB_PAINT - Date.now())));   // (a clock set back: not later)
   }
   document.addEventListener("visibilitychange", () => { if (document.hidden) cbClose(); else if (base) render(); });
 
@@ -831,22 +987,22 @@
   }
 
   // Overlay live prices on the last published snapshot: price, unrealised P&L, balance, forming candle (BTC on
-  // Coinbase: a live price marker instead, from Coinbase's feed only).
+  // Coinbase: the run's own forming candle carried on with Coinbase's feed, formingBars, and a live price marker).
   function withLive(snap) {
     if (!snap) return snap;
     const s = JSON.parse(JSON.stringify(snap));
     if (s.header.kind === "basket") return withLiveBasket(s);
     const lp = s.livePx = livePrice(s);   // Coinbase closed: no price, so the board's own, nothing re-marked
+    if (s.venue) formingBars(s, Date.now());
     const mid = lp.price;
     if (!mid) return s;
     if (lp.source === "coinbase") s.chart.live = mid;
     const t = s.ticker;
     t.price = mid; s.analysis.stats.price = mid;
-    const p = t.pos;
-    const u = p ? (p.side === "long" ? 1 : -1) * p.qty * (mid - p.entry) : 0;
-    if (t.cash != null && t.cash + u > 0) {
-      t.hold_pct = p ? u / (p.qty * p.entry) : 0;
-      rebank(s, t.cash + u);
+    const p = t.pos, m = remark(t.cash, p, mid);
+    if (m) {
+      t.hold_pct = p ? m.u / (p.qty * p.entry) : 0;
+      rebank(s, m.bank);
     }
     const c = live.candle, ch = s.chart;   // never Hyperliquid's forming candle on a Coinbase chart
     if (c && !s.venue && live.candleCoin === (s.header.coin || "BTC") && ch.candles.length && c[0] > ch.candles[ch.candles.length - 1][0]) {
@@ -860,6 +1016,73 @@
     return s;
   }
 
+  // A desk account's bank re-marked at `price`: its cash (the realised balance) plus the open position's move. The tab
+  // (withLive) and its card in the tab row both use this, so they agree. null: nothing to re-mark with
+  function remark(cash, pos, price) {
+    if (cash == null || !(price > 0)) return null;
+    const u = pos ? (pos.side === "long" ? 1 : -1) * pos.qty * (price - pos.entry) : 0;
+    return cash + u > 0 ? { bank: cash + u, u } : null;
+  }
+  // index.json's BTC row as a venue livePrice reads: Coinbase's product, closed now (and until when), its next closure
+  const rowVenue = (c) => c.product ? { name: c.venue, product: c.product, closed_now: c.closed_now || null,
+    session: { next_closure: c.next_closure || null } } : null;
+  // A desk account's card, priced as its own tab would be right now, so it reads the same whichever tab is open: ETH and
+  // SOL at Hyperliquid's mid; BTC on Coinbase by livePrice on its venue (Coinbase's own price while the feed is fresh,
+  // else Hyperliquid's as the proxy, the board's price while Coinbase is closed). The re-mark is the tab's (remark).
+  // {bank, price, lp}: the board's bank and price when there's no live price (or an index from before cash was in it)
+  function cardMark(c) {
+    const lp = c.venue === "coinbase" ? livePrice({ venue: rowVenue(c) || cb.venue, header: { coin: c.coin } })
+      : { source: "hyperliquid", price: live.at ? parseFloat(live.mids[c.coin]) : NaN };
+    const price = lp.source && lp.price > 0 ? lp.price : NaN, m = remark(c.cash, c.pos, price);
+    return { bank: m ? m.bank : c.bank, price: price > 0 ? price : c.price, lp };
+  }
+  // The BTC card's mark for whose price it shows (its tab's ticker and footer say it in full), from the same livePrice
+  // call as the price: [word, the long form for its title, class]. Short enough for a 320 px phone's card
+  function srcMark(lp) {
+    if (!lp) return null;
+    if (lp.closed) return ["closed", `Coinbase is closed (${lp.closed.why}): the last run's price`, "closed"];
+    if (lp.source === "coinbase") return ["cb", "Coinbase's own price, from its live feed", "cb"];
+    if (lp.source === "hyperliquid" && lp.price > 0) {
+      return lp.stale ? ["hl stale", "Hyperliquid's BTC, a proxy for Coinbase's, and stale: no new answer for over 20 s", "stale"]
+        : ["hl proxy", "Hyperliquid's BTC, a proxy for Coinbase's: no price from Coinbase's own feed just now", "proxy"];
+    }
+    return ["last run", "the last run's price: no live price yet", "run"];
+  }
+
+  // BTC on Coinbase: the candle still forming, drawn as the chart's newest. The run's own (board chart.forming, read
+  // from Coinbase at chart.forming_as_of; the desk never decides on it), carried on with Coinbase's prices this page has
+  // seen in its window since the run: the close the newest of them, the high and low widened by each. The window after
+  // it, once it has begun, is drawn from those prices alone; a window after one the page saw nothing of isn't drawn
+  // (the chart's slots are candles in a row). Each is provisional (chart.prov, drawn dashed): the page sees no price
+  // from before it opened or while it was hidden, so a high or a low since the run can be missing. So is the run's own
+  // with nothing newer on it: the run saw only part of its window, and its close is the run's price, not now's (the
+  // feed down, Hyperliquid's price the proxy, Coinbase closed since, or no message yet), whether its window is still
+  // open or has closed. The next run's board brings the desk's own candle. Never Coinbase's candles channel, never
+  // Hyperliquid's candle on this chart. chart.provFeed: some of it is the feed's; chart.provRun: the run's own is drawn
+  // as it answered, at chart.runIdx, its close the run's price (chart.provRunDone: and its window has closed since)
+  function formingBars(s, now) {
+    const ch = s.chart, bar = ch.bar_ms, cs = ch.candles;
+    ch.prov = []; ch.provFeed = false; ch.provRun = false; ch.provRunDone = false; ch.runIdx = -1;
+    if (!bar || !cs.length) return;
+    const line = (s.analysis.outlook && s.analysis.outlook[0]) ? s.analysis.outlook[0].level : null, short = s.analysis.outlook_side === "short";
+    const add = (c, prov) => {
+      cs.push(c); ch.ema_fast.push(null); ch.ema_slow.push(null);
+      ch.don_lo.push(short ? line : null); ch.don_hi.push(short ? null : line);
+      if (prov) ch.prov.push(cs.length - 1);
+    };
+    let next = cs[cs.length - 1][0] + bar;   // the window the chart's next slot is for (a closure has no candles)
+    const f = Array.isArray(ch.forming) && ch.forming.length === 5 && ch.forming[0] >= next ? ch.forming.slice() : null;
+    if (f) {
+      const x = cb.bars.get(f[0]), after = !!x && x.at > (ch.forming_as_of || 0);
+      if (after) { f[2] = Math.max(f[2], x.h); f[3] = Math.min(f[3], x.l); f[4] = x.c; ch.provFeed = true; }
+      ch.provRun = !after; ch.provRunDone = !after && f[0] + bar <= now;
+      add(f, true);
+      if (!after) ch.runIdx = cs.length - 1;
+      next = f[0] + bar;
+    }
+    for (let x = cb.bars.get(next); x; x = cb.bars.get(next += bar)) { add([next, x.o, x.h, x.l, x.c], true); ch.provFeed = true; }
+  }
+
   function renderCoins() {
     const nav = $("coins");
     if (!index || !index.coins) { nav.hidden = true; return; }
@@ -867,31 +1090,33 @@
     let start = 0, bank = 0, net = 0;
     const cards = index.coins.map((c) => {
       if (c.error) return `<button class="coin err" data-coin="${esc(c.coin)}"><span class="c-name">${esc(c.coin)}</span><span class="c-sub">error: ${esc(c.error)}</span></button>`;
-      const basket = c.kind === "basket", lp = parseFloat(live.mids[c.coin]);
+      const basket = c.kind === "basket";
       const open = c.coin === (state && state.header.coin) && state.ticker.bank != null;
-      let b = open ? state.ticker.bank : c.bank;
+      // its tab open: what the tab shows; otherwise re-marked here by the tab's own rules (cardMark), every card and
+      // so the ALL total moving with the live prices whichever tab is open
+      const mk = basket ? null : cardMark(c);
+      let b = open ? state.ticker.bank : basket ? c.bank : mk.bank;
       if (basket && !open && live.at && c.holdings) {   // the basket's tab isn't open: re-mark it from the same mids
         const m = basketLive(c.cash, JSON.parse(JSON.stringify(c.holdings)));
         if (m.bank > 0) b = m.bank;
       }
       start += c.start; bank += b; net += c.net_flows || 0;
-      // BTC on Coinbase: its tab open, the price its ticker shows; otherwise by the same rules, from its board as last
-      // shown: the board's price while Coinbase is closed, Coinbase's own while the feed is fresh, else Hyperliquid's
-      const cbCard = c.venue === "coinbase" && !basket, cbq = cbCard && livePrice({ venue: cb.venue, header: { coin: c.coin } });
-      const label = basket ? (c.holdings || []).map((h) => h.coin).join("·") : cbCard && open && state.livePx ? px(state.ticker.price)
-        : cbCard ? (cb.mode = cbMode(cbq), px(cbq.source && cbq.price || c.price)) : lp ? px(lp) : px(c.price);
+      if (c.venue === "coinbase" && !basket && !open) cb.mode = cbMode(mk.lp);   // cbWatch redraws the card when it changes
+      const label = basket ? (c.holdings || []).map((h) => h.coin).join("·") : open ? px(state.ticker.price) : px(mk.price);
+      const src = c.venue === "coinbase" && !basket ? srcMark(open ? state.livePx : mk.lp) : null;   // BTC: whose price it is
       const sub = basket ? " · basket" : ` · risk ${(c.risk_per_trade * 100).toFixed(0)}%${c.shorts ? " · +shorts" : ""}${c.venue ? ` · ${esc(c.venue)}` : ""}`;
       const made = c.units != null ? b - c.start - (c.net_flows || 0) : b - c.start;
       const pnlCls = b == null || c.start == null ? "" : tone(made);
       return `<button class="coin ${c.coin === coin ? "on" : ""}" data-coin="${esc(c.coin)}" aria-pressed="${c.coin === coin}">` +
-        `<span class="c-name">${esc(c.coin)}<i>${esc(label)}</i></span><span class="c-bank ${pnlCls}">${usd(b)}</span>` +
+        `<span class="c-name">${esc(c.coin)}<i${src ? ` class="c-px" title="${esc(src[1])}"` : ""}>` +
+        `${src ? `<b class="c-src ${src[2]}">${src[0]}</b>` : ""}${esc(label)}</i></span><span class="c-bank ${pnlCls}">${usd(b)}</span>` +
         `<span class="c-sub">${c.units ? `${pct(b / c.units - 1)} perf · P&amp;L ${usd(b - c.start - c.net_flows, 0)}` : pct(b / c.start - 1)} · ${esc(c.position)} · ${esc(c.record)}${sub}</span></button>`;
     });
     const left = index.coins.filter((c) => c.error).map((c) => c.coin);   // no bank this run: not in the total
-    const put = start + net;   // with deposits: the P&L on everything put in, never counting the deposits as profit
-    const allCls = (net ? put > 0 : !!start) ? tone(net ? bank - put : bank - start) : "";
+    const putIn = start + net;   // with deposits: the P&L on everything put in, never counting the deposits as profit
+    const allCls = (net ? putIn > 0 : !!start) ? tone(net ? bank - putIn : bank - start) : "";
     cards.push(`<div class="coin total"><span class="c-name">ALL</span><span class="c-bank ${allCls}">${usd(bank)}</span>` +
-      (net ? `<span class="c-sub">${pct(put > 0 ? (bank - put) / put : 0)} · P&amp;L ${usd(bank - put)} on ${usd(put, 0)} put in` :
+      (net ? `<span class="c-sub">${pct(putIn > 0 ? (bank - putIn) / putIn : 0)} · P&amp;L ${usd(bank - putIn)} on ${usd(putIn, 0)} put in` :
        `<span class="c-sub">${pct(start ? bank / start - 1 : 0)} on ${usd(start, 0)} paper`) +
       `${left.length ? ` · without ${esc(left.join(", "))}` : ""}</span></div>`);
     nav.style.setProperty("--tabs", cards.length);
@@ -943,17 +1168,28 @@
   // light: a redraw for a new price only (Coinbase's, once a second): what a price moves, not the agents, their
   // bubbles, the P&L bars, the rules or the switches, which only a new board changes. drawn: what the last one showed
   const drawn = { bank: null, price: null, source: null, mids: 0 };
+  // Only `true` is the light redraw. A resize hands render its event (a phone turned on its side): everything is redrawn
+  // at the new size, the equity curve and the P&L bars too, a full render, once a frame at most
+  let resized = 0;
   function render(light = false) {
+    if (light !== true && light !== false) { if (!resized) resized = requestAnimationFrame(() => { resized = 0; render(); }); return; }
     state = withLive(base);
     if (!state) return;
     const s = state, hdr = s.header, lp = s.livePx || {};
-    if (s.venue && s.venue.name === "coinbase" && s.venue.product) { cb.product = s.venue.product; cb.venue = s.venue; }   // kept for the BTC card
+    // Coinbase's product and closures for the socket and the BTC card: the BTC board's while it's open, else the
+    // index's row for it (the same run), so a page opened straight on another tab prices the BTC card by the same rules
+    const cbRow = !s.venue && index && index.coins ? index.coins.find((c) => c.venue === "coinbase" && !c.error && c.product) : null;
+    const was = cb.product;
+    if (s.venue && s.venue.name === "coinbase" && s.venue.product) { cb.product = s.venue.product; cb.venue = s.venue; cb.barMs = s.chart.bar_ms || cb.barMs; }
+    else if (cbRow) { cb.product = cbRow.product; cb.venue = rowVenue(cbRow); }
+    if (was && was !== cb.product) cb.bars.clear();   // another product's prices aren't this one's candle
     cbSync();
     txt($("title"), hdr.title);
     txt($("tagline"), hdr.tagline);
     txt($("mode"), hdr.mode); $("mode").className = `mode ${hdr.mode.toLowerCase()}`;
-    txt($("daydate"), `DAY ${hdr.day} · ${hdr.date}`);
-    txt($("time"), hdr.time);
+    txt($("daydate"), `DAY ${hdr.day} · ${MT.day(s.updated).toUpperCase()}`);   // the run's time and date, in MT
+    txt($("time"), MT.clock(s.updated));
+    txt($("tz"), TZ);
     const basket = hdr.kind === "basket";
     document.body.classList.toggle("kind-basket", basket);
     document.body.dataset.coin = String(hdr.coin || "BTC").toUpperCase();
@@ -979,17 +1215,31 @@
   }
   function foot(s) {
     const hdr = s.header, lp = s.livePx || {};
-    const age = Math.round((Date.now() - s.updated) / 60000), secs = (t) => Math.max(0, Math.round((Date.now() - t) / 1000));
+    // (a phone clock behind the desk's: 0 min, never a negative age)
+    const age = Math.max(0, Math.round((Date.now() - s.updated) / 60000)), secs = (t) => Math.max(0, Math.round((Date.now() - t) / 1000));
     const cn = lp.closed;   // BTC on Coinbase: its own feed, else Hyperliquid's as a proxy, else closed (and why)
-    return `desk updated ${new Date(s.updated).toISOString().replace("T", " ").slice(0, 16)} UTC (${age} min ago)` +
-      (s.venue && cn ? (cn.by === "schedule" ? ` · Coinbase is closed now by its schedule (${cn.why}, until ${hhmm(cn.until)} UTC): no live price`
+    return `desk updated ${MT.when(s.updated)} ${TZ} (${age} min ago)` +
+      (s.venue && cn ? (cn.by === "schedule" ? ` · Coinbase is closed now by its schedule (${cn.why}, until ${hhmm(cn.until)} ${TZ}): no live price`
         : ` · Coinbase was closed at the last run (${cn.why}): no live price until a run finds it open` +
-          (cn.scheduled && cn.until ? ` or, after ${hhmm(cn.until)} UTC, its own feed does` : ""))
+          (cn.scheduled && cn.until ? ` or, after ${hhmm(cn.until)} ${TZ}, its own feed does` : ""))
       : s.venue && lp.source === "coinbase" ? ` · live price ${secs(lp.at)}s ago from Coinbase`
+      : s.venue && lp.stale ? ` · stale price: Hyperliquid's (a proxy for Coinbase's) last came ${secs(live.at)}s ago, and nothing from Coinbase's own feed just now`
       : live.at ? ` · live price ${secs(live.at)}s ago from Hyperliquid` +
         (s.venue ? ` (a proxy: no price from Coinbase's own feed just now; the desk marks at Coinbase's price every run)` : "") : "") +
+      provNote(s.chart) +
       (missing ? ` · no ${missing} board this run (its step failed), showing ${hdr.coin || "BTC"}` : "") +
       ` · not financial advice; the desk can and will lose money`;
+  }
+
+  // BTC's provisional newest candle(s) (formingBars), as the footer says it: from Coinbase's live feed, or the run's own
+  // as it answered (and whether its window has closed since); either way the next run's board brings the desk's own
+  function provNote(ch) {
+    const n = ch.prov ? ch.prov.length : 0;
+    const run = ch.provRun ? `the desk's as of ${hhmm(ch.forming_as_of)} ${TZ}${ch.provRunDone ? ", before its window closed" : ""}` : "";
+    if (!n) return "";
+    const from = [ch.provFeed ? "from Coinbase's live feed" : "", run].filter(Boolean).join(" and ");
+    return n > 1 ? ` · newest ${n} candles: provisional, ${from}; the desk's own candles replace them at the next run`
+      : ` · newest candle: provisional, ${from}; the desk's own candle replaces it at the next run`;
   }
 
   // Live server: /api/state every 2s. Static hosting (GitHub Pages): boards/<COIN>.json every 60s.

@@ -31,7 +31,8 @@
   /* meaning: 4.5:1 as text on --panel, --panel-2 and --caption */
   --green: #0d7440;         /* a gain, PASS, scan */
   --red: #a0158a;           /* a loss, DROP, a kill or halt that is ON: magenta, never --brand-red */
-  --orange: #7e2400;        /* risk, the stop, warnings: a deep rust, apart from the gain green for a red-green-blind eye */
+  --orange: #a84a00;        /* risk, the stop, warnings: a burnt orange (a deeper rust read as a dark red, a loss, in a
+                               run of text), apart from the gain green for a red-green-blind eye as well as rust was */
   --amber: #846000;         /* vet, MARK, an order waiting */
   --blue: #1c2a66;          /* crowd, the slow average, WAIT, deposits: navy */
   --cyan: #2348c8;          /* the crawler, live prices, the fast average: lab-ink blue */
@@ -151,17 +152,18 @@ html[data-desk="up"] .ring::after { border-color: transparent; border-bottom-col
 .live-dot { box-shadow: 0 0 0 1.5px var(--panel), 0 0 0 2.5px var(--cyan); }
 
 /* ---- money: a gain gets an up triangle, a loss a down one, zero nothing (app.js's tone(): up / down / flat) ------ */
-:is(.c-bank, #balance, #bal-hold, #ticker span, #vt-ticker span).up::before,
-:is(.c-bank, #balance, #bal-hold, #ticker span, #vt-ticker span).down::before {
+:is(.c-bank, #balance, #bal-hold, #ticker span, #vt-ticker span, .h-row .h-pnl).up::before,
+:is(.c-bank, #balance, #bal-hold, #ticker span, #vt-ticker span, .h-row .h-pnl).down::before,
+.stats .h-pnl:is(.up, .down) > b::before {
   content: ""; display: inline-block; width: .6em; height: .52em; margin-right: .22em; vertical-align: .06em; background: currentColor;
   -webkit-clip-path: polygon(50% 0, 100% 100%, 0 100%); clip-path: polygon(50% 0, 100% 100%, 0 100%);
 }
-:is(.c-bank, #balance, #bal-hold, #ticker span, #vt-ticker span).down::before {
+:is(.c-bank, #balance, #bal-hold, #ticker span, #vt-ticker span, .h-row .h-pnl).down::before, .stats .h-pnl.down > b::before {
   -webkit-clip-path: polygon(0 0, 100% 0, 50% 100%); clip-path: polygon(0 0, 100% 0, 50% 100%);
 }
-:is(.c-bank, #bal-hold, #ticker span, #vt-ticker span).flat { color: var(--text); }
+:is(.c-bank, #bal-hold, #ticker span, #vt-ticker span, .h-row .h-pnl).flat, .stats .h-pnl.flat { color: var(--text); }   /* VT's unrealised too */
 #balance.flat { color: var(--text) !important; }   /* app.js colors the big balance inline: zero is neither */
-:is(.c-bank, #balance, #bal-hold, #ticker span, #vt-ticker span):is(.up, .down) { white-space: nowrap; }   /* the mark stays with its number */
+:is(.c-bank, #balance, #bal-hold, #ticker span, #vt-ticker span, .h-row .h-pnl):is(.up, .down) { white-space: nowrap; }   /* the mark stays with its number */
 #balance.up::before, #balance.down::before { width: .5em; height: .42em; vertical-align: .14em; }
 
 /* ---- agent cards: one comic panel per character, its color as the strip on top, its line in a caption box ------ */
@@ -174,6 +176,9 @@ html[data-desk="up"] .ring::after { border-color: transparent; border-bottom-col
 .card.alert { box-shadow: 4px 4px 0 var(--card, var(--shadow)); }
 .card.blocked { border-color: var(--red); border-top-color: var(--red); box-shadow: 4px 4px 0 var(--red);
   background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--red) 9%, transparent) 0 4px, transparent 4px 9px), var(--panel); }
+/* SIZE's value is dollars that are neither a gain nor a loss (the trade it would size): ink with a hint of the card's
+   color, never a shade a gain's green could be taken for */
+#card-size .value { color: var(--text); color: color-mix(in srgb, var(--lime) 20%, var(--text)); }
 .card .quote { background: var(--caption); border: 1.5px solid var(--pen); color: var(--text); padding: 2px 5px; font-family: var(--pixel); font-weight: 600; font-size: 11px; line-height: 1.3; }
 .bar { background: var(--line); }
 

@@ -180,10 +180,16 @@ def _notify(state: dict) -> None:
         return
     import urllib.request
 
+    from .board import in_mountain_time
+
     t, coin = state["ticker"], state["header"].get("coin", "BTC")
     fl = state.get("flows")     # with deposits, the percentage is the time-weighted one: they aren't in it
     v = state.get("venue")      # BTC on Coinbase: its fills read like the real product's, so the push says paper
-    body = "\n".join(f"{e['agent'].upper()}: {e['text']}" for e in events)
+    # every time in Mountain Time (the board's events already are; one from elsewhere is converted here)
+    import time
+
+    body = "\n".join(f"{e['agent'].upper()}: {in_mountain_time(e['text'], e.get('ts') or int(time.time() * 1000))}"
+                     for e in events)
     body += (f"\n\n{coin} {'paper ' if v else ''}account ${t['bank']:,.2f} ({t['pnl_pct']:+.2%}"
              f"{' time-weighted' if fl else ''}) · {t['position']}")
     body += f" · {coin} ${t['price']:,.2f}" if t.get("price") is not None else ""    # the VT basket has no one price
@@ -229,8 +235,10 @@ def _notify_paused(paused: list[tuple[str, str]], path: Path, now_ms: int | None
         edited = 0
     if not (0 <= now - edited < 20 * 60_000 or now % PAUSED_PUSH_EVERY_MS < 15 * 60_000):
         return False
+    from .board import in_mountain_time
+
     names = ", ".join(c for c, _ in paused)
-    body = "\n\n".join(f"{c}: {text}" for c, text in paused) + (
+    body = "\n\n".join(f"{c}: {in_mountain_time(text, now)}" for c, text in paused) + (
         f"\n\nNothing is lost: fix {path.name} on main and the next run catches up every missed candle.")
     req = urllib.request.Request(f"https://ntfy.sh/{topic}", data=body.encode(), method="POST", headers={
         "Title": f"{names} paused: {path.name}", "Priority": "high", "Tags": "warning"})
@@ -251,8 +259,11 @@ def _notify_refused(refused: list[tuple[str, str]], now_ms: int | None = None) -
     now = int(time.time() * 1000) if now_ms is None else now_ms
     if not topic or now % PAUSED_PUSH_EVERY_MS >= 15 * 60_000:
         return False
+    from .board import in_mountain_time
+
     names = ", ".join(c for c, _ in refused)
-    body = "\n\n".join(f"{c}: {text}" for c, text in refused) + "\n\nThe other accounts keep running."
+    body = "\n\n".join(f"{c}: {in_mountain_time(text, now)}" for c, text in refused) + \
+        "\n\nThe other accounts keep running."
     req = urllib.request.Request(f"https://ntfy.sh/{topic}", data=body.encode(), method="POST", headers={
         "Title": f"{names} paused: ledger from another venue", "Priority": "high", "Tags": "warning"})
     try:
@@ -280,6 +291,7 @@ def cmd_step(args) -> int:
     import time
     import traceback
 
+    from . import board as board_mod
     from . import flows as flows_mod
     from . import paper
 
@@ -303,7 +315,9 @@ def cmd_step(args) -> int:
             failed.append(coin)
             print(f"  {coin}: step failed: {type(exc).__name__}: {exc}")
             traceback.print_exc()
-            summary.append({"coin": coin, "error": f"{type(exc).__name__}: {exc}"[:600 if isinstance(
+            # the page shows it: its times in Mountain Time (a refused ledger's opening, say)
+            said = board_mod.in_mountain_time(f"{type(exc).__name__}: {exc}", int(time.time() * 1000))
+            summary.append({"coin": coin, "error": said[:600 if isinstance(
                 exc, (flows_mod.FlowsError, paper.LedgerRefused)) else 200]})
             if isinstance(exc, flows_mod.FlowsError):
                 paused.append((coin, str(exc)))
@@ -326,6 +340,7 @@ def cmd_step(args) -> int:
                                      for h in s["basket"]["holdings"]]})
         else:
             row.update({"kind": "desk", "risk_per_trade": p.sizing.risk_per_trade, "shorts": p.strategy.allow_shorts})
+            row.update(board_mod.index_marks(s))     # cash, position, sessions: the card's live re-mark
             if s.get("venue"):      # BTC on Coinbase: the tab says so, with the contracts it holds
                 row.update({"venue": s["venue"]["name"], "contracts": s["venue"]["contracts"]})
         summary.append(row)

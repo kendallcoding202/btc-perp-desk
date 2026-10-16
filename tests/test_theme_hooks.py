@@ -53,7 +53,8 @@ def test_app_js_money_spans_get_their_classes_from_tone():
     assert '<span class="${tone(s.ticker.pnl)}">P&amp;L' in APP
     assert '$("bal-hold").className = tone(t.hold_pct, 4)' in APP
     assert '$("balance").className = `big ${tone(t.pnl)}`' in APP
-    assert "tone(made)" in APP and "tone(net ? bank - put : bank - start)" in APP
+    assert "tone(made)" in APP and "tone(net ? bank - putIn : bank - start)" in APP
+    assert 'class="h-pnl ${tone(h.unrealised)}"' in APP and '`h-pnl ${tone(t.unrealised)}`' in APP   # VT's unrealised
     assert 'closedTag("CLOSED (COINBASE) · ")' in APP
 
 

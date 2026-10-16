@@ -1,7 +1,7 @@
 // The page's two editions: day (cream paper) and night (dark paper). "auto" follows the device's light / dark setting;
 // day or night picked in the footer is remembered on this device only (localStorage, and the page works without it).
-// index.html's head sets html[data-edition] before the first paint; this wires the footer switch, keeps the phone's
-// status bar (theme-color) in step, and tells app.js and spider.js to repaint their canvases ("desk:theme").
+// index.html's head sets html[data-edition] and the phone's status bar (theme-color) before the first paint; this wires
+// the footer switch, keeps the status bar in step, and tells app.js and spider.js to repaint their canvases ("desk:theme").
 (() => {
   "use strict";
   const root = document.documentElement, KEY = "desk-edition";
@@ -11,9 +11,10 @@
     set(v) { try { if (v === "auto") localStorage.removeItem(KEY); else localStorage.setItem(KEY, v); } catch { /* private mode */ } },
   };
   // index.html has one theme-color per edition, each with its own media query; a picked edition sets both to its color
+  // (index.html's head already did, before the first paint, and kept each one's own color in data-own)
   const metas = [...document.querySelectorAll('meta[name="theme-color"]')];
   const color = { day: "", night: "" };
-  metas.forEach((m) => { m.dataset.own = m.content; color[/dark/.test(m.media) ? "night" : "day"] = m.content; });
+  metas.forEach((m) => { if (!m.dataset.own) m.dataset.own = m.content; color[/dark/.test(m.media) ? "night" : "day"] = m.dataset.own; });
   const picked = () => { const v = root.dataset.edition; return v === "day" || v === "night" ? v : "auto"; };
   const shown = () => picked() === "auto" ? (dark.matches ? "night" : "day") : picked();
   let last = shown();

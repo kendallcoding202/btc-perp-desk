@@ -9,7 +9,9 @@
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" content="#e8dfca" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#0d1119" media="(prefers-color-scheme: dark)">
-<script>try{var e=localStorage.getItem("desk-edition");if(e=="day"||e=="night")document.documentElement.dataset.edition=e}catch(x){}</script>
+<!-- a picked edition, before the first paint: the page's colors and the phone's status bar (both theme-colors take
+     the picked one's; each keeps its own in data-own for edition.js's auto) -->
+<script>try{var e=localStorage.getItem("desk-edition");if(e=="day"||e=="night"){document.documentElement.dataset.edition=e;var m=document.querySelectorAll('meta[name="theme-color"]'),c="",i;for(i=0;i<m.length;i++)if(/dark/.test(m[i].media)==(e=="night"))c=m[i].content;for(i=0;i<m.length;i++){m[i].setAttribute("data-own",m[i].content);if(c)m[i].content=c}}}catch(x){}</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap">
@@ -33,7 +35,7 @@
     <div class="clock">
       <span class="mode" id="mode">—</span>
       <span class="daydate" id="daydate">DAY — · —</span>
-      <span class="time"><b id="time">--:--</b> UTC</span>
+      <span class="time"><b id="time">--:--</b> <span id="tz">MT</span></span>
     </div>
   </header>
 
@@ -72,7 +74,7 @@
   <!-- the VT basket's tab: its three coins instead of the price chart and the agents -->
   <section class="panel basket basket-only" id="basket">
     <div class="ticker" id="vt-ticker">‹ BASKET</div>
-    <div class="panel-head"><span>HOLDINGS · AT THE 00:00 UTC CLOSE</span><span class="wait" id="vt-next">NEXT DECISION 00:00 UTC</span></div>
+    <div class="panel-head"><span id="vt-head">HOLDINGS · AT THE DAILY CLOSE</span><span class="wait" id="vt-next">NEXT DECISION</span></div>
     <div class="vt-body">
       <div class="ol-exp" id="vt-exp"></div>
       <p class="vt-rule" id="vt-rule"></p>

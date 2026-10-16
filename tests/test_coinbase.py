@@ -454,7 +454,9 @@ def test_a_candle_coinbase_never_published_is_accepted_after_two_answers_and_6_h
     led = json.loads((tmp_path / "paper.json").read_text())
     assert led["venue"]["holes"]["accepted"] == [gone] and led["meta"]["last_bar_ts"] == _ms("2026-10-13T18:00")
     ev = [e for e in st["paper"]["new_events"] if e["agent"] == "crawler"]
-    assert len(ev) == 1 and ev[0]["text"].startswith("Coinbase never published the 2026-10-12 22:00 UTC candle")
+    # the board and the phone say it in Mountain Time (22:00 UTC is 4:00 pm MDT); the ledger keeps the desk's words
+    assert len(ev) == 1 and ev[0]["text"].startswith("Coinbase never published the Oct 12, 4:00 pm MT candle")
+    assert any(e["text"].startswith("Coinbase never published the 2026-10-12 22:00 UTC candle") for e in led["desk"]["events"])
     _, feed = served(drop=[gone])
     assert not _step(feed, tmp_path, s.now)["paper"]["new_events"]           # said once; no longer waited for
 
