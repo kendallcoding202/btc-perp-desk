@@ -172,6 +172,11 @@ def _usd(x: float | None, dp: int = 2) -> str:
     return "—" if x is None else f"${x:,.{dp}f}"
 
 
+def _bps(rate: float | None) -> str:
+    """A fee rate as the SHADOW page says it: 0.0005 is "5bps", 0.00025 "2.5bps"."""
+    return "—" if rate is None else f"{round(rate * 1e4, 2):g}bps"
+
+
 # What a push may not say without NTFY_TOKEN: dollar amounts, and signed or currency-tagged two-decimal figures (a
 # balance move, a P&L). Prices without a $ (a stop level, BTC's price) and contract counts stay.
 _MONEY = re.compile(r"[-+]?\$\s?-?[\d,]+(?:\.\d+)?|(?<![\w.])[-+][\d,]*\d\.\d{2}\b|\b\d[\d,]*\.\d{2}\s?USDC?\b")
@@ -1723,7 +1728,8 @@ class Run:
                         "" if self.extras.get("fills_err") is None else self.extras["fills_err"])
         fees = self.extras.get("fees")
         self.checks.add("fees", CHECKS["fees"], fees is not None, "" if fees is None else
-                        f"{fees.get('tier') or 'tier not named'}, taker {fees.get('taker')}, maker {fees.get('maker')}")
+                        f"{fees.get('tier') or 'tier not named'}, taker {_bps(fees.get('taker'))}, maker "
+                        f"{_bps(fees.get('maker'))}")
         self.step = "reading the price, the positions, the orders and the deposits"
         mid = self.mark(ctx)
         self.mid = mid

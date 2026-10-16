@@ -26,15 +26,23 @@
   // Coinbase's codes in plain words: "FCM_MARGIN_WINDOW_TYPE_OVERNIGHT" reads "overnight". A code loses its type's
   // prefix, then the few that read badly as they are have their own words; any other reads in lower case with spaces
   // ("FCM_MARGIN_WINDOW_TYPE_LUNCH": "lunch"), so a code Coinbase adds later still says something. Words that aren't a
-  // code ("Advanced 1") stay as they are. The value Coinbase sent stays in the title (hover, or press and hold).
-  const PREFIXES = /^(FCM_MARGIN_WINDOW_TYPE|MARGIN_WINDOW_TYPE|INTRADAY_MARGIN_SETTING|MARGIN_LEVEL_TYPE|FCM_TRADING_SESSION_STATE|FUTURES_POSITION_SIDE|POSITION_SIDE|STOP_DIRECTION|FCM_SWEEP_STATUS)_/;
+  // code ("Advanced 1") stay as they are. The value Coinbase sent stays in the title (a desktop shows it on hover).
+  // The codes the page shows: the margin window and setting, a sweep's status, sides, a real order's type, a simulated
+  // stop's trigger and status, and the portfolio in an older board's check (desk/coinbase_run.py words it now)
+  const PREFIXES = /^(FCM_MARGIN_WINDOW_TYPE|MARGIN_WINDOW_TYPE|INTRADAY_MARGIN_SETTING)_/;
   const WORDS = {
-    UNSPECIFIED: "not said", UNDEFINED: "not said", UNKNOWN: "unknown", UNKNOWN_FCM_SWEEP_STATUS: "unknown",
-    UNKNOWN_ORDER_STATUS: "unknown", UNKNOWN_TRIGGER_STATUS: "unknown", UNKNOWN_ORDER_TYPE: "unknown",
-    STOP_LIMIT: "stop-limit", STOP_PENDING: "waiting to trigger", STOP_TRIGGERED: "triggered",
-    QUEUED: "queued for the reopen", CANCEL_QUEUED: "cancel queued for the reopen", EDIT_QUEUED: "edit queued",
-    CANCELLED: "canceled", STOP_UP: "up", STOP_DOWN: "down",
-    DEFAULT: "Default", CONSUMER: "Consumer", INTX: "International (INTX)",
+    UNSPECIFIED: "not said", UNKNOWN_FCM_SWEEP_STATUS: "unknown", STOP_LIMIT: "stop-limit",
+    STOP_PENDING: "waiting to trigger", STOP_TRIGGERED: "triggered", QUEUED: "queued for the reopen",
+    DEFAULT: "Default", CONSUMER: "Consumer", INTX: "International (INTX)", UNDEFINED: "unnamed",
+  };
+  // the desk's own name for what stopped a read, as a failed check's note ends ("candles: CoinbaseUnavailable",
+  // desk/brokers/coinbase_rest.py), in the words desk/coinbase_run.py's failure() says it; another name stays as it is
+  const ERRORS = {
+    CoinbaseUnavailable: "Coinbase didn't answer", DeadlineExceeded: "Coinbase didn't answer",
+    CoinbaseUncertain: "Coinbase didn't answer", CoinbaseDataError: "an answer the desk can't read",
+    FeedError: "an answer the desk can't read", CoinbaseRejected: "Coinbase refused the read",
+    CoinbaseAuthError: "Coinbase refused the key", CoinbasePermissionError: "a read the key isn't allowed to make",
+    ClockSkewError: "the clock too far off Coinbase's", CoinbaseError: "a check of the desk's own",
   };
   const isCode = (s) => /^[A-Z0-9]+(_[A-Z0-9]+)*$/.test(s) || /^[a-z0-9]+(_[a-z0-9]+)+$/.test(s);
   function plain(code) {
@@ -49,6 +57,12 @@
     const raw = String(code ?? "").trim(), said = plain(raw);
     if (!raw) return none;
     return said === raw ? esc(raw) : `<data value="${esc(raw)}" title="${esc(raw)}">${esc(said)}</data>`;
+  };
+  // a check's note, as HTML: one that ends in the desk's name for an error has that part in words, the name in the title
+  const noted = (note) => {
+    const m = /^(.*?)\b([A-Z][A-Za-z]+)$/.exec(String(note ?? "").trim());
+    if (!m || !ERRORS[m[2]]) return coded(note);
+    return `${esc(m[1])}<data value="${esc(m[2])}" title="${esc(m[2])}">${esc(ERRORS[m[2]])}</data>`;
   };
 
   function b64(s) {
@@ -67,8 +81,8 @@
     const base = await subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveKey"]);
     const key = await subtle.deriveKey({ name: "PBKDF2", salt: b64(env.salt), iterations: env.iter, hash: "SHA-256" },
       base, { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
-    const plain = await subtle.decrypt({ name: "AES-GCM", iv: b64(env.iv), additionalData: enc.encode(env.aad) }, key, b64(env.ct));
-    return JSON.parse(new TextDecoder().decode(plain));
+    const opened = await subtle.decrypt({ name: "AES-GCM", iv: b64(env.iv), additionalData: enc.encode(env.aad) }, key, b64(env.ct));
+    return JSON.parse(new TextDecoder().decode(opened));
   }
 
   // ---- the public status: no amounts, no key needed
@@ -99,7 +113,7 @@
   // what every board shows, a SHADOW that never worked included: its run's checks, its alerts, its own log. `run`:
   // "THIS RUN" when the board is the last run's, else the earlier run's time (a run since saved only its status)
   const checksHtml = (sh, run) => `<section class="panel sh-checks"><div class="panel-head"><span>EVERY READ, ${esc(run || "THIS RUN")}</span><span class="muted">a View-only key: it can't trade or move money</span></div><ul>` +
-    (sh.checks || []).map((c) => `<li class="${c.ok === true ? "ok" : c.ok === false ? "bad" : "muted"}"><b>${c.ok === true ? "OK" : c.ok === false ? "FAIL" : "—"}</b> ${esc(c.label)}${c.note ? `<i>${coded(c.note)}</i>` : ""}</li>`).join("") + `</ul></section>`;
+    (sh.checks || []).map((c) => `<li class="${c.ok === true ? "ok" : c.ok === false ? "bad" : "muted"}"><b>${c.ok === true ? "OK" : c.ok === false ? "FAIL" : "—"}</b> ${esc(c.label)}${c.note ? `<i>${noted(c.note)}</i>` : ""}</li>`).join("") + `</ul></section>`;
   const alertsHtml = (sh, earlier) => (sh.alerts || []).length ? `<div class="panel-head"><span>ALERTS ${earlier ? "THAT RUN" : "THIS RUN"}</span></div><ul>${sh.alerts.map((x) => `<li class="bad">${esc(x)}</li>`).join("")}</ul>` : "";
   const logHtml = (sh, open, earlier) => `<details${open ? " open" : ""}><summary>${earlier ? "that run's log (private)" : "this run's log (private)"}</summary><pre>${esc((sh.log || []).join("\n"))}</pre></details>`;
 
@@ -136,8 +150,9 @@
         ["buying power", usd(a.buying_power)], ["available margin", usd(a.available_margin)], ["holds", usd(a.holds)],
         ["liquidation buffer", a.liquidation_buffer_pct == null ? "—" : `${Number(a.liquidation_buffer_pct).toFixed(1)}%`],
         ["margin window", coded(a.margin_window)], ["intraday margin", coded(a.intraday_setting)],
-        a.usdc ? ["USDC in the portfolio", `<span class="bad">${esc(a.usdc)}</span>`] : null,
-        a.balance_block ? ["balance check", `<span class="bad">${esc(a.balance_block)}</span>`] : ["balance check", "adds up"],
+        // the two warnings: the row in red (a span in the value would take the label's grey)
+        a.usdc ? ["USDC in the portfolio", isNaN(a.usdc) ? esc(a.usdc) : `${usd(+a.usdc).replace("$", "")} USDC`, "bad"] : null,
+        a.balance_block ? ["balance check", esc(a.balance_block), "bad"] : ["balance check", "adds up"],
       ])}</div></div>` +
       `<div><div class="label muted">SHADOW (EST.)</div><div class="big">${usd(sim)}</div><div class="stats">${rows([
         ["simulated P&L (est.)", signed(sh.simulated_pnl)], ["position", coded(t.position) + (t.position_detail ? " " + esc(t.position_detail) : "")],
@@ -161,16 +176,17 @@
     const ws = (sh.would_send || []).slice().reverse();
     out.push(`<section class="panel sh-sends"><div class="panel-head"><span>ORDERS IT WOULD SEND</span><span class="muted">LIVE's exact requests · NONE SENT · fills simulated</span></div><ul>` +
       (ws.length ? ws.map((r) => `<li>${esc(day(r.ts))} ${esc(r.text)}<details><summary>request body</summary><pre>${esc(JSON.stringify(r.body, null, 1))}</pre></details></li>`).join("") : "<li class='muted'>none yet</li>") + `</ul></section>`);
-    // the virtual book, and what the real account holds besides
+    // the virtual book (a resting stop says its trigger, or, while the market is shut, that it's queued for the
+    // reopen), and what the real account holds besides
     const book = sh.book || {};
     out.push(`<section class="panel sh-book"><div class="panel-head"><span>SIMULATED BOOK</span><span class="muted">what LIVE would hold on Coinbase now</span></div><div class="stats">${rows([
       ["position", book.position ? `${coded(book.position.side)} ${esc(book.position.contracts)} contract(s) @ ${usd(book.position.entry)} · open P&L ${usd(book.position.upnl)} (est.)` : "flat"],
-      ["resting orders", (book.orders || []).length ? book.orders.map((o) => `${coded(o.side)} ${esc(o.n)} stop ${usd(o.stop, 0)} limit ${usd(o.limit, 0)} (${coded(o.trigger || o.status)})`).join("<br>") : "none"],
+      ["resting orders", (book.orders || []).length ? book.orders.map((o) => `${coded(o.side)} ${esc(o.n)} stop ${usd(o.stop, 0)} limit ${usd(o.limit, 0)} (${coded(o.status === "QUEUED" ? o.status : o.trigger || o.status)})`).join("<br>") : "none"],
       ["fees, funding (est.)", `${usd(book.fees)} · ${usd(book.funding)}`],
     ])}</div>` +
       `<div class="panel-head"><span>THE REAL ACCOUNT HOLDS</span><span class="muted">positions and orders the desk didn't place block its entries</span></div><div class="stats">${rows([
         ["positions", (a.positions || []).length ? a.positions.map((p) => `${esc(p.product_id)} ${coded(p.side)} ${esc(p.contracts)}`).join("<br>") : "none"],
-        ["open orders", (a.orders || []).length ? a.orders.map((o) => `${esc(o.product_id)} ${coded(o.side)} ${coded(o.type, "")}`).join("<br>") : "none"],
+        ["open orders", (a.orders || []).length ? a.orders.map((o) => `${esc(o.product_id)} ${coded(o.side)} ${o.type === "other" ? "(an order type the desk doesn't know)" : coded(o.type, "")}`).join("<br>") : "none"],
         ["fills (BIP, last 30 days)", (a.fills || []).length ? `${a.fills.length}` : "none"],
         ["pending sweeps", (a.sweeps || []).length ? a.sweeps.map((w) => `${coded(w.status)} ${w.all || w.amount == null || w.amount === "" ? "all" : isNaN(w.amount) ? esc(w.amount) : usd(+w.amount)}`).join("<br>") : "none"],
         ["fee tier", a.fee_tier ? `${coded(a.fee_tier.tier)} · taker ${bps(a.fee_tier.taker)} · maker ${bps(a.fee_tier.maker)} (fees on the board stay the estimate)` : "—"],
@@ -233,5 +249,5 @@
     load(store.get());
     setInterval(() => load(store.get()), 5 * 60 * 1000);
   }
-  if (typeof module !== "undefined") module.exports = { decrypt, statusHtml, boardHtml, BOARD_AAD, when, day, clock, plain, coded };
+  if (typeof module !== "undefined") module.exports = { decrypt, statusHtml, boardHtml, BOARD_AAD, when, day, clock, plain, coded, noted };
 })();

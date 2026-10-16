@@ -348,6 +348,7 @@ body.kind-basket .stage::after { content: none; }
 }
 @media (max-width: 420px) {
   .kind-basket .brand h1 { font-size: 19px; }
+  .kind-basket .ring { vertical-align: -6px; }   /* the smaller title's middle level with the ring's, as 23 px is at -5 */
   .card .quote { -webkit-line-clamp: 6; }   /* a 320 px phone's narrower card: SIZE's line takes five */
 }
 
