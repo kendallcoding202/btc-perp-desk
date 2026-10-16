@@ -140,6 +140,19 @@ jobs:
           fi
           ls -l _site _site/boards
 
+      # The site, stamped with the commit it was built from (tools/stamp_site.py): version.json, the build in each page's
+      # head and ?v=<short sha> on its own .js and .css, so a page left open sees new code and reloads onto it once
+      # (dashboard/version.js). Every run on one commit stamps the same: new boards alone never reload a page. It can't
+      # stop the deploy: a stamp that fails leaves each file whole and the site goes up unstamped (an open page then
+      # just doesn't update itself), with a warning.
+      - name: Stamp the site with its build
+        if: ${{ !cancelled() && steps.load.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 2
+        run: |
+          timeout 60 python3 -m tools.stamp_site _site "$GITHUB_SHA" \
+            || echo "::warning::the site goes up unstamped this run (why: above), so an open page won't update itself to it"
+
       - uses: actions/upload-pages-artifact@v3
         if: ${{ !cancelled() && steps.load.outcome == 'success' }}
         with:
