@@ -21,6 +21,35 @@
   const clock = (ms) => { const p = mt(ms); return `${p.hour}:${p.minute} ${String(p.dayPeriod || "").toLowerCase()} MT`; };
   const when = (ms) => ms ? `${day(ms)}, ${clock(ms)}` : "—";
   const ago = (ms, now) => ms ? `${Math.max(0, Math.round((now - ms) / 60000))} min ago` : "never";
+  const bps = (x) => x == null || x === "" || isNaN(x) ? "—" : `${+(x * 1e4).toFixed(2)}bps`;
+
+  // Coinbase's codes in plain words: "FCM_MARGIN_WINDOW_TYPE_OVERNIGHT" reads "overnight". A code loses its type's
+  // prefix, then the few that read badly as they are have their own words; any other reads in lower case with spaces
+  // ("FCM_MARGIN_WINDOW_TYPE_LUNCH": "lunch"), so a code Coinbase adds later still says something. Words that aren't a
+  // code ("Advanced 1") stay as they are. The value Coinbase sent stays in the title (hover, or press and hold).
+  const PREFIXES = /^(FCM_MARGIN_WINDOW_TYPE|MARGIN_WINDOW_TYPE|INTRADAY_MARGIN_SETTING|MARGIN_LEVEL_TYPE|FCM_TRADING_SESSION_STATE|FUTURES_POSITION_SIDE|POSITION_SIDE|STOP_DIRECTION|FCM_SWEEP_STATUS)_/;
+  const WORDS = {
+    UNSPECIFIED: "not said", UNDEFINED: "not said", UNKNOWN: "unknown", UNKNOWN_FCM_SWEEP_STATUS: "unknown",
+    UNKNOWN_ORDER_STATUS: "unknown", UNKNOWN_TRIGGER_STATUS: "unknown", UNKNOWN_ORDER_TYPE: "unknown",
+    STOP_LIMIT: "stop-limit", STOP_PENDING: "waiting to trigger", STOP_TRIGGERED: "triggered",
+    QUEUED: "queued for the reopen", CANCEL_QUEUED: "cancel queued for the reopen", EDIT_QUEUED: "edit queued",
+    CANCELLED: "canceled", STOP_UP: "up", STOP_DOWN: "down",
+    DEFAULT: "Default", CONSUMER: "Consumer", INTX: "International (INTX)",
+  };
+  const isCode = (s) => /^[A-Z0-9]+(_[A-Z0-9]+)*$/.test(s) || /^[a-z0-9]+(_[a-z0-9]+)+$/.test(s);
+  function plain(code) {
+    const raw = String(code ?? "").trim();
+    if (!isCode(raw)) return raw;
+    const k = raw.toUpperCase(), rest = k.replace(PREFIXES, "");
+    return WORDS[k] || WORDS[rest] || rest.toLowerCase().replace(/_/g, " ") || raw;
+  }
+  // as HTML: the plain words, escaped, with the code itself (escaped) as the title when they differ (a <data>, not a
+  // <span>: the stats rows style their spans as labels); `none` when missing
+  const coded = (code, none = "—") => {
+    const raw = String(code ?? "").trim(), said = plain(raw);
+    if (!raw) return none;
+    return said === raw ? esc(raw) : `<data value="${esc(raw)}" title="${esc(raw)}">${esc(said)}</data>`;
+  };
 
   function b64(s) {
     const bin = atob(String(s));
@@ -70,7 +99,7 @@
   // what every board shows, a SHADOW that never worked included: its run's checks, its alerts, its own log. `run`:
   // "THIS RUN" when the board is the last run's, else the earlier run's time (a run since saved only its status)
   const checksHtml = (sh, run) => `<section class="panel sh-checks"><div class="panel-head"><span>EVERY READ, ${esc(run || "THIS RUN")}</span><span class="muted">a View-only key: it can't trade or move money</span></div><ul>` +
-    (sh.checks || []).map((c) => `<li class="${c.ok === true ? "ok" : c.ok === false ? "bad" : "muted"}"><b>${c.ok === true ? "OK" : c.ok === false ? "FAIL" : "—"}</b> ${esc(c.label)}${c.note ? `<i>${esc(c.note)}</i>` : ""}</li>`).join("") + `</ul></section>`;
+    (sh.checks || []).map((c) => `<li class="${c.ok === true ? "ok" : c.ok === false ? "bad" : "muted"}"><b>${c.ok === true ? "OK" : c.ok === false ? "FAIL" : "—"}</b> ${esc(c.label)}${c.note ? `<i>${coded(c.note)}</i>` : ""}</li>`).join("") + `</ul></section>`;
   const alertsHtml = (sh, earlier) => (sh.alerts || []).length ? `<div class="panel-head"><span>ALERTS ${earlier ? "THAT RUN" : "THIS RUN"}</span></div><ul>${sh.alerts.map((x) => `<li class="bad">${esc(x)}</li>`).join("")}</ul>` : "";
   const logHtml = (sh, open, earlier) => `<details${open ? " open" : ""}><summary>${earlier ? "that run's log (private)" : "this run's log (private)"}</summary><pre>${esc((sh.log || []).join("\n"))}</pre></details>`;
 
@@ -106,12 +135,12 @@
         ["P&L not settled yet", usd(a.unsettled_pnl)], ["in transit (sweeps)", usd(a.in_transit)],
         ["buying power", usd(a.buying_power)], ["available margin", usd(a.available_margin)], ["holds", usd(a.holds)],
         ["liquidation buffer", a.liquidation_buffer_pct == null ? "—" : `${Number(a.liquidation_buffer_pct).toFixed(1)}%`],
-        ["margin window", esc(a.margin_window || "—")], ["intraday margin", esc(a.intraday_setting || "—")],
+        ["margin window", coded(a.margin_window)], ["intraday margin", coded(a.intraday_setting)],
         a.usdc ? ["USDC in the portfolio", `<span class="bad">${esc(a.usdc)}</span>`] : null,
         a.balance_block ? ["balance check", `<span class="bad">${esc(a.balance_block)}</span>`] : ["balance check", "adds up"],
       ])}</div></div>` +
       `<div><div class="label muted">SHADOW (EST.)</div><div class="big">${usd(sim)}</div><div class="stats">${rows([
-        ["simulated P&L (est.)", signed(sh.simulated_pnl)], ["position", esc(t.position || "—") + (t.position_detail ? " " + esc(t.position_detail) : "")],
+        ["simulated P&L (est.)", signed(sh.simulated_pnl)], ["position", coded(t.position) + (t.position_detail ? " " + esc(t.position_detail) : "")],
         ["record", esc(t.record || "—")], ["fees (est.)", usd(t.fees)], ["funding (est.)", usd(t.funding)],
         sh.opened ? ["opened", `${usd(sh.opened.amount)} on ${esc(sh.opened.ts ? day(sh.opened.ts) : sh.opened.date)} (${esc(sh.opened.what)}): money in, not profit`] : ["opened", "not yet: no money in the account"],
       ])}</div></div></div></section>`);
@@ -135,16 +164,16 @@
     // the virtual book, and what the real account holds besides
     const book = sh.book || {};
     out.push(`<section class="panel sh-book"><div class="panel-head"><span>SIMULATED BOOK</span><span class="muted">what LIVE would hold on Coinbase now</span></div><div class="stats">${rows([
-      ["position", book.position ? `${esc(book.position.side)} ${esc(book.position.contracts)} contract(s) @ ${usd(book.position.entry)} · open P&L ${usd(book.position.upnl)} (est.)` : "flat"],
-      ["resting orders", (book.orders || []).length ? book.orders.map((o) => `${esc(o.side)} ${esc(o.n)} stop ${usd(o.stop, 0)} limit ${usd(o.limit, 0)} (${esc(o.trigger || o.status)})`).join("<br>") : "none"],
+      ["position", book.position ? `${coded(book.position.side)} ${esc(book.position.contracts)} contract(s) @ ${usd(book.position.entry)} · open P&L ${usd(book.position.upnl)} (est.)` : "flat"],
+      ["resting orders", (book.orders || []).length ? book.orders.map((o) => `${coded(o.side)} ${esc(o.n)} stop ${usd(o.stop, 0)} limit ${usd(o.limit, 0)} (${coded(o.trigger || o.status)})`).join("<br>") : "none"],
       ["fees, funding (est.)", `${usd(book.fees)} · ${usd(book.funding)}`],
     ])}</div>` +
       `<div class="panel-head"><span>THE REAL ACCOUNT HOLDS</span><span class="muted">positions and orders the desk didn't place block its entries</span></div><div class="stats">${rows([
-        ["positions", (a.positions || []).length ? a.positions.map((p) => `${esc(p.product_id)} ${esc(p.side)} ${esc(p.contracts)}`).join("<br>") : "none"],
-        ["open orders", (a.orders || []).length ? a.orders.map((o) => `${esc(o.product_id)} ${esc(o.side)} ${esc(o.type || "")}`).join("<br>") : "none"],
+        ["positions", (a.positions || []).length ? a.positions.map((p) => `${esc(p.product_id)} ${coded(p.side)} ${esc(p.contracts)}`).join("<br>") : "none"],
+        ["open orders", (a.orders || []).length ? a.orders.map((o) => `${esc(o.product_id)} ${coded(o.side)} ${coded(o.type, "")}`).join("<br>") : "none"],
         ["fills (BIP, last 30 days)", (a.fills || []).length ? `${a.fills.length}` : "none"],
-        ["pending sweeps", (a.sweeps || []).length ? a.sweeps.map((w) => `${esc(w.status)} ${esc(w.amount || "all")}`).join("<br>") : "none"],
-        ["fee tier", a.fee_tier ? `${esc(a.fee_tier.tier || "—")} · taker ${esc(a.fee_tier.taker)} · maker ${esc(a.fee_tier.maker)} (fees on the board stay the estimate)` : "—"],
+        ["pending sweeps", (a.sweeps || []).length ? a.sweeps.map((w) => `${coded(w.status)} ${w.all || w.amount == null || w.amount === "" ? "all" : isNaN(w.amount) ? esc(w.amount) : usd(+w.amount)}`).join("<br>") : "none"],
+        ["fee tier", a.fee_tier ? `${coded(a.fee_tier.tier)} · taker ${bps(a.fee_tier.taker)} · maker ${bps(a.fee_tier.maker)} (fees on the board stay the estimate)` : "—"],
       ])}</div></section>`);
     // events and alerts, then the honest small print and the run's own log
     const ev = (s.events || []).slice().reverse().slice(0, 30);
@@ -204,5 +233,5 @@
     load(store.get());
     setInterval(() => load(store.get()), 5 * 60 * 1000);
   }
-  if (typeof module !== "undefined") module.exports = { decrypt, statusHtml, boardHtml, BOARD_AAD, when, day, clock };
+  if (typeof module !== "undefined") module.exports = { decrypt, statusHtml, boardHtml, BOARD_AAD, when, day, clock, plain, coded };
 })();

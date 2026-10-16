@@ -637,6 +637,10 @@ CHECKS = {
 }
 
 
+# Coinbase's portfolio types (PortfolioType) in the words the SHADOW board and the phone say them
+PORTFOLIO_WORDS = {"CONSUMER": "Consumer", "INTX": "International (INTX)", "UNDEFINED": "unnamed"}
+
+
 def _optional(fn, log, what: str):
     from .brokers.coinbase_rest import CoinbaseError
 
@@ -1041,8 +1045,9 @@ class Run:
         self.checks.add("view_only", CHECKS["view_only"], True)
         kind = perms.get("portfolio_type")
         if kind != "DEFAULT":
-            self.checks.add("portfolio", CHECKS["portfolio"], False, f"{kind or 'not said'}")
-            raise Stop("permissions", f"this key is on the {kind or 'unnamed'} portfolio, not Default: US futures live "
+            said = PORTFOLIO_WORDS.get(kind, kind) if isinstance(kind, str) else kind     # the words only, not the check
+            self.checks.add("portfolio", CHECKS["portfolio"], False, f"{said or 'not said'}")
+            raise Stop("permissions", f"this key is on the {said or 'unnamed'} portfolio, not Default: US futures live "
                                       f"in the Default (Primary) portfolio, and SHADOW would read this one's money as "
                                       f"the account's. Create the View key on the Default portfolio and put it in "
                                       f"COINBASE_CDP_KEY", public="the key isn't on the Default portfolio")

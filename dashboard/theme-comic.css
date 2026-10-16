@@ -348,6 +348,7 @@ body.kind-basket .stage::after { content: none; }
 }
 @media (max-width: 420px) {
   .kind-basket .brand h1 { font-size: 19px; }
+  .card .quote { -webkit-line-clamp: 6; }   /* a 320 px phone's narrower card: SIZE's line takes five */
 }
 
 /* ---- motion: the theme adds none; under reduced motion what style.css stops stays still here too ------------------ */

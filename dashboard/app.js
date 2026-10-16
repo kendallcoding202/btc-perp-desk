@@ -460,6 +460,7 @@
       el.className = `card ${a.state || ""}`;
       el.style.setProperty("--card", `var(${COLORS[a.key]})`);
       el.querySelector(".detail").textContent = a.detail || "";
+      el.querySelector(".detail").title = a.detail || "";   // a desktop card cuts it to one line: the whole of it on hover
       el.querySelector(".value").textContent = a.value ?? "";
       const bar = el.querySelector(".bar i");
       bar.style.width = `${Math.round((a.score ?? (a.state === "active" ? 1 : 0.25)) * 100)}%`;
