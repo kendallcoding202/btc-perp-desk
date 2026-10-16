@@ -108,7 +108,7 @@ const draw = (b, now) => { const s = JSON.parse(JSON.stringify(b)); formingBars(
   return { n: c.candles.length, tail: c.candles.slice(2), prov: c.prov, feed: c.provFeed, run: c.provRun,
     lens: [c.ema_fast.length, c.ema_slow.length, c.don_hi.length, c.don_lo.length], don: c.don_hi.slice(2), note: provNote(c) }; };
 const run = T0 + 20 * 60000, F = [T0, 80000, 80400, 79800, 80100], out = {};
-out.as_answered = draw(boardAt(F, run), run + 60000);           // no price from the feed yet: the run's own, solid
+out.as_answered = draw(boardAt(F, run), run + 60000);           // no price from the feed yet: the run's own, provisional
 cbSeen(80050, run - 5 * 60000);                                 // a price from before the run (the page was open)
 out.before_run = draw(boardAt(F, run), run + 60000);
 cbSeen(80600, run + 3 * 60000); cbSeen(79700, run + 4 * 60000); cbSeen(80300, run + 5 * 60000);
@@ -142,9 +142,12 @@ def test_the_page_carries_it_on_with_coinbases_prices_and_says_when_its_provisio
     o = _page()
     T0 = 1792173600000          # 2026-10-16 18:00 UTC
     F = [T0, 80000, 80400, 79800, 80100]
-    assert o["as_answered"] == {"n": 3, "tail": [F], "prov": [], "feed": False, "run": False, "lens": [3, 3, 3, 3],
-                                "don": [85000], "note": ""}
-    assert o["before_run"]["tail"] == [F] and o["before_run"]["prov"] == []      # prices before the run add nothing
+    # the run's own, as it answered, its window still open: provisional too (the run saw part of it, its close is the
+    # run's price), and said so: never drawn solid as if final and current
+    assert o["as_answered"] == {"n": 3, "tail": [F], "prov": [2], "feed": False, "run": True, "lens": [3, 3, 3, 3],
+                                "don": [85000], "note": " · newest candle: provisional, the desk's as of 12:20 pm MT; "
+                                                        "the desk's own candle replaces it at the next run"}
+    assert o["before_run"] == o["as_answered"]           # prices from before the run add nothing
     c = o["carried"]
     assert c["tail"] == [[T0, 80000, 80600, 79700, 80300]] and c["prov"] == [2] and c["feed"]
     assert c["note"] == (" · newest candle: provisional, from Coinbase's live feed; the desk's own candle replaces it at "

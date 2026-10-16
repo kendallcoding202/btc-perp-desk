@@ -146,7 +146,9 @@ def _keep_trying(what: str, fn, *, coin: str, kills_path: Path, wait_s: float, s
 
 
 def _utc(ms: int) -> str:
-    return time.strftime("%Y-%m-%d %H:%M", time.gmtime(ms / 1000))
+    """"2026-10-12 22:00 UTC": labelled, so a board shows it in Mountain Time (board.in_mountain_time), as every other
+    time there, never a bare UTC time on a page that says MT."""
+    return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ms / 1000))
 
 
 def process_closed_bars(desk: Desk, broker, f, new: list[int], *, ctx, now: int, mid: float, meta: dict,
@@ -362,7 +364,7 @@ def run(p: Params, mode: str, *, state_dir: str = "state", poll_s: float = 15.0,
                     # Away longer than the history window: some missed bars can't be rebuilt. Refuse, don't guess.
                     raise SystemExit(
                         f"live {p.market.symbol}: the last bar processed closed {_utc(meta['last_bar_ts'] + feed.bar_ms)}"
-                        f" UTC, too long ago to catch up: the {len(bars)}-bar history starts after it. Not trading "
+                        f", too long ago to catch up: the {len(bars)}-bar history starts after it. Not trading "
                         f"on a stale view. The exchange-side stop still protects any position. Check the account by "
                         f"hand, then restart with a fresh {desk_path} (move the old one aside).")
                 if new:

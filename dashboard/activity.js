@@ -50,6 +50,7 @@
   const reduced = matchMedia("(prefers-reduced-motion: reduce)");
   const wide = matchMedia("(min-width: 980px)");
   const narrow = matchMedia("(max-width: 420px)");
+  const tight = matchMedia("(max-width: 380px)");   // a 375 or 320 px phone: the status line drops the run's time
   // filter.py's KILLS: a brake that holds every new entry, whatever the price does (desk/engine.py kill_gates)
   const BRAKE = {
     drawdown_halt: ["drawdown halt", "until a human resets it"],
@@ -71,6 +72,7 @@
   const MT = window.deskMT, TZ = MT ? MT.zone : "UTC";
   if (!MT) return;
   const hhmm = (ms) => MT.clock(ms), HHMM = (ms) => MT.clock(ms, { up: true }), hms = (ms) => MT.clock(ms, { sec: true });
+  const hr = (ms) => MT.clock(ms, { short: true });   // "10 pm": a close, in a one-line readout a phone must fit
   const md = (ms) => MT.md(ms), ymd = (ms) => new Date(ms).toISOString().slice(0, 10);
   const clock = (ms) => {
     const s = Math.max(0, Math.floor(ms / 1000));
@@ -302,12 +304,13 @@
     M.dot.classList.toggle("act-stale", old || lost);
     set(M.st, lost ? (narrow.matches ? `CAN'T READ THE BOARD SINCE ${HHMM(lastRead)}` : `CAN'T READ THE BOARD SINCE ${HHMM(lastRead)} ${TZ} · SHOWING THE ONE BUILT ${HHMM(b.updated)} ${TZ}`)
       : old ? `STALE · NO NEW BOARD FOR ${age}`      // the run's time is in the REPLAY label
+      : tight.matches ? `LAST RUN ${age} AGO`     // its time is in the REPLAY label, two rows down: one line here
       : `LAST RUN ${HHMM(b.updated)} ${TZ} · ${age} AGO`);
     M.st.classList.toggle("act-warn", old || lost);
     set(M.exp, b.header.shorts && b.header.experiment ? "SHORTS: PAPER EXPERIMENT" : "");
     set(L.lrun, `${lost ? "CAN'T READ · " : old ? "STALE · " : ""}LAST RUN ${HHMM(b.updated)} ${TZ}`);
     L.lrun.classList.toggle("act-warn", old || lost);
-    if (lost && !unreadSaid) { unreadSaid = true; tapeAdd(`${hms(now)} no board read since ${hms(lastRead)} · showing the one built ${hms(b.updated)} ${TZ}`, "act-warn"); beat(now); }
+    if (lost && !unreadSaid) { unreadSaid = true; tapeAdd(`${hms(now)} no board read since ${hms(lastRead)} · showing the one built ${hhmm(b.updated)}`, "act-warn"); beat(now); }
     // a step that failed this run: the asked-for tab (app.js shows BTC's board when one is missing), or this one
     const asked = location.hash.slice(1).toUpperCase();
     const bad = IDX && IDX.coins ? IDX.coins.find((c) => c.error && (c.coin === asked || c.coin === shown)) : null;
@@ -398,7 +401,7 @@
       const px = isLive ? lv : h.mark, gap = h.sma50 ? px / h.sma50 - 1 : null;
       // the live price against the average as of the last close; ABOVE / BELOW is what that close said
       const html = `<b>${esc(h.coin)}</b> ${usd(px)} · ${gap == null ? "warming up" : `<i>${pct(gap, 1)}</i> vs ${n}-day avg`} · ` +
-        (h.sma50 == null ? "no average yet" : `<span class="${h.above_sma ? "act-up" : "act-dn"}">${h.above_sma ? "ABOVE" : "BELOW"}</span> at the ${B.basket.last_close_ts ? `${hhmm(B.basket.last_close_ts)} ${TZ} ` : ""}close`);
+        (h.sma50 == null ? "no average yet" : `<span class="${h.above_sma ? "act-up" : "act-dn"}">${h.above_sma ? "ABOVE" : "BELOW"}</span> at ${B.basket.last_close_ts ? `${hr(B.basket.last_close_ts)} ${TZ}` : "the last close"}`);
       if (rows[k].innerHTML !== html) {
         const was = rows[k].querySelector("i"), now2 = gap == null ? null : pct(gap, 1);
         rows[k].innerHTML = html;
@@ -419,8 +422,10 @@
   }
   function restText() {
     const chief = agentOf("chief"), cl = last(B.chart.candles);
-    if (blocker < 0) return `every check passed at the ${cl ? `${hhmm(cl[0] + B.chart.bar_ms)} ${TZ} ` : ""}close · CHIEF ${chief ? chief.value : "—"}`;
-    const g = gates[blocker], when = cl ? ` ${hhmm(cl[0] + B.chart.bar_ms)} ${TZ}` : "";
+    // the close's time short ("10 pm") and its zone left to the REPLAY · LAST RUN … MT line right above: one line on
+    // a 375 px phone, the line's price whole
+    if (blocker < 0) return `every check passed at the ${cl ? `${hr(cl[0] + B.chart.bar_ms)} ` : ""}close · CHIEF ${chief ? chief.value : "—"}`;
+    const g = gates[blocker], when = cl ? ` ${hr(cl[0] + B.chart.bar_ms)}` : "";
     if (g.name === "flat") return `${g.note}: no new entries while it is open`;
     if (g.verdict === "DROP" && phaseOf(g) === "KILLS") {
       const k = BRAKE[g.name === "manual_kill" ? (g.note === "flat_kill" ? "flat_kill" : "entry_kill") : g.name];
@@ -483,9 +488,11 @@
       return `<span class="act-chip ${h.sma50 == null ? "" : h.above_sma ? "c-pass" : "c-drop"}" title="${esc(`${h.coin} ${h.above_sma ? "above" : "below"} its average at that close: target ${fix(h.target_units || 0, 2)} units`)}">${esc(t)}</span>`;
     }).join("");
     const orders = hs.filter((h) => h.pending).map((h) => `${h.coin} ${h.pending.kind === "exit" ? "close all" : `${h.pending.usd >= 0 ? "+" : "−"}$${fix(Math.abs(h.pending.usd), 2)}`} ${modeWord()} order, fills at the next open`);
+    // decided_ts is the close itself (desk/voltrend.py decides at ts + DAY_MS, the day's 00:00 UTC close): its MT date
+    // is the close's, the same one the REPLAY label above names
     const dts = hs.map((h) => h.decided_ts).filter((x) => x != null);
     set(M.read, !decided ? `PREVIEW · first decision at the next ${hhmm(MT.nextUtcDay(Date.now()))} ${TZ} close`
-      : `decided at the ${md(Math.max(...dts) + DAY)} close · ${orders.length ? orders.join(" · ") : "no order waiting"}`);
+      : `decided at the ${md(Math.max(...dts))} close · ${orders.length ? orders.join(" · ") : "no order waiting"}`);
     stopRun("strip");
     const chips = [...M.nodes.children];
     if (!play || reduced.matches || !visible() || !monOn) { M.nodes.classList.remove("act-rp"); return; }
@@ -775,9 +782,10 @@
     if (po) po.takeRecords().forEach(take);
     const e = boardEntry && boardEntry.name.includes(`/boards/${shown}.json`) ? boardEntry : null;
     const kb = e && e.decodedBodySize ? ` · ${(e.decodedBodySize / 1024).toFixed(1)} KB` : "";
-    if (kind === "new") tapeAdd(`${hms(now)} NEW RUN · board built ${hms(B.updated)} ${TZ}${kb}`, "act-ev");
-    else if (kind === "first") tapeAdd(`${hms(now)} board read${kb} · last run ${hms(B.updated)} ${TZ}`, "act-bd");
-    else tapeAdd(`${hms(now)} board re-read${kb} · no new board since ${hms(B.updated)} ${TZ}`, "act-bd");
+    // the run's time to the minute, its zone the tape's heading's ("times MT"): a line fits a phone
+    if (kind === "new") tapeAdd(`${hms(now)} NEW RUN · board built ${hhmm(B.updated)}${kb}`, "act-ev");
+    else if (kind === "first") tapeAdd(`${hms(now)} board read${kb} · last run ${hhmm(B.updated)}`, "act-bd");
+    else tapeAdd(`${hms(now)} board re-read${kb} · no new board since ${hhmm(B.updated)}`, "act-bd");
   }
 
   // ---- the desk runs heartbeat: the last run's boards, account by account -------------------------------------

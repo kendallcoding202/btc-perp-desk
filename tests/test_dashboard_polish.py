@@ -159,7 +159,7 @@ const g = { font: "", measureText: (t) => ({ width: 6 * t.length }) };
 const out = [];
 for (const [close, stop, live, lo, hi] of [[78500, 77970, null, 76000, 80000], [104250, 101975.5, 104300, 99000, 106000],
                                          [2425.5, 2441.86, null, 2300, 2500], [82015, null, 82020, 80000, 84000]]) {
-  const padR = rightPad(g, { stop, live }, close, lo, hi), w = 358;
+  const padR = rightPad(g, { stop, live }, pxAxis(close), lo, hi), w = 358;
   const ends = [pxAxis(close), stop ? `STOP ${pxAxis(stop)}` : "", live ? pxAxis(live) : ""].map((t) => w - padR + 2 + 6 * t.length + 8);
   out.push({ padR, room: w - Math.max(...ends), old: w - 64 + 2 + Math.max(...[pxAxis(close), stop ? `STOP ${pxAxis(stop)}` : ""].map((t) => 6 * t.length + 8)) - w });
 }
@@ -168,7 +168,7 @@ console.log(JSON.stringify(out));"""
     assert all(o["room"] >= 2 and o["padR"] >= 64 for o in out), out
     assert out[0]["old"] > 0 and out[1]["old"] > 0          # the old 64 px ran 'STOP 77,970' past the edge
     assert out[3]["padR"] == 64                               # no stop: as wide as before
-    assert "padR = rightPad(g, chart, lastC, lo, hi)" in _function(APP, "drawChart")
+    assert "ct = closeTag(chart), padR = rightPad(g, chart, ct.text, lo, hi)" in _function(APP, "drawChart")
 
 
 # ---------------------------------------------------------------- resize
@@ -176,10 +176,13 @@ console.log(JSON.stringify(out));"""
 def test_a_resize_redraws_the_equity_curve_and_the_pnl_bars():
     """addEventListener("resize", render) passed the event in as `light`: a price-only redraw, which leaves the equity
     curve and the P&L bars at their old size (stretched) until the next board. Now a full render, once a frame."""
-    assert 'addEventListener("resize", render)' not in APP
-    m = re.search(r'window\.addEventListener\("resize", \(\) => \{([^\n]*)\}\);', APP)
-    assert m and "requestAnimationFrame(() => { resized = 0; render(); })" in m.group(1)
+    # the listener line as main has it (the coinbase-live branch adds its code right above it: a clean merge); render
+    # itself takes anything but true or false (the event) as a full redraw, scheduled once a frame
+    assert 'window.addEventListener("resize", render);' in APP
     render = _function(APP, "render")
+    head = render.split("\n")[1]
+    assert head.strip() == ("if (light !== true && light !== false) { if (!resized) resized = requestAnimationFrame(() => "
+                            "{ resized = 0; render(); }); return; }")
     assert "if (!light) drawPnlBars(" in render and "if (!light || s.ticker.bank !== drawn.bank)" in render
 
 

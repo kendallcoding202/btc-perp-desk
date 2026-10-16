@@ -92,9 +92,10 @@
       return p;
     };
     const two = (n) => String(n).padStart(2, "0");
-    // "6:04 pm", "6:04:09 pm" (sec), "6:04 PM" (up)
+    // "6:04 pm", "6:04:09 pm" (sec), "6:04 PM" (up), "6 pm" (short, on the hour: a close, in a line that's tight)
     const clock = (ms, o = {}) => {
-      const p = parts(ms), t = `${p.h % 12 || 12}:${two(p.mi)}${o.sec ? ":" + two(p.s) : ""} ${p.h < 12 ? "am" : "pm"}`;
+      const p = parts(ms), hm = o.short && !p.mi && !o.sec ? "" : `:${two(p.mi)}${o.sec ? ":" + two(p.s) : ""}`;
+      const t = `${p.h % 12 || 12}${hm} ${p.h < 12 ? "am" : "pm"}`;
       return o.up ? t.toUpperCase() : t;
     };
     const day = (ms) => { const p = parts(ms); return `${MON[p.mo - 1]} ${p.d}`; };              // "Oct 15"
@@ -111,8 +112,20 @@
         const head = same && mer ? clock(a).slice(0, -3) : clock(a);
         return `${days || !same ? pa.wd + " " : ""}${head}–${same ? "" : pb.wd + " "}${clock(b)}`;
       },
-      // the start of ms's Mountain Time day (its midnight), as epoch ms
-      midnight: (ms) => { const p = parts(ms); return Math.floor(ms / 1000) * 1000 - ((p.h * 60 + p.mi) * 60 + p.s) * 1000; },
+      // the start of ms's Mountain Time day (its midnight), as epoch ms. Stepped back by the clock's time of day until
+      // it reads 0:00 on the same date: on the two days a year the clocks change, that time of day isn't how long ago
+      // midnight was (1:00 am MST on Nov 1 is 2 h after it; 4:00 am MDT on a March Sunday 3 h)
+      midnight: (ms) => {
+        const k = key(ms);
+        let t = Math.floor(ms / 1000) * 1000;
+        for (let i = 0; i < 4; i++) {
+          const p = parts(t), into = ((p.h * 60 + p.mi) * 60 + p.s) * 1000;
+          if (key(t) !== k) t += DAY_MS - into;   // back into the day before: on to its next midnight
+          else if (into) t -= into;
+          else break;
+        }
+        return t;
+      },
       nextUtcDay: (ms) => Math.floor(ms / DAY_MS + 1) * DAY_MS,   // the desk's day turns: VT's close, the daily loss lock
     };
   })();
@@ -170,7 +183,7 @@
     if (chart.live) vals.push(chart.live);
     let lo = Math.min(...vals), hi = Math.max(...vals);
     const pad = (hi - lo) * 0.06; lo -= pad; hi += pad;
-    const lastC = cs[cs.length - 1][4], padR = rightPad(g, chart, lastC, lo, hi);
+    const lastC = cs[cs.length - 1][4], ct = closeTag(chart), padR = rightPad(g, chart, ct.text, lo, hi);
     // BTC's provisional newest candle(s) (formingBars, drawn dashed): each gets a slot at least 8 px wide, so its dashes
     // read on a phone (the others' slots are about 2 px there); the rest share what's left
     const prov = new Set(chart.prov || []);
@@ -258,7 +271,7 @@
       }
     }
     const last = cs[cs.length - 1];
-    tag(g, w - padR, Y(lastC), pxAxis(lastC), css(lastC >= last[1] ? "--green" : "--red"), true);
+    tag(g, w - padR, Y(lastC), ct.text, css(lastC >= last[1] ? "--green" : "--red"), !ct.held, ct.held);
     // BTC on Coinbase: its live price from Coinbase's feed, as a line and an outlined tag at the right edge (placed
     // above; none when the newest candle's close already says it). The candle still forming is formingBars'
     if (chart.live) {
@@ -276,12 +289,22 @@
     lastGeom = { X, Y, cs, w, h, padR };
   }
 
+  // The newest candle's close tag. Filled, as on every chart, when that close is a closed candle's or the live price;
+  // outlined in dashes, like the candle, when it is a provisional candle's that nothing live has carried on (BTC's
+  // forming candle with the feed down, on the proxy, or Coinbase closed since): then it is a price from before now,
+  // never shown as the current one, and "RUN" when it is the run's own as it answered. {text, held}
+  function closeTag(chart) {
+    const cs = chart.candles, k = cs.length - 1, c = cs[k][4];
+    const held = (chart.prov || []).includes(k) && !(chart.live && chart.live === c);
+    return { text: (held && chart.runIdx === k ? "RUN " : "") + pxAxis(c), held };
+  }
+
   // The price axis's width: room for its widest tag ("STOP 77,970" is wider than a price) and label, so none is cut off
   // at the canvas's right edge on a phone. A tag is drawn from 2 px past the axis line, 8 px wider than its text (tag()),
   // and keeps 2 px clear of the edge; an axis label starts 6 px past it. At least today's 64 px
-  function rightPad(g, chart, close, lo, hi) {
+  function rightPad(g, chart, closeText, lo, hi) {
     g.font = "bold 10px JetBrains Mono, monospace";
-    const tags = [pxAxis(close), chart.stop ? `STOP ${pxAxis(chart.stop)}` : "", chart.live ? pxAxis(chart.live) : ""];
+    const tags = [closeText, chart.stop ? `STOP ${pxAxis(chart.stop)}` : "", chart.live ? pxAxis(chart.live) : ""];
     const tagW = Math.max(...tags.map((t) => g.measureText(t).width + 12));
     g.font = "10px JetBrains Mono, monospace";
     const axisW = Math.max(g.measureText(pxAxis(hi)).width, g.measureText(pxAxis(lo)).width) + 8;
@@ -320,12 +343,12 @@
     g.fillText(short ? "S" : "L", x, top + 9); g.restore();
   }
 
-  function tag(g, x, y, text, color, filled = false) {
+  function tag(g, x, y, text, color, filled = false, dashed = false) {
     g.save(); g.font = "bold 10px JetBrains Mono, monospace";
     const tw = g.measureText(text).width + 8;
     const ink = css("--ink") || "#070b10";
     g.fillStyle = filled ? color : ink; g.strokeStyle = color;
-    g.fillRect(x + 2, y - 8, tw, 16); g.strokeRect(x + 2, y - 8, tw, 16);
+    g.fillRect(x + 2, y - 8, tw, 16); if (dashed) g.setLineDash([2, 2]); g.strokeRect(x + 2, y - 8, tw, 16); g.setLineDash([]);
     g.fillStyle = filled ? ink : color; g.fillText(text, x + 6, y + 4); g.restore();
   }
 
@@ -1032,12 +1055,14 @@
   // it, once it has begun, is drawn from those prices alone; a window after one the page saw nothing of isn't drawn
   // (the chart's slots are candles in a row). Each is provisional (chart.prov, drawn dashed): the page sees no price
   // from before it opened or while it was hidden, so a high or a low since the run can be missing. So is the run's own
-  // once its window has closed (the run saw only part of it). The next run's board brings the desk's own candle. Never
-  // Coinbase's candles channel, never Hyperliquid's candle on this chart. chart.provFeed: some of it is the feed's;
-  // chart.provRun: the run's own is provisional only because its window has closed
+  // with nothing newer on it: the run saw only part of its window, and its close is the run's price, not now's (the
+  // feed down, Hyperliquid's price the proxy, Coinbase closed since, or no message yet), whether its window is still
+  // open or has closed. The next run's board brings the desk's own candle. Never Coinbase's candles channel, never
+  // Hyperliquid's candle on this chart. chart.provFeed: some of it is the feed's; chart.provRun: the run's own is drawn
+  // as it answered, at chart.runIdx, its close the run's price (chart.provRunDone: and its window has closed since)
   function formingBars(s, now) {
     const ch = s.chart, bar = ch.bar_ms, cs = ch.candles;
-    ch.prov = []; ch.provFeed = false; ch.provRun = false;
+    ch.prov = []; ch.provFeed = false; ch.provRun = false; ch.provRunDone = false; ch.runIdx = -1;
     if (!bar || !cs.length) return;
     const line = (s.analysis.outlook && s.analysis.outlook[0]) ? s.analysis.outlook[0].level : null, short = s.analysis.outlook_side === "short";
     const add = (c, prov) => {
@@ -1050,8 +1075,9 @@
     if (f) {
       const x = cb.bars.get(f[0]), after = !!x && x.at > (ch.forming_as_of || 0);
       if (after) { f[2] = Math.max(f[2], x.h); f[3] = Math.min(f[3], x.l); f[4] = x.c; ch.provFeed = true; }
-      ch.provRun = !after && f[0] + bar <= now;
-      add(f, after || ch.provRun);
+      ch.provRun = !after; ch.provRunDone = !after && f[0] + bar <= now;
+      add(f, true);
+      if (!after) ch.runIdx = cs.length - 1;
       next = f[0] + bar;
     }
     for (let x = cb.bars.get(next); x; x = cb.bars.get(next += bar)) { add([next, x.o, x.h, x.l, x.c], true); ch.provFeed = true; }
@@ -1142,7 +1168,11 @@
   // light: a redraw for a new price only (Coinbase's, once a second): what a price moves, not the agents, their
   // bubbles, the P&L bars, the rules or the switches, which only a new board changes. drawn: what the last one showed
   const drawn = { bank: null, price: null, source: null, mids: 0 };
+  // Only `true` is the light redraw. A resize hands render its event (a phone turned on its side): everything is redrawn
+  // at the new size, the equity curve and the P&L bars too, a full render, once a frame at most
+  let resized = 0;
   function render(light = false) {
+    if (light !== true && light !== false) { if (!resized) resized = requestAnimationFrame(() => { resized = 0; render(); }); return; }
     state = withLive(base);
     if (!state) return;
     const s = state, hdr = s.header, lp = s.livePx || {};
@@ -1202,9 +1232,10 @@
   }
 
   // BTC's provisional newest candle(s) (formingBars), as the footer says it: from Coinbase's live feed, or the run's own
-  // whose window has closed since; either way the next run's board brings the desk's own
+  // as it answered (and whether its window has closed since); either way the next run's board brings the desk's own
   function provNote(ch) {
-    const n = ch.prov ? ch.prov.length : 0, run = ch.provRun ? `the desk's as of ${hhmm(ch.forming_as_of)} ${TZ}, before its window closed` : "";
+    const n = ch.prov ? ch.prov.length : 0;
+    const run = ch.provRun ? `the desk's as of ${hhmm(ch.forming_as_of)} ${TZ}${ch.provRunDone ? ", before its window closed" : ""}` : "";
     if (!n) return "";
     const from = [ch.provFeed ? "from Coinbase's live feed" : "", run].filter(Boolean).join(" and ");
     return n > 1 ? ` · newest ${n} candles: provisional, ${from}; the desk's own candles replace them at the next run`
@@ -1283,10 +1314,7 @@
     } catch { /* the chart just shows closed candles */ }
   }
 
-  // a resize (a phone turned on its side) redraws everything at the new size, the equity curve and the P&L bars too:
-  // a full render, not the light one a price takes (the event isn't passed on as `light`), once a frame at most
-  let resized = 0;
-  window.addEventListener("resize", () => { if (!resized) resized = requestAnimationFrame(() => { resized = 0; render(); }); });
+  window.addEventListener("resize", render);   // render(event): a full redraw at the new size, once a frame (render)
   window.addEventListener("desk:theme", () => { $("agents").textContent = ""; $("chief-sprite").textContent = ""; render(); });
   (async function loop() {
     await tick();

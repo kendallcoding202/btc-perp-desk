@@ -45,6 +45,7 @@ def _usd(x: float | None, dp: int | None = None) -> str:
 # winter). The desk's own words keep UTC (they're in the ledger, which never changes for this); the board's copy of
 # them, and every time the board writes itself, say MT. Stored timestamps stay epoch ms.
 _UTC_STAMP = re.compile(r"\b(\d{4}-\d{2}-\d{2}) (\d{2}):(\d{2}) UTC\b")      # "2026-10-12 22:00 UTC"
+_UTC_RANGE = re.compile(r"\b(\d{4}-\d{2}-\d{2} \d{2}:\d{2}) to (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) UTC\b")   # "... to ... UTC"
 _UTC_CLOCK = re.compile(r"\b(\d{2}):(\d{2}) UTC\b")                           # "reopens 23:00 UTC"
 _UTC_TOMORROW = re.compile(r"\buntil tomorrow UTC\b")                         # the daily loss limit's day
 _DAY_MS = 86400_000
@@ -58,9 +59,11 @@ def day_turns(ms: int) -> str:
 
 def in_mountain_time(text, ref_ms: int):
     """A board string's UTC times, as Mountain Time: "the 2026-10-12 22:00 UTC candle" -> "the Oct 12, 4:00 pm MT
-    candle"; a time of day with no date ("reopens 23:00 UTC", "the next 00:00 UTC close") is the first one at or after
-    `ref_ms` (when the text was said: they all look ahead), so it's right on either side of a clock change; "until
-    tomorrow UTC" -> "until the desk's day turns at 6:00 pm MT". Anything else is returned as it was."""
+    candle"; a span labelled once, at its end ("2026-10-15 18:00 to 2026-10-16 02:00 UTC": Coinbase's short answer),
+    has both ends rewritten, never an MT time beside an unlabelled UTC one; a time of day with no date ("reopens 23:00
+    UTC", "the next 00:00 UTC close") is the first one at or after `ref_ms` (when the text was said: they all look
+    ahead), so it's right on either side of a clock change; "until tomorrow UTC" -> "until the desk's day turns at
+    6:00 pm MT". Anything else is returned as it was."""
     if not isinstance(text, str) or "UTC" not in text:
         return text
 
@@ -72,6 +75,7 @@ def in_mountain_time(text, ref_ms: int):
         t = ref_ms // _DAY_MS * _DAY_MS + (int(m[1]) * 60 + int(m[2])) * 60_000
         return mountain.clock(t if t >= ref_ms else t + _DAY_MS)
 
+    text = _UTC_RANGE.sub(lambda m: f"{m[1]} UTC to {m[2]} UTC", text)     # each end its own label: both converted
     text = _UTC_STAMP.sub(stamp, text)
     text = _UTC_TOMORROW.sub(lambda m: f"until the desk's day turns at {day_turns(ref_ms)}", text)
     return _UTC_CLOCK.sub(clock, text)
