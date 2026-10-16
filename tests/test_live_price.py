@@ -104,8 +104,10 @@ def test_labels_name_the_source():
                  "no live price until a run finds it open", "is closed now by its schedule", '"STALE (HYPERLIQUID PROXY) · "',
                  "its own feed does`"):
         assert text in APP, text
-    # the chart's live marker only with Coinbase's own price; no candle made up for it
-    assert 'if (lp.source === "coinbase") s.chart.live = mid;' in APP
+    # the chart's live marker only with the chart's own fresh price: Coinbase's on BTC's (never the proxy's),
+    # Hyperliquid's on the others; no candle made up for it
+    assert ('if (lp.source === "coinbase" || (!s.venue && near(Date.now(), lp.at) <= STALE)) { s.chart.live = mid; '
+            's.chart.liveAt = lp.at; }') in APP
     for text in ('"Coinbase feed"', "FROM COINBASE'S OWN PRICES", "A PROXY FOR COINBASE'S", 'from ${o.feed ? "Coinbase"',
                  "AT THE LAST RUN'S PRICE${basket() ? \"S\" : \"\"} (NO LIVE PRICE YET)"):
         assert text in ACT, text
@@ -261,32 +263,35 @@ def test_tab_row_taps_only_switch_on_a_card():
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
 def test_the_live_tag_is_clear_of_the_other_tags():
-    """The chart's live price tag sits at its price, or at the nearest place clear of the close's and the stop's tags
-    (17 px: tags are 16 tall) on the same side of each as its price, inside the plot; if there's none, it isn't drawn
-    (the line still is). Checked against every whole-pixel place. An axis label under it is left out. When the newest
-    candle's close is the live price (BTC's forming candle carried on with Coinbase's feed), its close tag says it: no
-    second tag."""
-    place = _between(APP, "let liveY = null;", "\n\n    g.font")
-    assert "if (liveY != null && Math.abs(y - liveY) < 13) continue;" in APP
-    js = """
-const out = { n: 0, bad: [], none: 0, same: 0 };
-const padT = 8, padB = 18, h = 250, top = padT + 8, bot = h - padB - 8, Y = (p) => p;
-for (let close = 2; close <= 248; close += 7) for (const stop of [null, ...Array.from({ length: 28 }, (_, k) => 3 + 9 * k)]) for (let live = 1; live <= 250; live += 3) {
-  const cs = [[0, 0, 0, 0, close]], chart = { live, stop };
-""" + place + """
-  const taken = [close, stop].filter((o) => o != null);
-  const ok = (t) => t >= top && t <= bot && taken.every((o) => Math.abs(t - o) >= 17 && (live === o || (t - o) * (live - o) > 0));
-  let best = null;
-  for (let t = top; t <= bot; t += 0.5) if (ok(t) && (best == null || Math.abs(t - live) < Math.abs(best - live))) best = t;
-  out.n++;
-  if (live === close) { out.same++; if (liveY != null) out.bad.push(["twice", close, stop, live, liveY]); continue; }
-  if (liveY == null) { out.none++; if (best != null) out.bad.push(["missed", close, stop, live, best]); }
-  else if (!ok(liveY) || Math.abs(liveY - live) > Math.abs(best - live) + 0.5) out.bad.push(["placed", close, stop, live, liveY, best]);
+    """The right edge's tags (the live price's, the newest close's, the stop's) are 17 px apart at least (tags are 16
+    tall), in the order of their prices (a stop at the same price on its own side: below a long's price, above a
+    short's), inside the canvas, none left out. The live tag stays at its price unless the tags past it have no room
+    before the canvas's edge; the others are at theirs or pushed on past it. Checked over every few pixels. When the
+    newest candle's close is the live price (BTC's forming candle carried on with Coinbase's feed, ETH's and SOL's
+    from Hyperliquid), the live tag says it: no second tag. An axis label under any tag is left out."""
+    draw = _function(APP, "drawChart")
+    assert "const merged = chart.live && chart.live === lastC;" in draw and "if (!merged) tag(g, w - padR, ty[1]" in draw
+    assert "if (under(y)) continue;" in draw and "if (!under(h - 7)) g.fillText(TZ" in draw
+    js = _function(APP, "stackTags") + """
+const out = { n: 0, bad: [], moved: 0, same: 0 }, top = 8, bot = 252;
+for (let close = 12; close <= 248; close += 7) for (const stop of [null, ...Array.from({ length: 28 }, (_, k) => 12 + 8.5 * k)])
+for (const side of ["long", "short"]) for (let live = 12; live <= 248; live += 3) {
+  const merged = live === close, tags = [{ y: live, tie: 0 }, merged ? null : { y: close, tie: 0 },
+    stop == null ? null : { y: stop, tie: side === "short" ? -1 : 1 }];
+  const ty = stackTags(tags, 0, top, bot), shown = tags.map((t, k) => t && [t.y, t.tie, ty[k]]).filter(Boolean);
+  out.n++; if (merged) out.same++;
+  if (tags.some((t, k) => t && ty[k] == null)) out.bad.push(["left out", close, stop, live]);
+  const s = shown.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  for (let k = 1; k < s.length; k++) if (s[k][2] - s[k - 1][2] < 17 - 1e-9) out.bad.push(["close", close, stop, live, ty]);
+  if (shown.some((t) => t[2] < top || t[2] > bot)) out.bad.push(["outside", close, stop, live, ty]);
+  const m = s.findIndex((t) => t === shown[0]), room = Math.min(live - top - 17 * m, bot - live - 17 * (s.length - 1 - m));
+  if (ty[0] !== live) { out.moved++; if (room >= 0) out.bad.push(["moved", close, stop, live, ty]); }
+  shown.forEach((t) => { if (Math.abs(t[2] - t[0]) > 17 * 2 + 1e-9) out.bad.push(["pushed far", close, stop, live, ty]); });   // at most past two tags
 }
-console.log(JSON.stringify({ n: out.n, none: out.none, same: out.same, bad: out.bad.slice(0, 5), nbad: out.bad.length }));"""
+console.log(JSON.stringify({ n: out.n, moved: out.moved, same: out.same, bad: out.bad.slice(0, 5), nbad: out.bad.length }));"""
     r = __import__("json").loads(_node(js))
-    assert r["n"] > 20000 and r["nbad"] == 0 and r["same"] > 100, r
-    assert 0 < r["none"] < r["n"] / 10, r     # left off only when the close and the stop leave no room on its side
+    assert r["n"] > 50000 and r["nbad"] == 0 and r["same"] > 100, r
+    assert 0 < r["moved"] < r["n"] / 50, r      # moved only at the canvas's very edge, with tags past it
 
 
 def test_readme_pins_no_test_count():

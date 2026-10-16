@@ -14,7 +14,9 @@
   --yellow: var(--amber); /* activity.css / activity.js still use this name */
   --pink: var(--cyan);    /* activity.css still uses this name; the color is the live cyan */
   --blue: #6ea0ff;    /* crowd, the slow average */
-  --cyan: #2ee6ff;    /* crawler, live prices, the fast average */
+  --cyan: #2ee6ff;    /* crawler, the ticker's LIVE, the fast average */
+  --live: #ffd84a;    /* the chart's live price: its line and its "● LIVE" tag, a color no other line on it has */
+  --on-live: #070b10; /* the live tag's dot and lettering */
   --lime: #d6ff4a;    /* size */
   --ice: #d5deea;     /* fills */
   --white: #f7f8fb;   /* chief */
@@ -215,6 +217,10 @@ html[data-desk="up"] .card.active::after { animation: sheen 4.8s ease-in-out inf
 .swatch.channel { width: 16px; background: repeating-linear-gradient(90deg, var(--muted) 0 3px, transparent 3px 5px); }
 .swatch.stop { background: var(--orange); }
 .swatch.prov { width: 8px; height: 9px; background: none; border: 1px dashed var(--muted); border-radius: 0; }   /* BTC's provisional newest candle */
+.swatch.live { width: 14px; height: 9px; border-radius: 1px; background: radial-gradient(circle at 4px 50%, var(--on-live) 0 1.8px, transparent 2.3px), var(--live); }   /* the live tag: ● LIVE */
+.chart-head .lg { white-space: nowrap; }   /* a legend entry stays whole: a phone wraps between entries */
+/* the live tag's dot beating once for a new price (app.js liveBeat: an animation of 0.5 s, none at rest) */
+.live-beat { position: absolute; width: 5px; height: 5px; margin: -2.5px 0 0 -2.5px; border-radius: 50%; background: var(--on-live); opacity: 0; pointer-events: none; z-index: 1; }
 .chart-wrap::before {
   content: ""; position: absolute; left: 8px; right: 8px; top: 28px; height: 2px; z-index: 1;
   background: linear-gradient(90deg, transparent, var(--cyan), transparent);
@@ -422,4 +428,5 @@ body.has-live .big { text-shadow: 0 0 16px color-mix(in srgb, currentColor 50%, 
   html[data-desk="up"] .ring, html[data-desk="up"] .ring::after { border-color: var(--cyan); }
   body.has-live .chart-wrap::before { opacity: 0; }
   .spider { transition: none; }
+  .live-beat { display: none; }
 }

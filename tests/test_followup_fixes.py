@@ -243,7 +243,7 @@ def test_the_runs_forming_candle_is_provisional_whenever_nothing_newer_carries_i
 
 def test_the_close_tag_is_drawn_dashed_when_held():
     draw = _function(APP, "drawChart")
-    assert "tag(g, w - padR, Y(lastC), ct.text, css(lastC >= last[1] ? \"--green\" : \"--red\"), !ct.held, ct.held);" in draw
+    assert "if (!merged) tag(g, w - padR, ty[1], ct.text, css(lastC >= last[1] ? \"--green\" : \"--red\"), !ct.held, ct.held);" in draw
     assert "if (dashed) g.setLineDash([2, 2]);" in _function(APP, "tag")
 
 

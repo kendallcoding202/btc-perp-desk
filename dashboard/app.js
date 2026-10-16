@@ -195,21 +195,21 @@
     const slot = (k) => k < n0 ? cw : ps;
     const Y = (p) => padT + (hi - p) / (hi - lo) * (h - padT - padB);
     const tsIndex = new Map(cs.map((c, k) => [c[0], k]));
-    // BTC on Coinbase: its live price's tag at the right edge goes at its price, else at the nearest place clear of the
-    // close's and the stop's tags and on the same side of each as its price (the tags read in order); none if there's
-    // no such place, only its line. An axis label under it isn't drawn
-    let liveY = null;
-    if (chart.live && chart.live !== cs[cs.length - 1][4]) {   // the newest candle carried on to it: its close tag says it
-      const y = Y(chart.live), top = padT + 8, bot = h - padB - 8, taken = [Y(cs[cs.length - 1][4]), chart.stop ? Y(chart.stop) : null].filter((o) => o != null);
-      const ok = (t) => t >= top && t <= bot && taken.every((o) => Math.abs(t - o) >= 17 && (y === o || (t - o) * (y - o) > 0));
-      liveY = [y, top, bot, ...taken.flatMap((o) => [o - 17, o + 17])].filter(ok).sort((a, b) => Math.abs(a - y) - Math.abs(b - y))[0] ?? null;
-    }
+    // The tags at the right edge: the live price's (chart.live: the chart's own fresh price), the newest close's (none
+    // when that close is the live price: the live tag says it), the stop's. The live one at its price, the others at
+    // theirs or as near as they can be on their own side of it (stackTags), into the axis's corners if they must be
+    // (a stop at the chart's low with the price on it: its tag goes under the price's, over "MT"). An axis label under
+    // a tag isn't drawn
+    const merged = chart.live && chart.live === lastC;
+    const tags = [chart.live ? { y: Y(chart.live), tie: 0 } : null, merged ? null : { y: Y(lastC), tie: 0 },
+      chart.stop ? { y: Y(chart.stop), tie: chart.side === "short" ? -1 : 1 } : null];   // a stop at the price: on its side
+    const ty = stackTags(tags, chart.live ? 0 : 1, 8, h - 8), under = (y) => ty.some((t) => t != null && Math.abs(y - t) < 13);
 
     g.font = "10px JetBrains Mono, monospace";
     for (let k = 0; k <= 4; k++) {
       const p = lo + (hi - lo) * k / 4, y = Y(p);
       line(g, [[0, y], [w - padR, y]], css("--line"), 1);
-      if (liveY != null && Math.abs(y - liveY) < 13) continue;
+      if (under(y)) continue;
       g.fillStyle = css("--dim"); g.fillText(pxAxis(p), w - padR + 6, y + 3);
     }
     // the x axis in Mountain Time days: a tick where each day starts (its midnight, inside the candle it falls in: 5 am
@@ -223,7 +223,7 @@
       line(g, [[x, h - padB], [x, h - padB + 4]], css("--dim"), 1);
       if (x - lastDate >= 44 && x + 32 <= w - padR) { g.fillText(MT.md(cs[k][0]), x + 2, h - 4); lastDate = x; }
     }
-    g.fillText(TZ, w - padR + 6, h - 4);
+    if (!under(h - 7)) g.fillText(TZ, w - padR + 6, h - 4);
 
     line(g, chart.don_hi.map((v, k) => [X(k), v == null ? null : Y(v)]), css("--channel") || rgba("--muted", .55), 1, [3, 4]);
     line(g, chart.don_lo.map((v, k) => [X(k), v == null ? null : Y(v)]), css("--channel") || rgba("--muted", .35), 1, [3, 4]);
@@ -245,10 +245,7 @@
     });
     g.lineWidth = 1;
 
-    if (chart.stop) {
-      line(g, [[0, Y(chart.stop)], [w - padR, Y(chart.stop)]], css("--orange"), 1.2, [6, 4]);
-      tag(g, w - padR, Y(chart.stop), `STOP ${pxAxis(chart.stop)}`, css("--orange"));
-    }
+    if (chart.stop) line(g, [[0, Y(chart.stop)], [w - padR, Y(chart.stop)]], css("--orange"), 1.2, [6, 4]);
     if (chart.entry) line(g, [[0, Y(chart.entry)], [w - padR, Y(chart.entry)]], css("--entry") || "rgba(241,241,246,.6)", 1, [2, 3]);
 
     const pin = css("--entry-mark") === "pin";   // theme hook: an entry as an ink pin lettered L / S, not an up / down triangle
@@ -271,22 +268,72 @@
       }
     }
     const last = cs[cs.length - 1];
-    tag(g, w - padR, Y(lastC), ct.text, css(lastC >= last[1] ? "--green" : "--red"), !ct.held, ct.held);
-    // BTC on Coinbase: its live price from Coinbase's feed, as a line and an outlined tag at the right edge (placed
-    // above; none when the newest candle's close already says it). The candle still forming is formingBars'
+    if (!merged) tag(g, w - padR, ty[1], ct.text, css(lastC >= last[1] ? "--green" : "--red"), !ct.held, ct.held);
+    if (chart.stop) tag(g, w - padR, ty[2], `STOP ${pxAxis(chart.stop)}`, css("--orange"));
+    // The chart's own live price, fresh (withLive: Coinbase's on BTC's chart, Hyperliquid's on ETH's and SOL's): a solid
+    // line in --live, a color no other line has, and "● LIVE 82,290" on its tag at the right edge. Never the proxy's,
+    // a stale price or one from before a closure: then no line, no LIVE, and the close tag as it is. The candle still
+    // forming is formingBars' (BTC) or Hyperliquid's (the others)
     if (chart.live) {
-      const y = Y(chart.live), cyan = css("--cyan") || "#2ee6ff";
-      line(g, [[0, y], [w - padR, y]], rgba("--cyan", .7), 1, [2, 3]);
-      g.save(); g.font = "bold 9px JetBrains Mono, monospace"; g.fillStyle = cyan; g.textAlign = "right";
-      // its word clear above the wicks of the newest candles under it (BTC's forming candle runs up to the line), unless
-      // that's far from the line: then on it, as before
-      const x1 = w - padR - 4, x0 = x1 - g.measureText("LIVE").width - 2, ty0 = (liveY != null && liveY < y ? liveY : y) - 4;
-      let ty = ty0;
-      for (let k = cs.length - 1; k >= 0 && X(k) + slot(k) / 2 >= x0; k--) if (X(k) - slot(k) / 2 <= x1) ty = Math.min(ty, Y(cs[k][2]) - 3);
-      g.fillText("LIVE", x1, ty0 - ty > 36 || ty < padT + 9 ? ty0 : ty); g.restore();
-      if (liveY != null) tag(g, w - padR, liveY, pxAxis(chart.live), cyan);
-    }
+      line(g, [[0, Y(chart.live)], [w - padR, Y(chart.live)]], css("--live") || "#ffd84a", 1.5);
+      liveBeat(chart.liveAt, liveTag(g, w - padR, ty[0], chart.live));
+    } else liveBeat(0, null);
     lastGeom = { X, Y, cs, w, h, padR };
+  }
+
+  // Where the right edge's tags go ({y, tie} each, or null for none): in the order of their prices (tie: a tag at the
+  // same price goes above, -1, or below, 1), 17 px apart at least (a tag is 16 tall) and between top and bot, none
+  // left out. The anchor (the live price's tag, else the close's) stays at its price; the others are at theirs or
+  // pushed on past it, and only a stack with no room before top or bot moves the anchor. [y or null, ...] in order
+  function stackTags(tags, anchor, top, bot) {
+    const o = tags.map((t, k) => k).filter((k) => tags[k]).sort((i, j) => tags[i].y - tags[j].y || tags[i].tie - tags[j].tie);
+    const y = o.map((k) => tags[k].y), n = y.length, a = Math.max(0, o.indexOf(anchor));
+    if (!n) return tags.map(() => null);
+    y[a] = Math.min(bot, Math.max(top, y[a]));
+    for (let k = a + 1; k < n; k++) y[k] = Math.max(y[k], y[k - 1] + 17);
+    for (let k = a - 1; k >= 0; k--) y[k] = Math.min(y[k], y[k + 1] - 17);
+    if (y[n - 1] > bot) { y[n - 1] = bot; for (let k = n - 2; k >= 0; k--) y[k] = Math.min(y[k], y[k + 1] - 17); }
+    if (y[0] < top) { y[0] = top; for (let k = 1; k < n; k++) y[k] = Math.max(y[k], y[k - 1] + 17); }
+    const at = tags.map(() => null);
+    o.forEach((k, m) => { at[k] = y[m]; });
+    return at;
+  }
+
+  // The live price's tag: "● LIVE 82,290" on --live, the dot and the word on the tag itself, its lettering in
+  // --on-live. As wide as liveW(); returns where its dot is (liveBeat)
+  const liveW = (g, p) => {
+    g.font = "bold 9px JetBrains Mono, monospace"; const ww = g.measureText("LIVE").width;
+    g.font = "bold 10px JetBrains Mono, monospace";
+    return { ww, tw: ww + g.measureText(pxAxis(p)).width + 19 };
+  };
+  function liveTag(g, x, y, p) {
+    g.save();
+    const { ww, tw } = liveW(g, p), on = css("--on-live") || "#17161c";
+    g.fillStyle = g.strokeStyle = css("--live") || "#ffd84a";
+    g.fillRect(x + 2, y - 8, tw, 16); g.strokeRect(x + 2, y - 8, tw, 16);
+    g.fillStyle = on; g.beginPath(); g.arc(x + 7.5, y, 2.5, 0, Math.PI * 2); g.fill();
+    g.fillText(pxAxis(p), x + 17 + ww, y + 4);
+    g.font = "bold 9px JetBrains Mono, monospace"; g.fillText("LIVE", x + 13, y + 3.5);
+    g.restore();
+    return [x + 7.5, y];
+  }
+
+  // The live tag's dot beats once when a new price comes (a Coinbase message on BTC, an allMids answer on ETH and
+  // SOL), so a glance sees it moving: a dot over the canvas's own for 0.5 s, then nothing; no animation runs between
+  // prices, and none under reduced motion. at: the price's time (the same one again: no beat); dot: [x, y] on #chart,
+  // null when no live tag is drawn
+  const beat = { el: null, at: 0, dot: null }, still = matchMedia("(prefers-reduced-motion: reduce)");
+  function liveBeat(at, dot = beat.dot) {
+    beat.dot = dot;
+    if (!dot) { beat.at = 0; if (beat.el && beat.el.getAnimations) beat.el.getAnimations().forEach((a) => a.cancel()); return; }
+    if (at === beat.at) return;
+    beat.at = at;
+    const c = $("chart");
+    if (still.matches || !c.animate) return;
+    if (!beat.el) { beat.el = document.createElement("i"); beat.el.className = "live-beat"; beat.el.setAttribute("aria-hidden", "true"); c.after(beat.el); }
+    beat.el.style.left = `${c.offsetLeft + dot[0]}px`; beat.el.style.top = `${c.offsetTop + dot[1]}px`;
+    beat.el.animate([{ opacity: 1, transform: "scale(1)" }, { opacity: 1, transform: "scale(2)", offset: 0.3 }, { opacity: 1, transform: "scale(1)" }],
+      { duration: 500, easing: "ease-out" });
   }
 
   // The newest candle's close tag. Filled, as on every chart, when that close is a closed candle's or the live price;
@@ -299,13 +346,15 @@
     return { text: (held && chart.runIdx === k ? "RUN " : "") + pxAxis(c), held };
   }
 
-  // The price axis's width: room for its widest tag ("STOP 77,970" is wider than a price) and label, so none is cut off
-  // at the canvas's right edge on a phone. A tag is drawn from 2 px past the axis line, 8 px wider than its text (tag()),
-  // and keeps 2 px clear of the edge; an axis label starts 6 px past it. At least today's 64 px
+  // The price axis's width: room for its widest tag ("STOP 77,970" and "● LIVE 82,290" are wider than a price) and
+  // label, so none is cut off at the canvas's right edge on a phone. A tag is drawn from 2 px past the axis line, 8 px
+  // wider than its text (tag(); the live one liveW()), and keeps 2 px clear of the edge; an axis label starts 6 px past
+  // it. At least today's 64 px
   function rightPad(g, chart, closeText, lo, hi) {
+    const live = chart.live ? liveW(g, chart.live).tw + 4 : 0;
     g.font = "bold 10px JetBrains Mono, monospace";
-    const tags = [closeText, chart.stop ? `STOP ${pxAxis(chart.stop)}` : "", chart.live ? pxAxis(chart.live) : ""];
-    const tagW = Math.max(...tags.map((t) => g.measureText(t).width + 12));
+    const tags = [closeText, chart.stop ? `STOP ${pxAxis(chart.stop)}` : ""];
+    const tagW = Math.max(live, ...tags.map((t) => g.measureText(t).width + 12));
     g.font = "10px JetBrains Mono, monospace";
     const axisW = Math.max(g.measureText(pxAxis(hi)).width, g.measureText(pxAxis(lo)).width) + 8;
     return Math.ceil(Math.max(64, tagW, axisW));
@@ -518,9 +567,7 @@
       ` · ${esc(t.record)} · HOLD <span class="${tone(t.hold_pct, 4)}">${pct(t.hold_pct)}</span>` +
       ` · ${pnlHtml(s)} · FEES ${usd(t.fees)}${v ? " (EST.)" : ""} · FUNDING ${v ? "(EST.) " : ""}${usd(t.funding)}`);
     txt($("chart-title"), `${v ? v.product : coin + "-PERP"} · ${s.header.interval} · ${px(t.price)}${proxy ? " (HL proxy)" : ""}`);
-    put($("chart-sub"), `<span class="${chgCls}">24h ${pct(t.change_24h)}</span>` +
-      ` · fast <i class="swatch fast"></i> · slow <i class="swatch slow"></i> · channel <i class="swatch channel"></i> · stop <i class="swatch stop"></i>` +
-      (s.chart.prov && s.chart.prov.length ? ` · newest candle${s.chart.prov.length > 1 ? "s" : ""} <i class="swatch prov"></i> provisional` : ""));
+    put($("chart-sub"), legend(s.chart, `<span class="${chgCls}">24h ${pct(t.change_24h)}</span>`));
     const chips = $("chips");
     put(chips, s.agents.map((a) => `<span class="chip ${a.state === "idle" ? "off" : ""}" title="${esc(a.name)}: ${esc(a.state)}"
       style="background:var(${COLORS[a.key]})">${esc(a.name[0])}</span>`).join(""));
@@ -537,6 +584,15 @@
              row(`follow-through ${num(ans.follow_through?.noul)}`, ans.follow_through?.noul) +
              row(`trend ${num(ans.regime?.probabilities?.trend)}`, ans.regime?.probabilities?.trend)
            : `<div class="q"><span>LAST ANSWER</span>asked only when every other gate passes</div>`));
+  }
+
+  // The legend under the chart's title: each entry kept whole on one line with the dot after it, so a phone wraps it
+  // between entries only, a line ending "·". The live price's entry only while its marker is drawn (chart.live)
+  function legend(ch, change) {
+    return [change, `fast <i class="swatch fast"></i>`, `slow <i class="swatch slow"></i>`, `channel <i class="swatch channel"></i>`,
+      `stop <i class="swatch stop"></i>`, ch.live ? `live <i class="swatch live"></i>` : "",
+      ch.prov && ch.prov.length ? `newest candle${ch.prov.length > 1 ? "s" : ""} <i class="swatch prov"></i> provisional` : "",
+    ].filter(Boolean).map((x) => `<span class="lg">${x}</span>`).join("&nbsp;· ");
   }
 
   function renderBalance(s) {
@@ -946,7 +1002,7 @@
       if (!base.venue) { renderCoins(); return; }   // another tab: only the BTC card's price moves
       // the same Coinbase price as drawn (the book moved, no trade) and no new allMids: only the price's time is new
       if (state && drawn.source === "coinbase" && livePrice(base).source === "coinbase" && cb.price === drawn.price && live.at === drawn.mids) {
-        state.livePx.at = cb.at; txt($("foot"), foot(state));
+        state.livePx.at = state.chart.liveAt = cb.at; txt($("foot"), foot(state)); liveBeat(cb.at);
       } else render(true);                          // only what the price moves; render says when its source changed
       if (state.livePx.source === "coinbase" && (!told || told.priceAt !== cb.at)) ticked();   // a new Coinbase message
     }, now ? 0 : Math.min(CB_PAINT, Math.max(0, cb.painted + CB_PAINT - Date.now())));   // (a clock set back: not later)
@@ -994,9 +1050,12 @@
     if (s.header.kind === "basket") return withLiveBasket(s);
     const lp = s.livePx = livePrice(s);   // Coinbase closed: no price, so the board's own, nothing re-marked
     if (s.venue) formingBars(s, Date.now());
+    s.chart.side = s.ticker.pos ? s.ticker.pos.side : null;   // a stop's side of the price: below a long's, above a short's
     const mid = lp.price;
     if (!mid) return s;
-    if (lp.source === "coinbase") s.chart.live = mid;
+    // the chart's live marker: only its own price while fresh, Coinbase's on BTC's chart (never the proxy's) and
+    // Hyperliquid's mid on the others under STALE old; chart.liveAt is when it came (its dot beats for a new one)
+    if (lp.source === "coinbase" || (!s.venue && near(Date.now(), lp.at) <= STALE)) { s.chart.live = mid; s.chart.liveAt = lp.at; }
     const t = s.ticker;
     t.price = mid; s.analysis.stats.price = mid;
     const p = t.pos, m = remark(t.cash, p, mid);
@@ -1170,7 +1229,7 @@
   const drawn = { bank: null, price: null, source: null, mids: 0 };
   // Only `true` is the light redraw. A resize hands render its event (a phone turned on its side): everything is redrawn
   // at the new size, the equity curve and the P&L bars too, a full render, once a frame at most
-  let resized = 0;
+  let resized = 0, liveDue = 0;
   function render(light = false) {
     if (light !== true && light !== false) { if (!resized) resized = requestAnimationFrame(() => { resized = 0; render(); }); return; }
     state = withLive(base);
@@ -1199,6 +1258,10 @@
     if (s.venue) cb.mode = cbMode(lp);
     if (basket) renderBasket(s);
     else { if (!light) renderAgents(s.agents); renderStage(s); if (!light) renderBubbles(s.agents); drawChart(s.chart); drawWeb(); }
+    // a Hyperliquid price is LIVE on its chart until it is STALE old: then a redraw takes the marker off, unless a newer
+    // one has come (BTC's Coinbase price: cbWatch redraws when it stops being fresh)
+    clearTimeout(liveDue);
+    if (!basket && !s.venue && s.chart.live) liveDue = setTimeout(() => render(true), Math.max(0, s.chart.liveAt + STALE - Date.now()) + 50);
     renderBalance(s);
     if (!light || s.ticker.bank !== drawn.bank) { drawn.bank = s.ticker.bank; drawEquity(s.equity, s.flows ? s.flows.marks : []); }   // flat: the same curve
     if (!light) drawPnlBars(s.pnl_bars);
