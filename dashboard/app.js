@@ -264,7 +264,12 @@
       const y = Y(chart.live), cyan = css("--cyan") || "#2ee6ff";
       line(g, [[0, y], [w - padR, y]], rgba("--cyan", .7), 1, [2, 3]);
       g.save(); g.font = "bold 9px JetBrains Mono, monospace"; g.fillStyle = cyan; g.textAlign = "right";
-      g.fillText("LIVE", w - padR - 4, (liveY != null && liveY < y ? liveY : y) - 4); g.restore();
+      // its word clear above the wicks of the newest candles under it (BTC's forming candle runs up to the line), unless
+      // that's far from the line: then on it, as before
+      const x1 = w - padR - 4, x0 = x1 - g.measureText("LIVE").width - 2, ty0 = (liveY != null && liveY < y ? liveY : y) - 4;
+      let ty = ty0;
+      for (let k = cs.length - 1; k >= 0 && X(k) + slot(k) / 2 >= x0; k--) if (X(k) - slot(k) / 2 <= x1) ty = Math.min(ty, Y(cs[k][2]) - 3);
+      g.fillText("LIVE", x1, ty0 - ty > 36 || ty < padT + 9 ? ty0 : ty); g.restore();
       if (liveY != null) tag(g, w - padR, liveY, pxAxis(chart.live), cyan);
     }
     lastGeom = { X, Y, cs, w, h, padR };
