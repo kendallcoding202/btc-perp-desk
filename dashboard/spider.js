@@ -188,6 +188,20 @@
     const sx = S / 2 + (shake ? 2 : 0), up = S / 2 + (shake ? 4 : 0);
     return !ws.some((q) => q.r > p.x - sx && q.l < p.x + sx && q.b > p.y - up && q.t < p.y + S * 11 / 24);
   }
+  // the money on the page is never sat on: the tabs' banks and prices, the big balance and HOLD, the tickers, the cards'
+  // values and the desk monitor. A perch on an edge over any of it slides along that edge to clear it, or isn't taken
+  const MONEY = ".coin .c-bank, .coin .c-sub, .coin .c-name i, #balance, #bal-hold, #ticker, #vt-ticker, .card .value, .act-monitor";
+  const money = () => [...document.querySelectorAll(MONEY)].flatMap(words);   // read once a stop, never a frame
+  function offMoney(p) {
+    if (!p || !p.perch) return p;
+    const ws = money(), b = box(p.perch.el);
+    if (clear(p, ws, p.found)) return p;   // (found: it twitches there)
+    if (!b) return null;
+    for (let d = 4; d < b.w; d += 4) {
+      for (const x of [p.x - d, p.x + d]) if (x >= b.x + S / 2 && x <= b.x + b.w - S / 2 && clear({ ...p, x }, ws, p.found)) return { ...p, x };
+    }
+    return null;
+  }
   const priceSpot = () => amountSpot($("ticker"), /\$[\d,.]+/);    // the coin's price: the ticker's first $ amount
   // the basket's bank in its ticker. A phone wraps it after BANK: it then stands above that word, on the panel's
   // edge, not over the ticker's first line
@@ -256,10 +270,10 @@
     const m = basket() && FILL.exec(text || ""), row = m && sleeveSpot(m[1]);   // VT: first that coin's row
     if (row && seen(row.y, S / 2)) return row;
     const chip = tickerEl() && tickerEl().querySelector(".hl"), c = box(chip);
-    if (c && seen(c.y, S / 2)) return { x: c.x + c.w / 2, y: c.y - S * 0.45, perch: { el: chip, top: true } };
+    const atChip = c && seen(c.y, S / 2) && offMoney({ x: c.x + c.w / 2, y: c.y - S * 0.45, perch: { el: chip, top: true } });
+    if (atChip) return atChip;
     const tab = document.querySelector(".coin.on"), t = box(tab);
-    if (t && seen(t.y, S / 2)) return { ...edge(t, true, 0.5), perch: { el: tab, top: true } };
-    return null;
+    return (t && seen(t.y, S / 2) && offMoney({ ...edge(t, true, 0.5), perch: { el: tab, top: true } })) || null;
   }
 
   // ---- motion: a visit becomes a plan of small actions; each returns ms until it next needs a frame, -1 = done,
@@ -465,8 +479,9 @@
         if (dirty) refresh();
         const room = Math.min(visit.drop, scrollY + innerHeight - sp.y - S, fy + fh - sp.y - S);
         if (room < 30 || silk) continue;
-        const tk = box(tickerEl()), y = sp.y + room;           // never hang over the ticker's numbers
+        const tk = box(tickerEl()), y = sp.y + room;           // never hang over the ticker's numbers, or any money
         if (tk && y + S / 2 > tk.y && y - S / 2 < tk.y + tk.h) continue;
+        if (!clear({ x: sp.x, y }, money())) continue;
         plan = [lower(y, room / 0.09, 45), sit(rand(1400, 2400), "hang"), climb(room / 0.07), sit(rand(3000, 6000), "idle")];
         return true;
       }
@@ -492,6 +507,8 @@
         }
       }
       if (peekFor) { queue.unshift(peekAt(peekFor), visit); peekFor = null; continue; }
+      spot = offMoney(spot);              // an edge it would sit on: clear of the money on it, or another stop
+      if (!spot) continue;
       go(spot);
       return true;
     }

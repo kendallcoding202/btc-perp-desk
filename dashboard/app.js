@@ -57,9 +57,9 @@
   const hhmm = (ms) => new Date(ms).toISOString().slice(11, 16);
   const mmddhhmm = (ms) => new Date(ms).toISOString().slice(5, 16).replace("T", " ");
   const DAY_MS = 86400000;
-  // theme hook: a signed amount's direction as classes, "ok up" / "bad down" / "ok flat" (zero at the shown `dp`
-  // decimals is flat: neither a gain nor a loss). style.css colors ok / bad; a theme can mark up / down / flat
-  const tone = (x, dp = 2) => x == null || isNaN(x) ? "" : Math.abs(x) * 10 ** dp < 0.5 ? "ok flat" : x < 0 ? "bad down" : "ok up";
+  // theme hook: a signed amount's classes. ok / bad exactly as before (style.css colors them: below zero is bad), plus
+  // its direction for a theme: up, down, or flat when it is zero at the shown `dp` decimals (neither a gain nor a loss)
+  const tone = (x, dp = 2) => `${x < 0 ? "bad" : "ok"}${x == null || isNaN(x) ? "" : Math.abs(x) * 10 ** dp < 0.5 ? " flat" : x < 0 ? " down" : " up"}`;
   const closedTag = (text) => `<span class="venue-closed">${text.replace(/ · $/, "")}</span> · `;   // theme hook: CLOSED as a chip
 
   // ---- canvas helpers -------------------------------------------------------
@@ -130,15 +130,19 @@
     line(g, chart.ema_slow.map((v, k) => [X(k), v == null ? null : Y(v)]), css("--blue"), 1.6);
     line(g, chart.ema_fast.map((v, k) => [X(k), v == null ? null : Y(v)]), css("--cyan"), 1.6);
 
-    const bw = Math.max(1, cw * 0.62), hollow = css("--candle-up") === "hollow" && bw >= 3;   // theme hook: hollow up candles
+    // theme hook (--candle-up: hollow): up candles hollow and down ones filled, so direction isn't color alone. A body
+    // under 3 px (a phone) is drawn hollow as wide as its slot allows, outlined in one device pixel
+    const bw = Math.max(1, cw * 0.62), hollow = css("--candle-up") === "hollow";
+    const hw = bw >= 3 ? bw : Math.max(bw, cw * 0.92), hl = bw >= 3 ? 1 : 1 / (window.devicePixelRatio || 1);
     cs.forEach(([, o, hgh, l, c], k) => {
       const up = c >= o, col = up ? css("--green") : css("--red");
-      g.strokeStyle = col; g.beginPath(); g.moveTo(X(k), Y(hgh)); g.lineTo(X(k), Y(l)); g.stroke();
+      g.strokeStyle = col; g.lineWidth = up && hollow ? hl : 1; g.beginPath(); g.moveTo(X(k), Y(hgh)); g.lineTo(X(k), Y(l)); g.stroke();
       g.fillStyle = col;
       const y1 = Y(Math.max(o, c)), y2 = Y(Math.min(o, c));
-      if (up && hollow) { g.fillStyle = css("--ink"); g.fillRect(X(k) - bw / 2, y1, bw, Math.max(1, y2 - y1)); g.strokeRect(X(k) - bw / 2 + 0.5, y1 + 0.5, bw - 1, Math.max(1, y2 - y1 - 1)); }
+      if (up && hollow) { g.fillStyle = css("--ink"); g.fillRect(X(k) - hw / 2, y1, hw, Math.max(1, y2 - y1)); g.strokeRect(X(k) - hw / 2 + hl / 2, y1 + hl / 2, hw - hl, Math.max(hl, y2 - y1 - hl)); }
       else g.fillRect(X(k) - bw / 2, y1, bw, Math.max(1, y2 - y1));
     });
+    g.lineWidth = 1;
 
     if (chart.stop) {
       line(g, [[0, Y(chart.stop)], [w - padR, Y(chart.stop)]], css("--orange"), 1.2, [6, 4]);
@@ -146,12 +150,14 @@
     }
     if (chart.entry) line(g, [[0, Y(chart.entry)], [w - padR, Y(chart.entry)]], css("--entry") || "rgba(241,241,246,.6)", 1, [2, 3]);
 
+    const pin = css("--entry-mark") === "pin";   // theme hook: an entry as an ink pin lettered L / S, not an up / down triangle
     for (const m of chart.markers) {
       const k = nearest(tsIndex, m.ts, chart.bar_ms, cs);
       if (k == null) continue;
       const x = X(k), y = Y(m.price);
       if (m.kind === "entry") {
         const short = m.side === "short";
+        if (pin) { entryPin(g, x, y, short); continue; }
         g.fillStyle = css(short ? "--red" : "--green");
         g.beginPath();
         if (short) { g.moveTo(x, y - 4); g.lineTo(x - 5, y - 12); g.lineTo(x + 5, y - 12); }
@@ -173,6 +179,18 @@
     if (index.has(open)) return index.get(open);
     if (ts < cs[0][0]) return null;
     return Math.min(cs.length - 1, Math.floor((ts - cs[0][0]) / barMs));
+  }
+
+  // theme hook (--entry-mark: pin): an entry at its price as a pin in the page's ink, lettered L (a long: the pin hangs
+  // below the price) or S (a short: above it). Neither a gain nor a loss color, and no arrow: arrows mean money
+  function entryPin(g, x, y, short) {
+    const d = short ? -1 : 1, top = short ? y - 18 : y + 6;
+    g.save(); g.lineWidth = 1; g.strokeStyle = g.fillStyle = css("--pen") || css("--text");
+    g.beginPath(); g.arc(x, y, 1.8, 0, Math.PI * 2); g.fill();
+    g.beginPath(); g.moveTo(x, y); g.lineTo(x, y + d * 6); g.stroke();
+    g.fillStyle = css("--panel"); g.fillRect(x - 5.5, top, 11, 12); g.strokeRect(x - 5, top + 0.5, 10, 11);
+    g.fillStyle = css("--text"); g.font = "bold 9px JetBrains Mono, monospace"; g.textAlign = "center";
+    g.fillText(short ? "S" : "L", x, top + 9); g.restore();
   }
 
   function tag(g, x, y, text, color, filled = false) {
@@ -364,9 +382,9 @@
     $("bal-mode").textContent = s.header.mode;
     $("bal-record").textContent = t.record;
     $("bal-hold").textContent = pct(t.hold_pct);
-    $("bal-hold").className = tone(t.hold_pct, 4);
+    $("bal-hold").className = t.hold_pct < 0 ? "bad" : "ok";
     $("balance").textContent = usd(t.bank);
-    $("balance").style.color = t.pnl >= 0 ? "var(--green)" : "var(--red)"; $("balance").className = `big ${tone(t.pnl)}`;
+    $("balance").style.color = t.pnl >= 0 ? "var(--green)" : "var(--red)";
     if (goal) {
       $("goal-from").textContent = usd(goal.start, 0);
       $("goal-to").textContent = usd(goal.target, 0);
@@ -390,6 +408,9 @@
       $("goal-note").innerHTML = `${(goal.progress * 100).toFixed(1)}% of the way (log scale) · ${num(goal.multiple_left, 0)}x to go<br>` + pace +
         (goal.realised_cagr != null ? `<br>at this account's own pace ${at(goal.realised_cagr, goal.years_at_realised_rate)}` : "") + money;
     }
+
+    // theme hook: HOLD and the big balance as a gain, a loss or flat (tone(): the same ok / bad as above, plus up / down / flat)
+    $("bal-hold").className = tone(t.hold_pct, 4); $("balance").className = `big ${tone(t.pnl)}`;
   }
 
   const GATE_FMT = (g) => {

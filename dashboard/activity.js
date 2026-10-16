@@ -273,6 +273,7 @@
     const mode = b.header.mode || "PAPER";
     set(M.mode, mode); M.mode.classList.toggle("act-livemode", mode !== "PAPER");
     set(L.lmode, mode); L.lmode.classList.toggle("act-livemode", mode !== "PAPER");
+    M.mode.dataset.mode = L.lmode.dataset.mode = mode.toLowerCase();   // theme hook: which mode, not only "not PAPER"
     M.dot.classList.toggle("act-stale", old || lost);
     set(M.st, lost ? (narrow.matches ? `CAN'T READ THE BOARD SINCE ${hhmm(lastRead)}` : `CAN'T READ THE BOARD SINCE ${hhmm(lastRead)} UTC · SHOWING THE ONE BUILT ${hhmm(b.updated)} UTC`)
       : old ? `STALE · NO NEW BOARD FOR ${age}`      // the run's time is in the REPLAY label
