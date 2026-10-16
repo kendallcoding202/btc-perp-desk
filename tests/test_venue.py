@@ -202,10 +202,15 @@ def test_remember_keeps_margin_windows_and_the_funding_log_across_runs():
 
 
 def test_live_refuses_btc_on_coinbase_with_why():
-    from desk.brokers.live import LiveBroker, LiveSetupError
+    """BTC on Coinbase goes only through Coinbase's own adapter (desk/brokers/coinbase.py), and LIVE on it is locked
+    (desk/coinbase_live.py): never through ccxt, never without arming."""
+    from desk.brokers.live import LiveBroker, LiveSetupError, make_exchange
 
-    with pytest.raises(LiveSetupError, match="BTC is set up for COINBASE · BTC PERP .*live trading there isn't built"):
-        LiveBroker(params_for("BTC"), exchange=object(), state_path="/nonexistent/x.json")
+    for ex in (object(), None):
+        with pytest.raises(LiveSetupError, match="BTC is set up for COINBASE · BTC PERP .*LIVE on it is locked"):
+            LiveBroker(params_for("BTC"), exchange=ex, state_path="/nonexistent/x.json")
+    with pytest.raises(LiveSetupError, match="LIVE on it is locked"):
+        make_exchange("coinbase")
 
 
 # a venue like Coinbase's for the tests' synthetic 4h series: no known closures (they're from 2025-26), 3x
@@ -304,3 +309,26 @@ def test_the_research_tables_mark_each_halt_and_count_what_whole_contracts_skip(
     assert out.splitlines()[2].endswith("| trades | entries skipped: no whole contract fits |")
     plain = research.sizing(bars, funding, P)                                   # no venue: no skip column
     assert plain.splitlines()[2].endswith("| trades |")
+
+
+def test_min_equity_for_one_contract_is_the_size_gates_own_arithmetic():
+    """At $80,000 with a stop $2,400 away: one contract ($800) loses $24 at the stop. 5% risk needs $480; 4x needs
+    $200; the overnight margin needs $24 + $800 x 21.025% = $192.20. The size gate takes one contract from $480."""
+    r = rules()
+    need = r.min_equity_for_one(80_000.0, 77_600.0, 1, 0.05, desk_max_leverage=4.0)
+    assert need == pytest.approx(480.0)
+    desk_qty = lambda eq: eq * 0.05 / 2_400.0       # noqa: E731 (the desk's risk-based size, filter.py SIZE)
+    assert r.size(desk_qty(need), 80_000.0, 77_600.0, need, 1, 0.05)[0] == pytest.approx(0.01)
+    assert r.size(desk_qty(need - 0.01), 80_000.0, 77_600.0, need - 0.01, 1, 0.05)[0] == 0.0
+    # a short: its overnight margin (25.6625%) binds when the stop is near
+    short = r.min_equity_for_one(80_000.0, 80_400.0, -1, 0.05)
+    assert short == pytest.approx(max(4.0 / 0.05, 800.0 / r.spec.max_leverage, 4.0 + 800.0 * 0.256625))
+
+
+def test_live_on_coinbase_without_once_refuses_with_the_loop_message(capsys):
+    from desk import __main__ as cli
+
+    assert cli.main(["live", "--coin", "BTC"]) == 2
+    assert "Coinbase LIVE runs one check per call (--once)" in capsys.readouterr().out
+    assert cli.main(["live", "--coin", "BTC", "--once"]) == 2           # off Actions it needs --local too
+    assert "--local" in capsys.readouterr().out

@@ -351,3 +351,6 @@ body.kind-basket .stage::after { content: none; }
   .card::after { animation: none !important; }
   body.has-live .chart-wrap::before { opacity: 0; }
 }
+
+/* BTC SHADOW: the pill on the main board and on its own page, paper lettering on the lab-ink badge (AA in both editions) */
+.mode.shadow { color: var(--panel); background: var(--cyan); border-color: var(--pen); }

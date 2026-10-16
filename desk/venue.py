@@ -120,10 +120,12 @@ class Sessions:
 
 class Rules:
     """One venue's rules as they stand for a run: the spec (thresholds.ContractVenue), the closures known, and the
-    margin rates (paper passes what Coinbase answered this run; the backtest the spec's)."""
+    margin rates (paper passes what Coinbase answered this run; the backtest the spec's). `clock`: how a gate's note
+    writes a time of day (paper's and the backtest's: UTC; Coinbase's SHADOW and LIVE pass Mountain Time's)."""
 
-    def __init__(self, venue: ContractVenue, windows=(), margin: dict | None = None):
+    def __init__(self, venue: ContractVenue, windows=(), margin: dict | None = None, clock=None):
         self.spec = venue
+        self.clock = clock or (lambda ms: f"{_hhmm(ms)} UTC")
         self.sessions = Sessions(venue, windows)
         m = margin or {}
         self.margin = {"overnight_long": m.get("overnight_long") or venue.overnight_long_margin,
@@ -164,7 +166,7 @@ class Rules:
         if c:
             a, b, why = c
             return GateResult("session", Verdict.DROP, owner="fills",
-                              note=f"Coinbase closed at the fill ({why}, reopens {_hhmm(b)} UTC)")
+                              note=f"Coinbase closed at the fill ({why}, reopens {self.clock(b)})")
         if ctx is not None and getattr(ctx, "session_open", None) is False:
             return GateResult("session", Verdict.DROP, owner="fills",
                               note=getattr(ctx, "session_note", None) or "Coinbase reports its session closed")
@@ -223,6 +225,19 @@ class Rules:
             note = f"cut from {first} to {n} contracts: " + note
         gates.append(GateResult("margin", Verdict.PASS, round(left, 2), round(need, 2), "min", "size", note))
         return self.qty(n), gates
+
+    def min_equity_for_one(self, price: float, stop: float, side_sign: int, risk_budget: float,
+                           desk_max_leverage: float | None = None) -> float:
+        """The smallest account that holds one contract at `price` with this stop, as size() decides: the loss at the
+        stop within the risk budget, one contract's notional within the leverage caps, and the equity left at the
+        stop covering its overnight margin. (What the board shows an account too small to trade.)"""
+        one = self.spec.contract_size * price
+        loss1 = self.spec.contract_size * abs(price - stop)
+        need = [loss1 / risk_budget if risk_budget > 0 else math.inf, one / self.spec.max_leverage,
+                loss1 + one * self.overnight_margin(side_sign)]
+        if desk_max_leverage:
+            need.append(one / desk_max_leverage)
+        return max(need)
 
     def as_dict(self) -> dict:
         return {"spec": asdict(self.spec), "margin": dict(self.margin), "windows": self.sessions.windows}

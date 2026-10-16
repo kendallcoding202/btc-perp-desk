@@ -304,7 +304,7 @@ def _when(ms: int) -> str:
     return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ms / 1000))
 
 
-def _wait_for_holes(desk, vstate: dict, bars: list, bar_ms: int, now: int, last_bar_ts: int, log) -> tuple:
+def _wait_for_holes(desk, vstate: dict, bars: list, bar_ms: int, now: int, last_bar_ts: int, log, when=_when) -> tuple:
     """A candle Coinbase should have (no closure explains it) that this answer hasn't: the bars from it on wait, as a
     stop or signal on it would otherwise be lost for good (only bars after the last one processed are ever processed),
     and so does everything while one is missing among the newest HOLE_RECENT_BARS (it moves the breakout, the ATR, the
@@ -313,7 +313,9 @@ def _wait_for_holes(desk, vstate: dict, bars: list, bar_ms: int, now: int, last_
     HOLE_KEEP_MS). Older holes (CoinbaseFeed raises past MAX_HOLES) only move the slow average a little: logged.
     Day one waits for nothing: it doesn't trade, and its holes are accepted.
 
-    Returns (cut, changed): bars opening at `cut` or later wait (None: none do); changed = the hole memory moved."""
+    Returns (cut, changed): bars opening at `cut` or later wait (None: none do); changed = the hole memory moved.
+    `when`: how a time is written (paper's: UTC; SHADOW and LIVE pass Mountain Time's, desk/mountain.py)."""
+    _when = when
     rec = vstate.get("holes") or {}
     seen = {int(k): v for k, v in (rec.get("seen") or {}).items()}
     accepted = [int(x) for x in rec.get("accepted") or []]
@@ -358,12 +360,13 @@ def _wait_for_holes(desk, vstate: dict, bars: list, bar_ms: int, now: int, last_
     return cut, changed
 
 
-def _venue_context(desk, vstate: dict, ctx, now: int, spec) -> tuple:
+def _venue_context(desk, vstate: dict, ctx, now: int, spec, when=_when) -> tuple:
     """The newest bar's context with what only paper knows (how old the newest logged funding rate is: the funding
     gate), and the warnings worth one desk event each while they last (said when they start): no new Coinbase
     funding rate for 3 hours, then for a day (entries wait), an answer without the session details, Coinbase
-    reporting closed outside its schedule.
+    reporting closed outside its schedule. `when`: as _wait_for_holes's.
     Returns (ctx, changed)."""
+    _when = when
     log_rows = vstate.get("funding_log") or []
     age = now - log_rows[-1][0] if log_rows else None
     if ctx is not None and age is not None:

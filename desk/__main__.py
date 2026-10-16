@@ -5,7 +5,8 @@
     replay       watch the desk trade history on the board (http://127.0.0.1:8787)
     paper        one coin's paper account on live prices (BTC: Coinbase's rules and prices), with a live local board
     step         process newly closed bars for every paper account (BTC, ETH, SOL, VT) once, then exit (cron / Actions)
-    live         trade real money — refuses unless the backtest AND paper record pass
+    live         trade real money — refuses unless the backtest AND paper record pass (BTC on Coinbase: LOCKED in code)
+    shadow       BTC on Coinbase: the REAL account, read only with a View-only key; orders simulated, none sent
     reset-halt   clear a drawdown halt after you've looked at what happened
     jev-test     check that JEV_API_KEY works
 """
@@ -14,8 +15,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import pickle
+import re
 import sys
 from pathlib import Path
 
@@ -382,10 +385,91 @@ def _live_confirmed() -> bool:
     return os.environ.get("DESK_LIVE_CONFIRM") == LIVE_CONFIRM_PHRASE
 
 
+_PLAIN_USD = re.compile(r"\$?\s*(?:\d+(?:\.\d+)?|\d{1,3}(?:,\d{3})+(?:\.\d+)?)")
+
+
+def max_notional(text) -> float | None:
+    """--max-notional as given: a plain number of USD ("1000", "1000.50"), with an optional $ and spaces around it
+    ("$1000", " 1000 "), or with commas only in whole thousands groups ("1,000", "$1,000.50"). Anything else ("1,5",
+    "1000,50", "10 00", "1_000", "1e3"), blank, or not above 0: None, a missing cap, never a cap read 10 or 100 times
+    too large. (A repository variable that's deleted or mistyped must never stop Coinbase LIVE before its run starts:
+    once armed, a missing cap is a protect-only run; at a first start, and on Hyperliquid, a refusal.)"""
+    t = str(text if text is not None else "").strip()
+    if isinstance(text, (int, float)) and not isinstance(text, bool):
+        v = float(text)
+    elif _PLAIN_USD.fullmatch(t):
+        v = float(re.sub(r"[\s$,]", "", t))
+    else:
+        return None
+    return v if math.isfinite(v) and v > 0 else None
+
+
+def cmd_shadow(args) -> int:
+    """SHADOW (desk/coinbase_run.py): one check of the real Coinbase account, read only. stdout and stderr are
+    captured from here on: the Actions log is public, so it gets the key's masks and one line, nothing else."""
+    from . import coinbase_run as cr
+
+    env = dict(os.environ)
+    paper_board = None
+    if args.paper_board:
+        try:
+            paper_board = json.loads(Path(args.paper_board).read_text())
+        except (OSError, ValueError):
+            paper_board = None
+
+    def go(mask_emit, buf):
+        return cr.run_shadow(args.state_dir, env, base_url=cr.base_url_from(env), mask_emit=mask_emit,
+                             paper_board=paper_board, stray=buf)
+
+    code, _, _ = cr.captured(go, lambda line: print(line, flush=True))
+    return code
+
+
+COINBASE_LOOP = ("  Coinbase LIVE runs one check per call (--once), the way GitHub Actions runs it; the long-running loop "
+                 "isn't built for Coinbase.")
+
+
+def cmd_live_coinbase(args, p) -> int:
+    """LIVE on Coinbase: LOCKED in code (coinbase_live.LIVE_REVIEWED) and behind coinbase_live.arm() (README: Going
+    live on Coinbase). One check per call. The
+    go-live gate is read inside the run (captured), and only at a first start: an unreadable report or ledger is a
+    gate that doesn't pass, never a traceback before the run's safety pass."""
+    from . import coinbase_live
+    from . import coinbase_run as cr
+
+    on_actions = os.environ.get("GITHUB_ACTIONS") == "true"
+    # LIVE is locked in code (coinbase_live.LIVE_REVIEWED): the run refuses it first of all, before anything is read,
+    # sent or saved, whatever the flags (docs/coinbase-live-status.md)
+    if not coinbase_live.locked():
+        if not args.once:
+            print(COINBASE_LOOP)
+            return 2
+        if not on_actions and not args.local:
+            print("  Coinbase LIVE runs on GitHub Actions, where its state is saved (the coinbase-state branch). Two "
+                  "machines with separate states would manage one position twice: run it here only with --local, and "
+                  "only with the Actions job stopped.")
+            return 2
+    env = dict(os.environ)
+
+    def go(mask_emit, buf):
+        return cr.run_live_once(args.state_dir, env, max_notional=max_notional(args.max_notional),
+                                max_notional_text=args.max_notional, gate=lambda: promotion_status(p),
+                                force_unproven=args.force_unproven, base_url=cr.base_url_from(env),
+                                mask_emit=mask_emit, stray=buf)
+
+    code, _, run = cr.captured(go, lambda line: print(line, flush=True))
+    if run is not None and not on_actions:      # your own terminal: every arming check, PASS or FAIL
+        for line in run.arm_lines:
+            print(line)
+    return code
+
+
 def cmd_live(args) -> int:
     from . import runner
 
     p = _params(args)
+    if venue_for(p) is not None:        # BTC on Coinbase: its own client, LOCKED
+        return cmd_live_coinbase(args, p)
     checks = promotion_status(p)
     for label, ok, val in checks:
         print(f"  {'PASS' if ok else 'FAIL'}  {label} — {val}")
@@ -394,8 +478,9 @@ def cmd_live(args) -> int:
             print("\n  Not going live: the desk hasn't proven itself yet. Keep paper trading.")
             return 2
         print("\n  --force-unproven: you are overriding the go-live gate. This is your call, not the desk's.")
-    if args.max_notional is None:
-        print("  live requires --max-notional (start with something you can lose, e.g. 50)")
+    cap = max_notional(args.max_notional)
+    if cap is None:
+        print("  live requires --max-notional, a number of USD (start with something you can lose, e.g. 50)")
         return 2
     if not _live_confirmed():
         print(f'  set DESK_LIVE_CONFIRM="{LIVE_CONFIRM_PHRASE}" in .env to arm live trading.')
@@ -404,7 +489,7 @@ def cmd_live(args) -> int:
 
     try:
         runner.run(p, "live", poll_s=args.poll, host=args.host, port=args.port, dashboard=not args.no_dashboard,
-                   max_notional=args.max_notional, jev=_jev(p))
+                   max_notional=cap, jev=_jev(p))
     except LiveSetupError as exc:
         print(f"\n  Not going live: {exc}")
         return 2
@@ -518,9 +603,18 @@ def main(argv=None) -> int:
         if name == "paper":
             sp.add_argument("--ledger", default=None, help="default ledger/<COIN>")
         if name == "live":
-            sp.add_argument("--max-notional", type=float, default=None, help="hard USD cap per position")
+            sp.add_argument("--max-notional", default=None, help="hard USD cap per position (a number of USD)")
             sp.add_argument("--force-unproven", action="store_true", help="override the go-live gate (don't)")
+            sp.add_argument("--once", action="store_true", help="BTC on Coinbase: one check, then exit (Actions)")
+            sp.add_argument("--state-dir", default="state", help="BTC on Coinbase: where its encrypted state is")
+            sp.add_argument("--local", action="store_true", help="BTC on Coinbase: allow --once off GitHub Actions")
         sp.set_defaults(fn=fn)
+
+    sp = sub.add_parser("shadow")
+    sp.add_argument("--coin", default="BTC", type=str.upper, choices=["BTC"])
+    sp.add_argument("--state-dir", required=True, help="the coinbase-state branch's files (the workflow loads them)")
+    sp.add_argument("--paper-board", default=None, help="the BTC paper account's board.json, to compare decisions")
+    sp.set_defaults(fn=cmd_shadow)
 
     sp = sub.add_parser("reset-halt")
     sp.add_argument("--mode", choices=["paper", "live"], default="paper")
