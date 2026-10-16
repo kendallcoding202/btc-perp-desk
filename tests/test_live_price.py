@@ -262,11 +262,13 @@ def test_tab_row_taps_only_switch_on_a_card():
 def test_the_live_tag_is_clear_of_the_other_tags():
     """The chart's live price tag sits at its price, or at the nearest place clear of the close's and the stop's tags
     (17 px: tags are 16 tall) on the same side of each as its price, inside the plot; if there's none, it isn't drawn
-    (the line still is). Checked against every whole-pixel place. An axis label under it is left out."""
+    (the line still is). Checked against every whole-pixel place. An axis label under it is left out. When the newest
+    candle's close is the live price (BTC's forming candle carried on with Coinbase's feed), its close tag says it: no
+    second tag."""
     place = _between(APP, "let liveY = null;", "\n\n    g.font")
     assert "if (liveY != null && Math.abs(y - liveY) < 13) continue;" in APP
     js = """
-const out = { n: 0, bad: [], none: 0 };
+const out = { n: 0, bad: [], none: 0, same: 0 };
 const padT = 8, padB = 18, h = 250, top = padT + 8, bot = h - padB - 8, Y = (p) => p;
 for (let close = 2; close <= 248; close += 7) for (const stop of [null, ...Array.from({ length: 28 }, (_, k) => 3 + 9 * k)]) for (let live = 1; live <= 250; live += 3) {
   const cs = [[0, 0, 0, 0, close]], chart = { live, stop };
@@ -276,12 +278,13 @@ for (let close = 2; close <= 248; close += 7) for (const stop of [null, ...Array
   let best = null;
   for (let t = top; t <= bot; t += 0.5) if (ok(t) && (best == null || Math.abs(t - live) < Math.abs(best - live))) best = t;
   out.n++;
+  if (live === close) { out.same++; if (liveY != null) out.bad.push(["twice", close, stop, live, liveY]); continue; }
   if (liveY == null) { out.none++; if (best != null) out.bad.push(["missed", close, stop, live, best]); }
   else if (!ok(liveY) || Math.abs(liveY - live) > Math.abs(best - live) + 0.5) out.bad.push(["placed", close, stop, live, liveY, best]);
 }
-console.log(JSON.stringify({ n: out.n, none: out.none, bad: out.bad.slice(0, 5), nbad: out.bad.length }));"""
+console.log(JSON.stringify({ n: out.n, none: out.none, same: out.same, bad: out.bad.slice(0, 5), nbad: out.bad.length }));"""
     r = __import__("json").loads(_node(js))
-    assert r["n"] > 20000 and r["nbad"] == 0, r
+    assert r["n"] > 20000 and r["nbad"] == 0 and r["same"] > 100, r
     assert 0 < r["none"] < r["n"] / 10, r     # left off only when the close and the stop leave no room on its side
 
 

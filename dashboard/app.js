@@ -170,15 +170,22 @@
     if (chart.live) vals.push(chart.live);
     let lo = Math.min(...vals), hi = Math.max(...vals);
     const pad = (hi - lo) * 0.06; lo -= pad; hi += pad;
-    const cw = (w - padR) / cs.length;
-    const X = (k) => k * cw + cw / 2;
+    // BTC's provisional newest candle(s) (formingBars, drawn dashed): each gets a slot at least 8 px wide, so its dashes
+    // read on a phone (the others' slots are about 2 px there); the rest share what's left
+    const prov = new Set(chart.prov || []);
+    let np = 0;
+    while (np < cs.length - 1 && prov.has(cs.length - 1 - np)) np++;
+    const ps = np ? Math.max((w - padR) / cs.length, 8) : 0, n0 = cs.length - np;
+    const cw = (w - padR - np * ps) / n0;
+    const X = (k) => k < n0 ? k * cw + cw / 2 : n0 * cw + (k - n0) * ps + ps / 2;
+    const slot = (k) => k < n0 ? cw : ps;
     const Y = (p) => padT + (hi - p) / (hi - lo) * (h - padT - padB);
     const tsIndex = new Map(cs.map((c, k) => [c[0], k]));
     // BTC on Coinbase: its live price's tag at the right edge goes at its price, else at the nearest place clear of the
     // close's and the stop's tags and on the same side of each as its price (the tags read in order); none if there's
     // no such place, only its line. An axis label under it isn't drawn
     let liveY = null;
-    if (chart.live) {
+    if (chart.live && chart.live !== cs[cs.length - 1][4]) {   // the newest candle carried on to it: its close tag says it
       const y = Y(chart.live), top = padT + 8, bot = h - padB - 8, taken = [Y(cs[cs.length - 1][4]), chart.stop ? Y(chart.stop) : null].filter((o) => o != null);
       const ok = (t) => t >= top && t <= bot && taken.every((o) => Math.abs(t - o) >= 17 && (y === o || (t - o) * (y - o) > 0));
       liveY = [y, top, bot, ...taken.flatMap((o) => [o - 17, o + 17])].filter(ok).sort((a, b) => Math.abs(a - y) - Math.abs(b - y))[0] ?? null;
@@ -198,7 +205,7 @@
     let lastDate = -1e9;
     for (let k = 1; k < cs.length; k++) {
       if (MT.key(cs[k][0]) === MT.key(cs[k - 1][0])) continue;
-      const mid = MT.midnight(cs[k][0]), x = X(k) - cw / 2 - Math.max(0, Math.min(1, (cs[k][0] - mid) / chart.bar_ms)) * cw;
+      const mid = MT.midnight(cs[k][0]), x = X(k) - slot(k) / 2 - Math.max(0, Math.min(1, (cs[k][0] - mid) / chart.bar_ms)) * slot(k - 1);
       line(g, [[x, h - padB], [x, h - padB + 4]], css("--dim"), 1);
       if (x - lastDate >= 44 && x + 32 <= w - padR) { g.fillText(MT.md(cs[k][0]), x + 2, h - 4); lastDate = x; }
     }
@@ -215,6 +222,7 @@
     const hw = bw >= 3 ? bw : Math.max(bw, cw * 0.92), hl = bw >= 3 ? 1 : 1 / (window.devicePixelRatio || 1);
     cs.forEach(([, o, hgh, l, c], k) => {
       const up = c >= o, col = up ? css("--green") : css("--red");
+      if (prov.has(k)) { provCandle(g, X(k), Y, o, hgh, l, c, col, Math.max(bw, slot(k) * 0.72), up && hollow); return; }
       g.strokeStyle = col; g.lineWidth = up && hollow ? hl : 1; g.beginPath(); g.moveTo(X(k), Y(hgh)); g.lineTo(X(k), Y(l)); g.stroke();
       g.fillStyle = col;
       const y1 = Y(Math.max(o, c)), y2 = Y(Math.min(o, c));
@@ -251,7 +259,7 @@
     const last = cs[cs.length - 1];
     tag(g, w - padR, Y(last[4]), pxAxis(last[4]), css(last[4] >= last[1] ? "--green" : "--red"), true);
     // BTC on Coinbase: its live price from Coinbase's feed, as a line and an outlined tag at the right edge (placed
-    // above). Only a marker: no candle is made up for the bar that's still forming
+    // above; none when the newest candle's close already says it). The candle still forming is formingBars'
     if (chart.live) {
       const y = Y(chart.live), cyan = css("--cyan") || "#2ee6ff";
       line(g, [[0, y], [w - padR, y]], rgba("--cyan", .7), 1, [2, 3]);
@@ -260,6 +268,19 @@
       if (liveY != null) tag(g, w - padR, liveY, pxAxis(chart.live), cyan);
     }
     lastGeom = { X, Y, cs, w, h, padR };
+  }
+
+  // A provisional candle (BTC's newest, carried on from Coinbase's feed until the next run): its wick and its body's
+  // outline in dashes, up or down in its usual color, in both editions. The body is the paper (--ink) where the theme
+  // draws that candle hollow (an up one, --candle-up: hollow), else a pale wash of its color: filled stays filled
+  function provCandle(g, x, Y, o, h, l, c, col, pw, hollowBody) {
+    const y1 = Y(Math.max(o, c)), y2 = Y(Math.min(o, c)), bh = Math.max(3, y2 - y1);
+    g.save(); g.strokeStyle = col; g.lineWidth = 1; g.setLineDash([2, 2]);
+    g.beginPath(); g.moveTo(x, Y(h)); g.lineTo(x, y1); g.moveTo(x, y1 + bh); g.lineTo(x, Y(l)); g.stroke();
+    g.fillStyle = css("--ink") || "#070b10"; g.fillRect(x - pw / 2, y1, pw, bh);
+    if (!hollowBody) { g.globalAlpha = 0.3; g.fillStyle = col; g.fillRect(x - pw / 2, y1, pw, bh); g.globalAlpha = 1; }
+    g.strokeRect(x - pw / 2 + 0.5, y1 + 0.5, pw - 1, bh - 1);
+    g.restore();
   }
 
   function nearest(index, ts, barMs, cs) {
@@ -457,7 +478,8 @@
       ` · ${pnlHtml(s)} · FEES ${usd(t.fees)}${v ? " (EST.)" : ""} · FUNDING ${v ? "(EST.) " : ""}${usd(t.funding)}`);
     txt($("chart-title"), `${v ? v.product : coin + "-PERP"} · ${s.header.interval} · ${px(t.price)}${proxy ? " (HL proxy)" : ""}`);
     put($("chart-sub"), `<span class="${chgCls}">24h ${pct(t.change_24h)}</span>` +
-      ` · fast <i class="swatch fast"></i> · slow <i class="swatch slow"></i> · channel <i class="swatch channel"></i> · stop <i class="swatch stop"></i>`);
+      ` · fast <i class="swatch fast"></i> · slow <i class="swatch slow"></i> · channel <i class="swatch channel"></i> · stop <i class="swatch stop"></i>` +
+      (s.chart.prov && s.chart.prov.length ? ` · newest candle${s.chart.prov.length > 1 ? "s" : ""} <i class="swatch prov"></i> provisional` : ""));
     const chips = $("chips");
     put(chips, s.agents.map((a) => `<span class="chip ${a.state === "idle" ? "off" : ""}" title="${esc(a.name)}: ${esc(a.state)}"
       style="background:var(${COLORS[a.key]})">${esc(a.name[0])}</span>`).join(""));
@@ -724,7 +746,7 @@
   // update does. calm: when a quiet ticker was last expected (a closure the board knows of). mode: where the price on
   // screen comes from, as last drawn (cbMode)
   const cb = { ws: null, sub: null, product: null, venue: null, price: NaN, at: 0, ts: 0, beat: 0, opened: 0, last: 0, tries: 0,
-    retry: 0, dog: 0, due: 0, painted: 0, mode: "", quiet: false, calm: 0 };
+    retry: 0, dog: 0, due: 0, painted: 0, mode: "", quiet: false, calm: 0, bars: new Map(), barMs: 7200000 };
   // Coinbase's RFC 3339 times carry nanoseconds: cut to milliseconds first (Safari's Date.parse takes no more)
   const cbTime = (s) => {
     const m = typeof s === "string" && /^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d{1,3})?\d*Z$/.exec(s);
@@ -844,7 +866,17 @@
     // it: it takes an update, a trade or the book moving, to count as live again
     if (!upd && (cb.quiet || (cb.venue && cb.venue.closed_now))) return;
     cb.quiet = false; cb.price = p; cb.at = now; if (ts) cb.ts = ts;
+    cbSeen(p, ts || now);
     cbPaint();
+  }
+  // Coinbase's prices this page has seen, by 2h window (its open -> {o, h, l, c, at}, at = the newest one's time): what
+  // carries BTC's forming candle on between runs (formingBars). Only the ticker's prices as they come, never Coinbase's
+  // candles channel (measured incomplete); the newest three windows are kept
+  function cbSeen(p, t) {
+    const w = Math.floor(t / cb.barMs) * cb.barMs, x = cb.bars.get(w);
+    if (x) { x.h = Math.max(x.h, p); x.l = Math.min(x.l, p); x.c = p; x.at = t; return; }
+    cb.bars.set(w, { o: p, h: p, l: p, c: p, at: t });
+    [...cb.bars.keys()].sort((a, b) => b - a).slice(3).forEach((k) => cb.bars.delete(k));
   }
   function cbPaint(now = false) {   // now: where the price comes from changed, drawn at once rather than within a second
     if (cb.due && !now) return;
@@ -896,12 +928,13 @@
   }
 
   // Overlay live prices on the last published snapshot: price, unrealised P&L, balance, forming candle (BTC on
-  // Coinbase: a live price marker instead, from Coinbase's feed only).
+  // Coinbase: the run's own forming candle carried on with Coinbase's feed, formingBars, and a live price marker).
   function withLive(snap) {
     if (!snap) return snap;
     const s = JSON.parse(JSON.stringify(snap));
     if (s.header.kind === "basket") return withLiveBasket(s);
     const lp = s.livePx = livePrice(s);   // Coinbase closed: no price, so the board's own, nothing re-marked
+    if (s.venue) formingBars(s, Date.now());
     const mid = lp.price;
     if (!mid) return s;
     if (lp.source === "coinbase") s.chart.live = mid;
@@ -943,6 +976,37 @@
       : { source: "hyperliquid", price: live.at ? parseFloat(live.mids[c.coin]) : NaN };
     const price = lp.source && lp.price > 0 ? lp.price : NaN, m = remark(c.cash, c.pos, price);
     return { bank: m ? m.bank : c.bank, price: price > 0 ? price : c.price, lp };
+  }
+
+  // BTC on Coinbase: the candle still forming, drawn as the chart's newest. The run's own (board chart.forming, read
+  // from Coinbase at chart.forming_as_of; the desk never decides on it), carried on with Coinbase's prices this page has
+  // seen in its window since the run: the close the newest of them, the high and low widened by each. The window after
+  // it, once it has begun, is drawn from those prices alone; a window after one the page saw nothing of isn't drawn
+  // (the chart's slots are candles in a row). Each is provisional (chart.prov, drawn dashed): the page sees no price
+  // from before it opened or while it was hidden, so a high or a low since the run can be missing. So is the run's own
+  // once its window has closed (the run saw only part of it). The next run's board brings the desk's own candle. Never
+  // Coinbase's candles channel, never Hyperliquid's candle on this chart. chart.provFeed: some of it is the feed's;
+  // chart.provRun: the run's own is provisional only because its window has closed
+  function formingBars(s, now) {
+    const ch = s.chart, bar = ch.bar_ms, cs = ch.candles;
+    ch.prov = []; ch.provFeed = false; ch.provRun = false;
+    if (!bar || !cs.length) return;
+    const line = (s.analysis.outlook && s.analysis.outlook[0]) ? s.analysis.outlook[0].level : null, short = s.analysis.outlook_side === "short";
+    const add = (c, prov) => {
+      cs.push(c); ch.ema_fast.push(null); ch.ema_slow.push(null);
+      ch.don_lo.push(short ? line : null); ch.don_hi.push(short ? null : line);
+      if (prov) ch.prov.push(cs.length - 1);
+    };
+    let next = cs[cs.length - 1][0] + bar;   // the window the chart's next slot is for (a closure has no candles)
+    const f = Array.isArray(ch.forming) && ch.forming.length === 5 && ch.forming[0] >= next ? ch.forming.slice() : null;
+    if (f) {
+      const x = cb.bars.get(f[0]), after = !!x && x.at > (ch.forming_as_of || 0);
+      if (after) { f[2] = Math.max(f[2], x.h); f[3] = Math.min(f[3], x.l); f[4] = x.c; ch.provFeed = true; }
+      ch.provRun = !after && f[0] + bar <= now;
+      add(f, after || ch.provRun);
+      next = f[0] + bar;
+    }
+    for (let x = cb.bars.get(next); x; x = cb.bars.get(next += bar)) { add([next, x.o, x.h, x.l, x.c], true); ch.provFeed = true; }
   }
 
   function renderCoins() {
@@ -1035,8 +1099,10 @@
     // Coinbase's product and closures for the socket and the BTC card: the BTC board's while it's open, else the
     // index's row for it (the same run), so a page opened straight on another tab prices the BTC card by the same rules
     const cbRow = !s.venue && index && index.coins ? index.coins.find((c) => c.venue === "coinbase" && !c.error && c.product) : null;
-    if (s.venue && s.venue.name === "coinbase" && s.venue.product) { cb.product = s.venue.product; cb.venue = s.venue; }
+    const was = cb.product;
+    if (s.venue && s.venue.name === "coinbase" && s.venue.product) { cb.product = s.venue.product; cb.venue = s.venue; cb.barMs = s.chart.bar_ms || cb.barMs; }
     else if (cbRow) { cb.product = cbRow.product; cb.venue = rowVenue(cbRow); }
+    if (was && was !== cb.product) cb.bars.clear();   // another product's prices aren't this one's candle
     cbSync();
     txt($("title"), hdr.title);
     txt($("tagline"), hdr.tagline);
@@ -1078,8 +1144,19 @@
       : s.venue && lp.source === "coinbase" ? ` · live price ${secs(lp.at)}s ago from Coinbase`
       : live.at ? ` · live price ${secs(live.at)}s ago from Hyperliquid` +
         (s.venue ? ` (a proxy: no price from Coinbase's own feed just now; the desk marks at Coinbase's price every run)` : "") : "") +
+      provNote(s.chart) +
       (missing ? ` · no ${missing} board this run (its step failed), showing ${hdr.coin || "BTC"}` : "") +
       ` · not financial advice; the desk can and will lose money`;
+  }
+
+  // BTC's provisional newest candle(s) (formingBars), as the footer says it: from Coinbase's live feed, or the run's own
+  // whose window has closed since; either way the next run's board brings the desk's own
+  function provNote(ch) {
+    const n = ch.prov ? ch.prov.length : 0, run = ch.provRun ? `the desk's as of ${hhmm(ch.forming_as_of)} ${TZ}, before its window closed` : "";
+    if (!n) return "";
+    const from = [ch.provFeed ? "from Coinbase's live feed" : "", run].filter(Boolean).join(" and ");
+    return n > 1 ? ` · newest ${n} candles: provisional, ${from}; the desk's own candles replace them at the next run`
+      : ` · newest candle: provisional, ${from}; the desk's own candle replaces it at the next run`;
   }
 
   // Live server: /api/state every 2s. Static hosting (GitHub Pages): boards/<COIN>.json every 60s.

@@ -171,6 +171,7 @@ html[data-desk="up"] .card.active::after { animation: sheen 4.8s ease-in-out inf
 .swatch.slow { background: var(--blue); }
 .swatch.channel { width: 16px; background: repeating-linear-gradient(90deg, var(--muted) 0 3px, transparent 3px 5px); }
 .swatch.stop { background: var(--orange); }
+.swatch.prov { width: 8px; height: 9px; background: none; border: 1px dashed var(--muted); border-radius: 0; }   /* BTC's provisional newest candle */
 .chart-wrap::before {
   content: ""; position: absolute; left: 8px; right: 8px; top: 28px; height: 2px; z-index: 1;
   background: linear-gradient(90deg, transparent, var(--cyan), transparent);

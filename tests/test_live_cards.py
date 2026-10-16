@@ -84,12 +84,12 @@ def test_step_writes_them_into_each_desk_row(tmp_path, monkeypatch):
 # ---------------------------------------------------------------- the page
 
 _RULES = (_between(APP, "const CB_BEAT", "  // quiet: the ticker") + _between(APP, "const cbFresh", "  const cbMode")
-          + _function(APP, "rebank") + _function(APP, "withLive") + _function(APP, "remark")
+          + _function(APP, "rebank") + _function(APP, "withLive") + _function(APP, "remark") + _function(APP, "formingBars")
           + _between(APP, "const rowVenue", "  // A desk account's card") + _function(APP, "cardMark"))
 
 _STUB = """
 const live = { mids: { BTC: "80000", ETH: "2400" }, at: 0, candle: null };
-const cb = { ws: null, sub: "P", at: 0, beat: 0, price: 81230, venue: null };
+const cb = { ws: null, sub: "P", at: 0, beat: 0, price: 81230, venue: null, bars: new Map() };
 const now0 = Date.now();
 live.at = now0 - 1000;
 const feedOn = () => { cb.ws = { readyState: 1 }; cb.at = Date.now() - 500; cb.beat = Date.now() - 500; };

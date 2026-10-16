@@ -286,6 +286,8 @@ def step(p: Params, ledger_dir: str | Path = "ledger", feed=None, jev=None, log=
                                 "funding_prints": len(funding),
                                 "requests": feed.requests, "latency_ms": feed.last_latency_ms,
                                 "age_s": (now - (f.bars[-1].ts + f.bar_ms)) / 1000}, venue_state=vstate)
+    if spec is not None:    # Coinbase's forming candle for the chart (after the ledger is saved: display only)
+        board_mod.with_forming(state, forming, now)
     state["paper"] = {"days": (now - meta["started_ts"]) / 86400_000, "start_equity": meta["start_equity"],
                       "runs": meta["runs"], "bars_processed_this_run": processed,
                       "new_events": board_mod.events(new_events),       # times in Mountain Time

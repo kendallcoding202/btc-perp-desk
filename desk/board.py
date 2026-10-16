@@ -538,6 +538,18 @@ def with_flows(state: dict, flows, equity: float, now_ms: int) -> dict:
     return state
 
 
+def with_forming(state: dict, bar, as_of: int) -> dict:
+    """BTC on Coinbase: the 2h candle still forming at the run, as Coinbase answered it (paper fills a pending order at
+    its open and checks the stop against its range; no decision ever reads it), for the chart's newest candle:
+    chart.forming = [ts, open, high, low, close] and chart.forming_as_of = the run's time. The page carries it on from
+    Coinbase's live feed until the next run brings the desk's own. None (no candle in this window yet): nothing added.
+    Only a venue account's board gets it; the other charts draw Hyperliquid's forming candle, as before."""
+    if bar is not None:
+        state["chart"]["forming"] = [bar.ts, bar.open, bar.high, bar.low, bar.close]
+        state["chart"]["forming_as_of"] = as_of
+    return state
+
+
 def index_marks(state: dict) -> dict:
     """What index.json's row for a desk account needs so the page can re-mark its card between runs from the same price
     its own tab uses (a card then reads the same whichever tab is open): the cash, the open position (side, quantity,
