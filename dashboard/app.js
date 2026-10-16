@@ -200,8 +200,9 @@
     // when that close is the live price: the live tag says it), the stop's. The live one at its price, the others at
     // theirs or as near as they can be on their own side of it (stackTags), into the axis's corners if they must be
     // (a stop at the chart's low with the price on it: its tag goes under the price's, where "MT" was). A price label
-    // under a tag isn't drawn
-    const merged = chart.live && chart.live === lastC;
+    // under a tag isn't drawn. A held close (closeTag: the run's own as it answered) is never folded in: a live price
+    // equal to it is a coincidence, not that candle carried on to now, so both tags are drawn, stacked
+    const merged = chart.live && chart.live === lastC && !ct.held;
     const tags = [chart.live ? { y: Y(chart.live), tie: 0 } : null, merged ? null : { y: Y(lastC), tie: 0 },
       chart.stop ? { y: Y(chart.stop), tie: chart.side === "short" ? -1 : 1 } : null];   // a stop at the price: on its side
     const ty = stackTags(tags, chart.live ? 0 : 1, 8, h - 8), under = (y) => ty.some((t) => t != null && Math.abs(y - t) < 13);
@@ -275,9 +276,10 @@
     // The chart's own live price, fresh (withLive: Coinbase's on BTC's chart, Hyperliquid's on ETH's and SOL's): a solid
     // line in --live, a color no other line has, and "● LIVE 82,290" on its tag at the right edge. Never the proxy's,
     // a stale price or one from before a closure: then no line, no LIVE, and the close tag as it is. The candle still
-    // forming is formingBars' (BTC) or Hyperliquid's (the others)
+    // forming is formingBars' (BTC) or Hyperliquid's (the others). The line is --live-width wide (theme hook: the day
+    // edition's gold is lighter on its paper than the other lines are, so it is drawn wider there)
     if (chart.live) {
-      line(g, [[0, Y(chart.live)], [w - padR, Y(chart.live)]], css("--live") || "#ffd84a", 1.5);
+      line(g, [[0, Y(chart.live)], [w - padR, Y(chart.live)]], css("--live") || "#ffd84a", +(css("--live-width") || 1.5));
       // a stop at the price: its dashes over the live line, not hidden under it (its tag is stacked past the live one)
       if (chart.stop && Math.abs(Y(chart.stop) - Y(chart.live)) < 2) line(g, [[0, Y(chart.stop)], [w - padR, Y(chart.stop)]], css("--orange"), 1.2, [6, 4]);
       liveBeat(chart.live, liveTag(g, w - padR, ty[0], chart.live));
@@ -325,8 +327,8 @@
   // The live tag's dot beats once when the price moves (a Coinbase trade at a new price on BTC, a new Hyperliquid mid
   // on ETH and SOL), so a glance sees it moving: a dot over the canvas's own for 0.5 s, then nothing; no animation
   // runs between prices, none for a message or an answer with the same price (the book moved, no trade), and none
-  // under reduced motion. price: the live price drawn (the same one again: no beat); dot: [x, y] on #chart, null when
-  // no live tag is drawn
+  // under reduced motion. It grows to 1.6 times at most, so it stays clear of the tag's "LIVE". price: the live price
+  // drawn (the same one again: no beat); dot: [x, y] on #chart, null when no live tag is drawn
   const beat = { el: null, price: 0, dot: null }, still = matchMedia("(prefers-reduced-motion: reduce)");
   function liveBeat(price, dot) {
     beat.dot = dot;
@@ -337,17 +339,19 @@
     if (still.matches || !c.animate) return;
     if (!beat.el) { beat.el = document.createElement("i"); beat.el.className = "live-beat"; beat.el.setAttribute("aria-hidden", "true"); c.after(beat.el); }
     beat.el.style.left = `${c.offsetLeft + dot[0]}px`; beat.el.style.top = `${c.offsetTop + dot[1]}px`;
-    beat.el.animate([{ opacity: 1, transform: "scale(1)" }, { opacity: 1, transform: "scale(2)", offset: 0.3 }, { opacity: 1, transform: "scale(1)" }],
+    beat.el.animate([{ opacity: 1, transform: "scale(1)" }, { opacity: 1, transform: "scale(1.6)", offset: 0.3 }, { opacity: 1, transform: "scale(1)" }],
       { duration: 500, easing: "ease-out" });
   }
 
   // The newest candle's close tag. Filled, as on every chart, when that close is a closed candle's or the live price;
   // outlined in dashes, like the candle, when it is a provisional candle's that nothing live has carried on (BTC's
-  // forming candle with the feed down, on the proxy, or Coinbase closed since): then it is a price from before now,
-  // never shown as the current one, and "RUN" when it is the run's own as it answered. {text, held}
+  // forming candle with the feed down, on the proxy, or Coinbase closed since; ETH's or SOL's from Hyperliquid once
+  // its price is stale): then it is a price from before now, never shown as the current one, and "RUN" when it is the
+  // run's own as it answered, held even when the live price comes to equal its close (that candle isn't carried on to
+  // now by it). {text, held}
   function closeTag(chart) {
     const cs = chart.candles, k = cs.length - 1, c = cs[k][4];
-    const held = (chart.prov || []).includes(k) && !(chart.live && chart.live === c);
+    const held = (chart.prov || []).includes(k) && (chart.runIdx === k || !(chart.live && chart.live === c));
     return { text: (held && chart.runIdx === k ? "RUN " : "") + pxAxis(c), held };
   }
 
@@ -540,6 +544,15 @@
     });
     const chief = agents.find((a) => a.key === "chief");
     $("chief-bubble").textContent = chief ? chief.quote : "";
+  }
+  // The bubbles (a wide window: phones have none) kept over the plot, their box and its 3 px shadow ending short of
+  // the price axis, so none hides a tag past it (the live price's) or a price label: their spots are of the plot's
+  // width, and a bubble near its right edge wraps its line to fit. After drawChart, which knows the axis's width
+  function plotBubbles() {
+    const bb = $("bubbles"), cv = $("chart");
+    if (!lastGeom) return;
+    const right = `${Math.round(cv.parentElement.clientWidth - cv.offsetLeft - lastGeom.w + lastGeom.padR + 4)}px`;
+    if (bb.style.right !== right) bb.style.right = right;
   }
 
   // With deposits or withdrawals (the board only has "flows" once there's one): the P&L leaves them out, and its
@@ -1089,6 +1102,9 @@
       const short = s.analysis.outlook_side === "short";
       ch.ema_fast.push(null); ch.ema_slow.push(null);
       ch.don_lo.push(short ? line : null); ch.don_hi.push(short ? null : line);
+      // Hyperliquid quiet (its price STALE): this candle's close is a price from before now, so it is provisional as
+      // BTC's held one is, dashed and its close tag outlined in dashes (closeTag), never filled as the price now
+      if (lp.stale) { ch.prov = [ch.candles.length - 1]; ch.provHl = true; }
     }
     return s;
   }
@@ -1275,7 +1291,7 @@
     renderCoins(); notice();
     if (s.venue) cb.mode = cbMode(lp);
     if (basket) renderBasket(s);
-    else { if (!light) renderAgents(s.agents); renderStage(s); if (!light) renderBubbles(s.agents); drawChart(s.chart); drawWeb(); }
+    else { if (!light) renderAgents(s.agents); renderStage(s); if (!light) renderBubbles(s.agents); drawChart(s.chart); drawWeb(); plotBubbles(); }
     // a Hyperliquid price is LIVE (ETH's, SOL's, VT's) until it is STALE old: then a redraw takes LIVE off the chart's
     // marker, the ticker and the footer, unless a newer one has come (BTC's Coinbase price and the proxy: cbWatch
     // redraws when either stops being fresh)
@@ -1315,11 +1331,13 @@
   }
 
   // BTC's provisional newest candle(s) (formingBars), as the footer says it: from Coinbase's live feed, or the run's own
-  // as it answered (and whether its window has closed since); either way the next run's board brings the desk's own
+  // as it answered (and whether its window has closed since); either way the next run's board brings the desk's own.
+  // ETH's or SOL's (withLive: Hyperliquid's, its price stale): at Hyperliquid's last price, which the footer dates
   function provNote(ch) {
     const n = ch.prov ? ch.prov.length : 0;
     const run = ch.provRun ? `the desk's as of ${hhmm(ch.forming_as_of)} ${TZ}${ch.provRunDone ? ", before its window closed" : ""}` : "";
     if (!n) return "";
+    if (ch.provHl) return " · newest candle: provisional, its close Hyperliquid's last price, not now's";
     const from = [ch.provFeed ? "from Coinbase's live feed" : "", run].filter(Boolean).join(" and ");
     return n > 1 ? ` · newest ${n} candles: provisional, ${from}; the desk's own candles replace them at the next run`
       : ` · newest candle: provisional, ${from}; the desk's own candle replaces it at the next run`;
@@ -1379,13 +1397,14 @@
   }
 
   async function pollMids() {
+    // ETH's, SOL's and VT's footer counts its price's age every 5 s, before asking: while an answer fails or never
+    // comes too (BTC's: cbWatch, once a second)
+    if (state && !state.venue) txt($("foot"), foot(state));
     try {
       live.mids = await hl({ type: "allMids" }); live.at = Date.now();
       if (base && base.venue && livePrice(base).source === "coinbase") cbPaint();   // on Coinbase's feed: its next redraw takes these
       else { render(); if (!told || told.at !== live.at) ticked(); }   // (render has told a change of source already)
-    } catch {   // keep the last price; ETH's, SOL's and VT's footer counts its age (BTC's: cbWatch, once a second)
-      if (state && !state.venue) txt($("foot"), foot(state));
-    }
+    } catch { /* keep the last price */ }
   }
   async function pollCandle() {
     const c = (base && base.header.coin) || coin, iv = (base && base.header.interval) || "2h";

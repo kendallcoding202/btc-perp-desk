@@ -36,7 +36,8 @@
                                run of text), apart from the gain green for a red-green-blind eye as well as rust was */
   --amber: #846000;         /* vet, MARK, an order waiting */
   --blue: #1c2a66;          /* crowd, the slow average, WAIT, deposits: navy */
-  --cyan: #2348c8;          /* the crawler, the ticker's LIVE, the fast average: lab-ink blue */
+  --cyan: #2348c8;          /* the crawler, the ticker's LIVE, the fast average: lab-ink blue (the ticker's LIVE is
+                               text on the caption strip, 4.5:1, which no gold the chart could use reaches by day) */
   --lime: #4f6e00;          /* size */
   --ice: #4b5a72;           /* fills: slate */
   --white: #17161c;         /* chief: ink */
@@ -57,7 +58,10 @@
   --channel: #6f6b63;
   --live: #a68f00;          /* the chart's live price: its solid line and its "● LIVE" tag, a gold no other line on the
                                chart has (3.1:1 as a line on --panel); greener and lighter than the stop's burnt orange,
-                               so a red-green-blind eye still tells the two apart */
+                               so a red-green-blind eye still tells the two apart (a darker gold would not). Night's
+                               is the PAPER sticker's gold, the edition's one gold: the tag says LIVE and its price */
+  --live-width: 2;          /* app.js: the live line's width, wider by day than its 1.5 at night: the gold is the
+                               lightest line on the paper */
   --on-live: #17161c;       /* the live tag's dot and lettering, ink on the gold (5.6:1) */
   --candle-up: hollow;      /* up candles hollow, down ones filled */
   --entry-mark: pin;        /* entries as ink pins lettered L / S (no triangles: arrows mean money) */
@@ -81,7 +85,7 @@
     --lime: #c6e86b; --ice: #b9c7da; --white: #f1ead8;
     --btc: #f7a53c; --eth: #8fa3ff; --sol: #b9a5ff; --vt: #4fd6dc;
     --brand-red: #ff5a4f; --on-red: #17161c; --sticker: #ffd23f; --letter-shadow: #04060a; --tab-on: var(--caption); --chip-closed: #2e3648;
-    --spider-eye: #ffd23f; --entry: #e3dcc9; --channel: #8e97aa; --live: #ffd23f; --on-live: #17161c;
+    --spider-eye: #ffd23f; --entry: #e3dcc9; --channel: #8e97aa; --live: #ffd23f; --live-width: 1.5; --on-live: #17161c;
     --web-silk: rgba(126, 240, 250, .5); --web-dot: #f1ead8; --web-glow: 3; --web-hub: #1a1d33;
   }
 }
@@ -95,7 +99,7 @@
   --lime: #c6e86b; --ice: #b9c7da; --white: #f1ead8;
   --btc: #f7a53c; --eth: #8fa3ff; --sol: #b9a5ff; --vt: #4fd6dc;
   --brand-red: #ff5a4f; --on-red: #17161c; --sticker: #ffd23f; --letter-shadow: #04060a; --tab-on: var(--caption); --chip-closed: #2e3648;
-  --spider-eye: #ffd23f; --entry: #e3dcc9; --channel: #8e97aa; --live: #ffd23f; --on-live: #17161c;
+  --spider-eye: #ffd23f; --entry: #e3dcc9; --channel: #8e97aa; --live: #ffd23f; --live-width: 1.5; --on-live: #17161c;
   --web-silk: rgba(126, 240, 250, .5); --web-dot: #f1ead8; --web-glow: 3; --web-hub: #1a1d33;
 }
 

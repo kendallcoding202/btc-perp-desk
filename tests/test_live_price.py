@@ -268,9 +268,10 @@ def test_the_live_tag_is_clear_of_the_other_tags():
     short's), inside the canvas, none left out. The live tag stays at its price unless the tags past it have no room
     before the canvas's edge; the others are at theirs or pushed on past it. Checked over every few pixels. When the
     newest candle's close is the live price (BTC's forming candle carried on with Coinbase's feed, ETH's and SOL's
-    from Hyperliquid), the live tag says it: no second tag. A price label under any tag is left out; "MT" moves left."""
+    from Hyperliquid), the live tag says it: no second tag (never for a held close: the run's RUN tag stays). A price
+    label under any tag is left out; "MT" moves left."""
     draw = _function(APP, "drawChart")
-    assert "const merged = chart.live && chart.live === lastC;" in draw and "if (!merged) tag(g, w - padR, ty[1]" in draw
+    assert "const merged = chart.live && chart.live === lastC && !ct.held;" in draw and "if (!merged) tag(g, w - padR, ty[1]" in draw
     assert "if (under(y)) continue;" in draw and "const tzW = under(h - 7) ? g.measureText(TZ).width + 6 : 0;" in draw
     assert "g.fillText(TZ, tzW ? w - padR - tzW + 2 : w - padR + 6, h - 4);" in draw
     js = _function(APP, "stackTags") + """
