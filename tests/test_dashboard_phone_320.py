@@ -74,7 +74,8 @@ def test_an_account_tabs_line_shows_whole_on_a_narrow_phone():
     narrow = _media(STYLE, "(max-width: 420px)")
     sub = _decls(_rule(narrow, ".coin .c-sub"))
     assert sub["-webkit-line-clamp"] == "none" and sub["display"] == "block"   # before: two lines, "· risk 5% ·…"
-    assert "align-content: start" in _rule(narrow, ".coin")      # a row's shorter tab keeps its lines at the top
+    assert ".coin {" not in narrow      # the row's tabs keep their default stretch, so their lines stay level
+    assert 'esc(c.record).replace(/ /g, "&nbsp;")' in APP     # "0W 0L" stays on one line
     assert _after(STYLE, "(max-width: 560px)", "(max-width: 420px)")
     assert "-webkit-line-clamp: 2" in _rule(_media(STYLE, "(max-width: 560px)"), ".coin .c-sub")   # 421 to 560 px
     desk = _decls(_rule(_top(STYLE), ".coin .c-sub"))
@@ -110,3 +111,8 @@ def test_the_replay_labels_count_goes_under_it_on_a_narrow_phone():
     assert "text-overflow: ellipsis" in _rule(desk, ".act-sh > span:first-child")
     assert "@media (max-width: 340px) { .act-sh .act-tz { display: none; } }" in ACTIVITY   # 320 px: the zone still goes
     assert '<div class="act-sh"><span data-k="rl">REPLAY · LAST RUN</span><span class="act-cnt" data-k="cnt">' in ACT_JS
+
+
+def test_the_stale_age_stays_whole_when_the_warning_wraps():
+    # "…FOR 23H" / "56M" read oddly: the age's hours and minutes are joined by a no-break space
+    assert 'STALE · NO NEW BOARD FOR ${age.replace(/ /g, "\\u00a0")}' in ACT_JS

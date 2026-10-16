@@ -418,10 +418,9 @@ body.has-live .big { text-shadow: 0 0 16px color-mix(in srgb, currentColor 50%, 
   .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 /* a narrow phone: a rule's name wraps at its underscores (app.js puts a <wbr> after each) in its own column, and a
-   tab's line shows whole, its row's tabs top-aligned when one runs a line longer */
+   tab's line shows whole */
 @media (max-width: 420px) {
   .thr-row .n { white-space: normal; text-overflow: clip; overflow-wrap: anywhere; }
-  .coin { align-content: start; }
   .coin .c-sub { display: block; -webkit-line-clamp: none; }
 }
 
