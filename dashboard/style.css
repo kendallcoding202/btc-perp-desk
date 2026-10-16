@@ -92,6 +92,11 @@ html[data-desk="up"] .ring::after { border-color: transparent; border-bottom-col
 .coin.total { cursor: default; }
 .coin .c-name { font-family: var(--pixel); font-size: 13px; letter-spacing: .08em; display: flex; justify-content: space-between; gap: 6px; }
 .coin .c-name i { font-style: normal; font-family: var(--mono); font-size: 10px; color: var(--muted); letter-spacing: 0; }
+/* BTC's card says whose price it shows (app.js srcMark): a small word over the price, so it fits a 320 px phone */
+.coin .c-name i.c-px { display: flex; flex-direction: column; align-items: flex-end; align-self: flex-end; line-height: 1.1; }
+.coin .c-src { font-size: 8px; font-weight: 700; letter-spacing: .04em; color: var(--dim); white-space: nowrap; }
+.coin .c-src.cb { color: var(--cyan); }
+.coin .c-src.stale { color: var(--orange); }
 .coin .c-bank { font-weight: 700; font-size: 16px; }
 .coin .c-sub { font-size: 10px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 /* five tabs don't fit a desktop's width in one line: let the sub-line wrap there (phones keep one line) */
@@ -297,6 +302,8 @@ body.has-live .big { text-shadow: 0 0 16px color-mix(in srgb, currentColor 50%, 
 .spider[data-mood="found"] { filter: drop-shadow(0 0 3px #ffd84a); }
 .spider[data-mood="trade"] { filter: drop-shadow(0 0 3px #f7f8fb); }
 .spider.asleep, .spider[data-mood="asleep"] { opacity: .4; filter: none; }   /* no fresh board: the desk is not running */
+.spider { transition: opacity .12s linear; }
+.spider.over-money { opacity: .15; }   /* crossing a bank, a price or a P&L on its way: the figure shows through */
 .spider-silk { display: none; width: 1px; height: 1px; background: var(--cyan); box-shadow: 0 0 6px var(--cyan); transform-origin: 0 0; }
 
 /* phones and narrow windows */

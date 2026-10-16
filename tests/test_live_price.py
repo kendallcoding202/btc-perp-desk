@@ -73,7 +73,8 @@ def test_freshness_throttle_and_backoff_numbers():
     assert _const("CB_PAINT") >= 1000
     assert _const("CB_BASE") == 2000 and _const("CB_MAX") == 60000 and _const("CB_GAP") >= 1000
     fresh = APP[APP.index("const cbFresh"):APP.index("function cbClosed")]
-    assert "now - cb.beat < CB_BEAT" in fresh and "now - cb.at < CB_QUIET" in fresh and "cb.at > 0" in fresh
+    assert "near(now, cb.beat) < CB_BEAT" in fresh and "near(now, cb.at) < CB_QUIET" in fresh and "cb.at > 0" in fresh
+    assert "const near = (now, ...ts) => Math.min(...ts.map((t) => Math.abs(now - t)));" in APP   # either way: tests/test_dashboard_polish.py
     retry = _function(APP, "cbRetry")
     assert "Math.min(CB_MAX" in retry and "Math.random()" in retry
     assert "cb.last + CB_GAP" in _function(APP, "cbConnect")
@@ -203,7 +204,7 @@ def test_a_quiet_ticker_reconnects_and_then_takes_an_update():
     price from before) doesn't count until an update does."""
     watch = _function(APP, "cbWatch")
     assert "cbClosed(cb.venue, now)" in watch and "cb.at = 0; cb.quiet = true;" in watch
-    assert "now - Math.max(cb.at, cb.opened, cb.calm) > CB_QUIET) { cb.quiet = true; cbDrop(true); return; }" in watch
+    assert "near(now, cb.at, cb.opened, cb.calm) > CB_QUIET) { cb.quiet = true; cbDrop(true); return; }" in watch
     assert "if (up > 60000 && !quiet) cb.tries = 0;" in _function(APP, "cbDrop")
     msg = _function(APP, "cbMessage")
     assert 'upd = upd || e.type === "update"' in msg
@@ -233,8 +234,8 @@ def test_listeners_hear_a_change_of_source_at_once():
 
 def test_the_tape_has_one_line_per_real_event():
     feed = _function(ACT, "tapeFeed")
-    assert "!(tk.at > feedAt)" in feed and "feedAt = tk.at" in feed
-    assert "const answer = d.at > midsAt;" in ACT and "else if (answer) setTimeout(" in ACT
+    assert "tk.at === feedAt" in feed and "feedAt = tk.at" in feed and "performance.now()" in feed
+    assert "const answer = !!d.at && d.at !== midsAt;" in ACT and "else if (answer) setTimeout(" in ACT
 
 
 def test_a_price_redraw_leaves_the_boards_own_panels_alone():

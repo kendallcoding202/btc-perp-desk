@@ -121,7 +121,7 @@
       </div>
       <div class="act-side">
         <div class="act-live" data-k="live"></div>
-        <div class="act-tape" data-k="tape" aria-live="off"><b>TAPE · this page's own requests, as they land · times ${TZ}</b><div></div><div></div><div></div><div></div><div></div><div></div></div>
+        <div class="act-tape" data-k="tape" aria-live="off"><b data-k="tapeh">TAPE · this page's own requests, as they land · times ${TZ}</b><div></div><div></div><div></div><div></div><div></div><div></div></div>
         <div class="act-beat" data-k="beat"></div>
         <div class="act-rsch" data-k="rsch"></div>
       </div>
@@ -137,6 +137,9 @@
   let B = null, IDX = null, staticBoard = true;   // detail.board (app.js's base: read only), detail.index, detail.static
   let shown = null, shownUpdated = null;     // the account on screen, and its board's run time
   let mids = null, midsAt = 0;               // the newest allMids answer, and when it came
+  // how long ago a price came, measured either way: a phone clock set back puts it ahead of now, which is no fresher
+  // for it (as app.js's near()), so a price never reads as just in until the clock catches up
+  const since = (t, now) => Math.abs(now - t);
   let tk = null;                             // the open tab's price as app.js last drew it: {coin, price, source, at, closed}
   const modes = {};                           // each account's header.mode, as seen
   let research = null;
@@ -324,7 +327,7 @@
     if (o.shut && o.shut.by === "schedule") return `${vName()} closed now by its schedule (${o.shut.why}, until ${hhmm(o.shut.until)} ${TZ}) · price ${mid$(o.mid)} from the last run, ${hhmm(B.updated)} ${TZ}`;
     if (o.shut) return `${vName()} closed at the last run, ${hhmm(B.updated)} ${TZ} (${o.shut.why}) · price ${mid$(o.mid)} from that run`;
     if (!o.isLive) return `price ${mid$(o.mid)} at the last run, ${hhmm(B.updated)} ${TZ} · no live price yet`;
-    const age = now - o.at;
+    const age = since(o.at, now);
     return age > (o.feed ? FEED_QUIET : NO_TICK) ? `no live price for ${Math.round(age / 1000)} s · showing the last one, ${mid$(o.mid)}`
       : `price ${mid$(o.mid)} from ${o.feed ? "Coinbase" : `Hyperliquid${venue() ? ", a proxy for Coinbase's" : ""}`} · ${Math.max(0, Math.round(age / 1000))}s ago`;
   }
@@ -402,7 +405,7 @@
         if (was && now2 && was.textContent !== now2) flash(rows[k].querySelector("i"));
       }
     });
-    const age = now - midsAt;
+    const age = since(midsAt, now);
     set(rows[3], !any ? `prices at the last run, ${hhmm(B.updated)} ${TZ} · no live price yet`
       : age > NO_TICK ? `no live price for ${Math.round(age / 1000)} s · showing the last ones`
       : `Hyperliquid · ${Math.round(age / 1000)}s ago · averages as of the ${md(B.basket.last_close_ts || B.updated)} close`);
@@ -665,7 +668,7 @@
     const rows = [];
     let o = null;
     if (basket()) {
-      const n = B.basket.rules.sma_bars, age = Math.round((now - midsAt) / 1000);
+      const n = B.basket.rules.sma_bars, age = Math.round(since(midsAt, now) / 1000);
       rows.push(["PRICES", mids ? `allMids · ${age > NO_TICK / 1000 ? `no live price for ${age} s` : `${age}s ago`}` : `at the last run, ${hhmm(B.updated)} ${TZ} · no live price yet`, ""]);
       B.basket.holdings.forEach((h) => {
         const lv = mids ? parseFloat(mids[h.coin]) : NaN, isLive = isFinite(lv) && lv > 0, px = isLive ? lv : h.mark;
@@ -674,7 +677,7 @@
       });
     } else {
       o = calc(now);
-      const iv = (B.header.interval || "").toLowerCase(), age = Math.round((now - o.at) / 1000);
+      const iv = (B.header.interval || "").toLowerCase(), age = Math.round(since(o.at, now) / 1000);
       rows.push(["PRICE", o.shut ? `${mid$(o.mid)} at the last run · ${vName()} ${o.shut.by === "schedule" ? `is closed now by its schedule (${o.shut.why}, until ${hhmm(o.shut.until)} ${TZ})` : `was closed then (${o.shut.why})`}`
         : o.isLive ? `${mid$(o.mid)} · ${o.feed ? "Coinbase feed" : "allMids"} · ${age > (o.feed ? FEED_QUIET : NO_TICK) / 1000 ? `no live price for ${age} s` : `${Math.max(0, age)}s ago`}` : `${mid$(o.mid)} at the last run · no live price yet`, ""]);
       const exp = B.header.shorts && B.header.experiment && o.side === "short" ? " · shorts: paper experiment" : "";
@@ -759,11 +762,13 @@
     tapeAdd(`${hms(now)} price check · allMids${ms} · ${what}`, "act-tk");
   }
   // Coinbase's feed (BTC's tab): no request to time; a line at most every 5 s, its newest price, as its prices come
-  // about once a second and the tape holds six lines; none without a new message from it
-  let feedLine = 0, feedAt = 0;
+  // about once a second and the tape holds six lines; none without a new message from it (a new message has another
+  // time, whichever way the phone's clock moved). The 5 s are on the page's own steady clock, not the wall clock
+  let feedLine = -Infinity, feedAt = 0;
   function tapeFeed(now) {
-    if (now - feedLine < 5000 || !(tk.at > feedAt)) return;
-    feedLine = now; feedAt = tk.at;
+    const t = performance.now();
+    if (t - feedLine < 5000 || !tk.at || tk.at === feedAt) return;
+    feedLine = t; feedAt = tk.at;
     tapeAdd(`${hms(now)} price · Coinbase feed · ${B.header.coin} ${mid$(tk.price)}${moved("cb", tk.price)}`, "act-tk");
   }
   function tapeBoard(now, kind) {
@@ -867,6 +872,9 @@
     mon.classList.remove("act-wait"); log.classList.remove("act-wait");
     modes[d.coin] = B.header.mode;
     shown = d.coin; shownUpdated = d.updated;
+    // the tape's lines: this page's own requests (board reads, Hyperliquid's allMids), and on BTC's tab the messages
+    // Coinbase's feed sends it, which no request of the page's asked for one by one
+    set(L.tapeh, `TAPE · this page's own requests${venue() ? " and Coinbase's feed" : ""}, as they land · times ${TZ}`);
     status(now); countdown(now); footer();
     if (first || switched || fresh) {
       if (basket()) { vtStrip(false); vtLive(now); }
@@ -893,7 +901,9 @@
   addEventListener("desk:tick", (e) => {
     const d = e.detail || {};
     if (!d.mids) return;
-    const answer = d.at > midsAt;            // a new allMids answer (a tick is also Coinbase's price, or a change of source)
+    // a new allMids answer: its time differs from the last one's (later, or earlier if the phone's clock was set back;
+    // a tick is also Coinbase's price, or a change of source, which carry the same allMids time)
+    const answer = !!d.at && d.at !== midsAt;
     if (d.at) { mids = d.mids; midsAt = d.at; }
     tk = { coin: d.coin, price: Number(d.price), source: d.source || null, at: d.priceAt || midsAt, closed: d.closed || null };
     if (!B || document.hidden) return;     // hidden: keep the price; the clock redraws it when the page is back

@@ -174,7 +174,7 @@ def test_only_the_tickers_prices_never_coinbases_candles_channel_or_hyperliquids
     cbMessage after a price is taken as live). Hyperliquid's forming candle is drawn on a chart without a venue only."""
     sends = [line for line in APP.splitlines() if "ws.send(" in line]
     assert len(sends) == 2 and all('"heartbeats"' in s or '"ticker"' in s for s in sends) and "candles" not in "".join(sends)
-    assert "cbSeen(p, ts || now);" in _function(APP, "cbMessage")
+    assert "cbSeen(p, ts && Math.abs(ts - now) <= CB_SKEW ? ts : now);" in _function(APP, "cbMessage")
     assert "cb.price = p" in _function(APP, "cbMessage").split("cbSeen(")[0]
     live = _function(APP, "withLive")
     assert "if (s.venue) formingBars(s, Date.now());" in live

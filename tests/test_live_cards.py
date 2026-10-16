@@ -142,5 +142,5 @@ def test_every_card_and_the_all_total_use_it():
     assert "let b = open ? state.ticker.bank : basket ? c.bank : mk.bank;" in coins
     assert "const mk = basket ? null : cardMark(c);" in coins and "bank += b;" in coins
     assert "basketLive(c.cash, " in coins                                       # VT as before
-    assert 'tone(made)' in coins and "tone(net ? bank - put : bank - start)" in coins   # the theme's hooks stay
+    assert 'tone(made)' in coins and "tone(net ? bank - putIn : bank - start)" in coins   # the theme's hooks stay
     assert "remark(t.cash, p, mid)" in _function(APP, "withLive")

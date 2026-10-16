@@ -162,7 +162,7 @@
     const { g, w, h } = fit(canvas);
     const cs = chart.candles;
     if (!cs.length) return;
-    const padR = 64, padT = 8, padB = 18;
+    const padT = 8, padB = 18;
     const vals = [];
     cs.forEach((c) => vals.push(c[2], c[3]));
     [chart.ema_fast, chart.ema_slow, chart.don_hi].forEach((s) => s.forEach((v) => v != null && vals.push(v)));
@@ -170,6 +170,7 @@
     if (chart.live) vals.push(chart.live);
     let lo = Math.min(...vals), hi = Math.max(...vals);
     const pad = (hi - lo) * 0.06; lo -= pad; hi += pad;
+    const lastC = cs[cs.length - 1][4], padR = rightPad(g, chart, lastC, lo, hi);
     // BTC's provisional newest candle(s) (formingBars, drawn dashed): each gets a slot at least 8 px wide, so its dashes
     // read on a phone (the others' slots are about 2 px there); the rest share what's left
     const prov = new Set(chart.prov || []);
@@ -257,7 +258,7 @@
       }
     }
     const last = cs[cs.length - 1];
-    tag(g, w - padR, Y(last[4]), pxAxis(last[4]), css(last[4] >= last[1] ? "--green" : "--red"), true);
+    tag(g, w - padR, Y(lastC), pxAxis(lastC), css(lastC >= last[1] ? "--green" : "--red"), true);
     // BTC on Coinbase: its live price from Coinbase's feed, as a line and an outlined tag at the right edge (placed
     // above; none when the newest candle's close already says it). The candle still forming is formingBars'
     if (chart.live) {
@@ -273,6 +274,18 @@
       if (liveY != null) tag(g, w - padR, liveY, pxAxis(chart.live), cyan);
     }
     lastGeom = { X, Y, cs, w, h, padR };
+  }
+
+  // The price axis's width: room for its widest tag ("STOP 77,970" is wider than a price) and label, so none is cut off
+  // at the canvas's right edge on a phone. A tag is drawn from 2 px past the axis line, 8 px wider than its text (tag()),
+  // and keeps 2 px clear of the edge; an axis label starts 6 px past it. At least today's 64 px
+  function rightPad(g, chart, close, lo, hi) {
+    g.font = "bold 10px JetBrains Mono, monospace";
+    const tags = [pxAxis(close), chart.stop ? `STOP ${pxAxis(chart.stop)}` : "", chart.live ? pxAxis(chart.live) : ""];
+    const tagW = Math.max(...tags.map((t) => g.measureText(t).width + 12));
+    g.font = "10px JetBrains Mono, monospace";
+    const axisW = Math.max(g.measureText(pxAxis(hi)).width, g.measureText(pxAxis(lo)).width) + 8;
+    return Math.ceil(Math.max(64, tagW, axisW));
   }
 
   // A provisional candle (BTC's newest, carried on from Coinbase's feed until the next run): its wick and its body's
@@ -547,6 +560,18 @@
     return `${v}${t}`;
   };
 
+  // BTC on Coinbase: its session in the venue line, as the price on screen has it (lp: livePrice at this redraw), not
+  // only as the run found it. A scheduled closure that began since the run is CLOSED NOW (the board's closed_now is
+  // still empty), one the run found is CLOSED AT THE LAST RUN once Coinbase's feed shows it trading, and the next
+  // closure is named only while it is still ahead: one that is under way or over isn't "next"
+  function closureNote(v, lp, now) {
+    const nc = v.session && v.session.next_closure, cn = v.closed_now, shut = lp && lp.closed;
+    const closed = shut && shut.by === "schedule" ? ` · <b>CLOSED NOW: ${esc(shut.why)} until ${hhmm(shut.until)} ${TZ}</b>`
+      : cn ? ` · <b>${shut || !lp ? "CLOSED NOW" : "CLOSED AT THE LAST RUN"}: ${esc(cn.why)}${cn.until ? ` until ${hhmm(cn.until)} ${TZ}` : ""}</b>` : "";
+    const next = nc && now < nc.start && !(cn && cn.scheduled) ? ` · next ${cn ? "scheduled " : ""}closure ${esc(nc.why)} ${MT.span(nc.start, nc.end, true)} ${TZ}` : "";
+    return closed + next;
+  }
+
   // light: a redraw for a new price only (the gates and events are the board's)
   function renderAnalysis(s, light = false) {
     const st = s.analysis.stats, basket = s.header.kind === "basket", t = s.ticker;
@@ -555,7 +580,7 @@
     const v = s.venue, lp = s.livePx || {};   // BTC on Coinbase: whole contracts, its margin, funding estimated from logged rates
     const cells = basket ? [
       ["$" + s.header.coin, "basket", "sym"], ["Cash", usd(t.cash)], ["Held", usd(t.notional)],
-      ["Exposure", `${num(t.exposure)}x`], ["Unrealised", usd(t.unrealised), t.unrealised < 0 ? "bad" : "ok"], ["Fees", usd(t.fees)], ["Funding", usd(t.funding)],
+      ["Exposure", `${num(t.exposure)}x`], ["Unrealised", usd(t.unrealised), `h-pnl ${tone(t.unrealised)}`], ["Fees", usd(t.fees)], ["Funding", usd(t.funding)],
     ] : v ? [
       ["$" + (s.header.coin || "BTC"), "perp · " + s.header.venue, "sym"],
       [lp.closed ? "Price" : lp.source === "coinbase" ? "Price (Coinbase live)" : live.at ? "Price (HL proxy)" : "Price", px(st.price)],
@@ -575,12 +600,11 @@
     const olHead = s.analysis.outlook_side === "short"
       ? `SHORT LINE · a 2h close below it shorts; steps up as old lows age out (if ${esc(s.header.coin || "BTC")} makes no new low)`
       : `BUY LINE · steps down as old highs age out (if ${esc(s.header.coin || "BTC")} makes no new high)`;
-    const nc = v && v.session.next_closure, sk = v && v.skipping, cn = v && v.closed_now, fs = v && v.funding.stale_since;
+    const sk = v && v.skipping, fs = v && v.funding.stale_since;
     const venueLine = v ? `<div class="ol-exp">${esc(v.display)} RULES · whole ${v.contract_size} BTC contracts (one is ${usd(v.one_contract_usd, 0)}), ` +
       `≤${v.max_leverage}x, overnight margin ${(v.margin_rate * 100).toFixed(1)}% · fees est. ${esc(v.fee_estimate)} · funding est. from ${v.funding.logged} logged hourly rates` +
       (fs ? ` <b>(none new since ${MT.when(fs)} ${TZ})</b>` : "") + (v.stop_fill ? ` · ${esc(v.stop_fill)}` : "") +
-      (cn ? ` · <b>${lp.closed || !s.livePx ? "CLOSED NOW" : "CLOSED AT THE LAST RUN"}: ${esc(cn.why)}${cn.until ? ` until ${hhmm(cn.until)} ${TZ}` : ""}</b>` : "") +
-      (nc && !(cn && cn.scheduled) ? ` · next ${cn ? "scheduled " : ""}closure ${esc(nc.why)} ${MT.span(nc.start, nc.end, true)} ${TZ}` : "") +
+      closureNote(v, s.livePx, Date.now()) +
       (v.waiting_for ? ` · <b>WAITING for Coinbase's ${MT.when(v.waiting_for)} ${TZ} candle</b>` : "") +
       (sk ? ` · <b>SKIPPING: ${esc(sk.note)}</b>` : "") + `</div>` : "";
     put($("outlook"), venueLine + (s.header.experiment ? `<div class="ol-exp">EXPERIMENT · ${esc(s.header.experiment)}</div>` : "") +
@@ -646,7 +670,7 @@
         cell(2, h.vol10 == null ? "—" : `${(h.vol10 * 100).toFixed(0)}%`, "annualised") +
         cell(3, `${num(h.held_units)} held`, `target ${num(h.target_units ?? 0)}${band}`) +
         cell(4, usd(h.notional), h.qty > 0 ? `${(h.weight * 100).toFixed(1)}% of the bank · ${num(h.qty, 5)} ${esc(h.coin)}` : "") +
-        cell(5, h.qty > 0 ? `<span class="${h.unrealised >= 0 ? "ok" : "bad"}">${usd(h.unrealised)}</span>` : "—", h.qty > 0 ? `avg entry ${px(h.avg_entry)}` : "") +
+        cell(5, h.qty > 0 ? `<span class="h-pnl ${tone(h.unrealised)}">${usd(h.unrealised)}</span>` : "—", h.qty > 0 ? `avg entry ${px(h.avg_entry)}` : "") +
         cell(6, order[0], order[1], o ? "pend" : "") + `</div>`;
     });
     $("holdings").innerHTML = `<div class="h-row h-head">${head.map((x) => `<div>${x}</div>`).join("")}</div>` + rows.join("");
@@ -747,10 +771,15 @@
   const CB_BASE = 2000, CB_MAX = 60000, CB_GAP = 1000;   // retries: 2 s doubling to 60 s, jittered; never two a second
   const STALE = 20000;      // the proxy's price older than this (Hyperliquid not answering) isn't called live, as the
                             // desk monitor says "no live price" after as long
+  const CB_SKEW = 300000;   // a ticker stamp further than 5 min from its arrival: the arrival time places its price
+  // how long ago the latest of these times was, measured either way: a wall clock set back (the phone's own clock
+  // corrected) makes a time ahead of now, which is no fresher for it, so nothing stays "fresh" or waits until the clock
+  // catches up; the next message, about a second away, is
+  const near = (now, ...ts) => Math.min(...ts.map((t) => Math.abs(now - t)));
   // quiet: the ticker went quiet or Coinbase was closed, so a snapshot (the price from before) doesn't count until an
   // update does. calm: when a quiet ticker was last expected (a closure the board knows of). mode: where the price on
   // screen comes from, as last drawn (cbMode)
-  const cb = { ws: null, sub: null, product: null, venue: null, price: NaN, at: 0, ts: 0, beat: 0, opened: 0, last: 0, tries: 0,
+  const cb = { ws: null, sub: null, product: null, venue: null, price: NaN, at: 0, beat: 0, opened: 0, last: 0, tries: 0,
     retry: 0, dog: 0, due: 0, painted: 0, mode: "", quiet: false, calm: 0, bars: new Map(), barMs: 7200000 };
   // Coinbase's RFC 3339 times carry nanoseconds: cut to milliseconds first (Safari's Date.parse takes no more)
   const cbTime = (s) => {
@@ -759,7 +788,7 @@
     return isFinite(t) ? t : 0;
   };
   const cbFresh = (product, now = Date.now()) => !!cb.ws && cb.ws.readyState === 1 && cb.sub === product && cb.at > 0 &&
-    now - cb.beat < CB_BEAT && now - cb.at < CB_QUIET;
+    near(now, cb.beat) < CB_BEAT && near(now, cb.at) < CB_QUIET;
   // Coinbase closed: as the last run found it (the board's own price until a run finds it open, or, for a scheduled
   // closure, until its end), or inside a closure the board's schedule lists (its weekly break or a maintenance window)
   // that began since the run
@@ -780,7 +809,7 @@
     if (v.name === "coinbase" && cbFresh(v.product, now)) return { source: "coinbase", price: cb.price, at: cb.at };
     // past the end of a scheduled closure the run found: closed, as it found it, until Coinbase's feed shows it trading
     if (v.closed_now) return { source: null, price: NaN, at: 0, closed: { ...v.closed_now, by: "run" } };
-    return { source: "hyperliquid", price: hlMid, at: live.at, stale: !!live.at && now - live.at > STALE };
+    return { source: "hyperliquid", price: hlMid, at: live.at, stale: !!live.at && near(now, live.at) > STALE };
   }
   const cbMode = (lp) => JSON.stringify(lp, ["source", "closed", "by", "stale"]);
   const cbWanted = () => !document.hidden && !!cb.product && (!!(base && base.venue && base.venue.product === cb.product) ||
@@ -794,12 +823,12 @@
   function cbConnect() {
     cb.retry = 0;
     if (!cbWanted() || cb.ws || !("WebSocket" in window)) return;
-    const wait = cb.last + CB_GAP - Date.now();
+    const wait = Math.min(CB_GAP, cb.last + CB_GAP - Date.now());   // (a clock set back: still at most a second)
     if (wait > 0) { cb.retry = setTimeout(cbConnect, wait); return; }
     cb.last = Date.now();
     let ws;
     try { ws = new WebSocket(CB_WS); } catch { cbRetry(); return; }
-    Object.assign(cb, { ws, sub: cb.product, at: 0, ts: 0, beat: 0, opened: 0 });
+    Object.assign(cb, { ws, sub: cb.product, at: 0, beat: 0, opened: 0 });
     ws.onopen = () => {
       if (cb.ws !== ws) return;
       cb.opened = Date.now();
@@ -840,15 +869,18 @@
   // going quiet, a closure starting, the proxy going stale) is redrawn at once, and the BTC tab's footer counts its age
   function cbWatch() {
     const now = Date.now();
-    if (cb.ws && now - Math.max(cb.opened || cb.last, cb.beat) > CB_DEAD) { cbDrop(); return; }
+    if (cb.ws && near(now, cb.opened || cb.last, cb.beat) > CB_DEAD) { cbDrop(); return; }
     if (cbClosed(cb.venue, now)) { cb.at = 0; cb.quiet = true; cb.calm = now; }   // nothing from before it is live after it
-    else if (cb.ws && cb.opened && now - Math.max(cb.at, cb.opened, cb.calm) > CB_QUIET) { cb.quiet = true; cbDrop(true); return; }
+    else if (cb.ws && cb.opened && near(now, cb.at, cb.opened, cb.calm) > CB_QUIET) { cb.quiet = true; cbDrop(true); return; }
     const on = base && base.venue ? base : { venue: cb.venue, header: { coin: "BTC" } };   // another tab: the BTC card
     if (cbMode(livePrice(on, now)) !== cb.mode) cbPaint(true);
     else if (on === base && state && state.venue) txt($("foot"), foot(state));
   }
   // Parsed defensively: text only, JSON only; heartbeats and the ticker for this product only (acks, errors and
-  // any new kind of message are ignored, as Coinbase asks); a price is a positive decimal; nothing older than shown
+  // any new kind of message are ignored, as Coinbase asks); a price is a positive decimal. Newest is the last to
+  // arrive (one socket delivers in order) and how fresh it is is when it arrived here (cb.at): Coinbase's own stamp
+  // never decides either, so a message stamped in the future (a clock off at either end) can't hold back the ones
+  // after it. The stamp only places a price in its 2h window for the forming candle, when it's near the arrival time
   function cbMessage(raw) {
     if (typeof raw !== "string" || raw.length > 65536) return;
     let m;
@@ -858,7 +890,6 @@
     if (m.channel === "heartbeats") { cb.beat = now; return; }
     if (m.channel !== "ticker") return;
     const ts = cbTime(m.timestamp);
-    if (ts && ts < cb.ts) return;
     let p = NaN, upd = false;
     m.events.forEach((e) => (e && Array.isArray(e.tickers) ? e.tickers : []).forEach((k) => {
       const x = !k || k.product_id !== cb.sub ? NaN : typeof k.price === "number" ? k.price   // Coinbase sends "80835": plain decimals only
@@ -870,8 +901,8 @@
     // after a quiet spell or a closure (or past the end of one the run found), a snapshot is only the price from before
     // it: it takes an update, a trade or the book moving, to count as live again
     if (!upd && (cb.quiet || (cb.venue && cb.venue.closed_now))) return;
-    cb.quiet = false; cb.price = p; cb.at = now; if (ts) cb.ts = ts;
-    cbSeen(p, ts || now);
+    cb.quiet = false; cb.price = p; cb.at = now;
+    cbSeen(p, ts && Math.abs(ts - now) <= CB_SKEW ? ts : now);
     cbPaint();
   }
   // Coinbase's prices this page has seen, by 2h window (its open -> {o, h, l, c, at}, at = the newest one's time): what
@@ -895,7 +926,7 @@
         state.livePx.at = cb.at; txt($("foot"), foot(state));
       } else render(true);                          // only what the price moves; render says when its source changed
       if (state.livePx.source === "coinbase" && (!told || told.priceAt !== cb.at)) ticked();   // a new Coinbase message
-    }, now ? 0 : Math.max(0, cb.painted + CB_PAINT - Date.now()));
+    }, now ? 0 : Math.min(CB_PAINT, Math.max(0, cb.painted + CB_PAINT - Date.now())));   // (a clock set back: not later)
   }
   document.addEventListener("visibilitychange", () => { if (document.hidden) cbClose(); else if (base) render(); });
 
@@ -982,6 +1013,18 @@
     const price = lp.source && lp.price > 0 ? lp.price : NaN, m = remark(c.cash, c.pos, price);
     return { bank: m ? m.bank : c.bank, price: price > 0 ? price : c.price, lp };
   }
+  // The BTC card's mark for whose price it shows (its tab's ticker and footer say it in full), from the same livePrice
+  // call as the price: [word, the long form for its title, class]. Short enough for a 320 px phone's card
+  function srcMark(lp) {
+    if (!lp) return null;
+    if (lp.closed) return ["closed", `Coinbase is closed (${lp.closed.why}): the last run's price`, "closed"];
+    if (lp.source === "coinbase") return ["cb", "Coinbase's own price, from its live feed", "cb"];
+    if (lp.source === "hyperliquid" && lp.price > 0) {
+      return lp.stale ? ["hl stale", "Hyperliquid's BTC, a proxy for Coinbase's, and stale: no new answer for over 20 s", "stale"]
+        : ["hl proxy", "Hyperliquid's BTC, a proxy for Coinbase's: no price from Coinbase's own feed just now", "proxy"];
+    }
+    return ["last run", "the last run's price: no live price yet", "run"];
+  }
 
   // BTC on Coinbase: the candle still forming, drawn as the chart's newest. The run's own (board chart.forming, read
   // from Coinbase at chart.forming_as_of; the desk never decides on it), carried on with Coinbase's prices this page has
@@ -1034,18 +1077,20 @@
       start += c.start; bank += b; net += c.net_flows || 0;
       if (c.venue === "coinbase" && !basket && !open) cb.mode = cbMode(mk.lp);   // cbWatch redraws the card when it changes
       const label = basket ? (c.holdings || []).map((h) => h.coin).join("·") : open ? px(state.ticker.price) : px(mk.price);
+      const src = c.venue === "coinbase" && !basket ? srcMark(open ? state.livePx : mk.lp) : null;   // BTC: whose price it is
       const sub = basket ? " · basket" : ` · risk ${(c.risk_per_trade * 100).toFixed(0)}%${c.shorts ? " · +shorts" : ""}${c.venue ? ` · ${esc(c.venue)}` : ""}`;
       const made = c.units != null ? b - c.start - (c.net_flows || 0) : b - c.start;
       const pnlCls = b == null || c.start == null ? "" : tone(made);
       return `<button class="coin ${c.coin === coin ? "on" : ""}" data-coin="${esc(c.coin)}" aria-pressed="${c.coin === coin}">` +
-        `<span class="c-name">${esc(c.coin)}<i>${esc(label)}</i></span><span class="c-bank ${pnlCls}">${usd(b)}</span>` +
+        `<span class="c-name">${esc(c.coin)}<i${src ? ` class="c-px" title="${esc(src[1])}"` : ""}>` +
+        `${src ? `<b class="c-src ${src[2]}">${src[0]}</b>` : ""}${esc(label)}</i></span><span class="c-bank ${pnlCls}">${usd(b)}</span>` +
         `<span class="c-sub">${c.units ? `${pct(b / c.units - 1)} perf · P&amp;L ${usd(b - c.start - c.net_flows, 0)}` : pct(b / c.start - 1)} · ${esc(c.position)} · ${esc(c.record)}${sub}</span></button>`;
     });
     const left = index.coins.filter((c) => c.error).map((c) => c.coin);   // no bank this run: not in the total
-    const put = start + net;   // with deposits: the P&L on everything put in, never counting the deposits as profit
-    const allCls = (net ? put > 0 : !!start) ? tone(net ? bank - put : bank - start) : "";
+    const putIn = start + net;   // with deposits: the P&L on everything put in, never counting the deposits as profit
+    const allCls = (net ? putIn > 0 : !!start) ? tone(net ? bank - putIn : bank - start) : "";
     cards.push(`<div class="coin total"><span class="c-name">ALL</span><span class="c-bank ${allCls}">${usd(bank)}</span>` +
-      (net ? `<span class="c-sub">${pct(put > 0 ? (bank - put) / put : 0)} · P&amp;L ${usd(bank - put)} on ${usd(put, 0)} put in` :
+      (net ? `<span class="c-sub">${pct(putIn > 0 ? (bank - putIn) / putIn : 0)} · P&amp;L ${usd(bank - putIn)} on ${usd(putIn, 0)} put in` :
        `<span class="c-sub">${pct(start ? bank / start - 1 : 0)} on ${usd(start, 0)} paper`) +
       `${left.length ? ` · without ${esc(left.join(", "))}` : ""}</span></div>`);
     nav.style.setProperty("--tabs", cards.length);
@@ -1147,6 +1192,7 @@
         : ` · Coinbase was closed at the last run (${cn.why}): no live price until a run finds it open` +
           (cn.scheduled && cn.until ? ` or, after ${hhmm(cn.until)} ${TZ}, its own feed does` : ""))
       : s.venue && lp.source === "coinbase" ? ` · live price ${secs(lp.at)}s ago from Coinbase`
+      : s.venue && lp.stale ? ` · stale price: Hyperliquid's (a proxy for Coinbase's) last came ${secs(live.at)}s ago, and nothing from Coinbase's own feed just now`
       : live.at ? ` · live price ${secs(live.at)}s ago from Hyperliquid` +
         (s.venue ? ` (a proxy: no price from Coinbase's own feed just now; the desk marks at Coinbase's price every run)` : "") : "") +
       provNote(s.chart) +
@@ -1236,7 +1282,10 @@
     } catch { /* the chart just shows closed candles */ }
   }
 
-  window.addEventListener("resize", render);
+  // a resize (a phone turned on its side) redraws everything at the new size, the equity curve and the P&L bars too:
+  // a full render, not the light one a price takes (the event isn't passed on as `light`), once a frame at most
+  let resized = 0;
+  window.addEventListener("resize", () => { if (!resized) resized = requestAnimationFrame(() => { resized = 0; render(); }); });
   window.addEventListener("desk:theme", () => { $("agents").textContent = ""; $("chief-sprite").textContent = ""; render(); });
   (async function loop() {
     await tick();

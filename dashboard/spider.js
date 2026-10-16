@@ -192,6 +192,11 @@
   // values and the desk monitor. A perch on an edge over any of it slides along that edge to clear it, or isn't taken
   const MONEY = ".coin .c-bank, .coin .c-sub, .coin .c-name i, #balance, #bal-hold, #ticker, #vt-ticker, .card .value, .act-monitor";
   const money = () => [...document.querySelectorAll(MONEY)].flatMap(words);   // read once a stop, never a frame
+  // ... and on the way: a walk, a drop or a climb can't go round every figure, so while the sprite crosses any of
+  // that money it fades almost out (.over-money). Its words are read once as each move starts (pass), and each frame
+  // only compares numbers: nothing is read from the layout per frame
+  let pass = [];
+  const passing = () => { pass = money(); };
   function offMoney(p) {
     if (!p || !p.perch) return p;
     const ws = money(), b = box(p.perch.el);
@@ -289,8 +294,8 @@
   function walk(x, y, ms, legs, arc, every) {
     let x0, y0, t0;
     return {
-      travel: true,
-      begin(now) { x0 = sp.x; y0 = sp.y; t0 = now; },
+      travel: true, fade: true,
+      begin(now) { x0 = sp.x; y0 = sp.y; t0 = now; passing(); },
       run(now) {
         const k = Math.min(1, (now - t0) / ms), e = ease(k);
         sp.x = x0 + (x - x0) * e;
@@ -304,8 +309,8 @@
   function lower(y, ms, every = 0) {   // tie a thread here and drop straight down
     let y0, t0;
     return {
-      travel: true,
-      begin(now) { y0 = sp.y; t0 = now; silk = { x: sp.x, y: sp.y - S * 0.1 }; },
+      travel: true, fade: true,
+      begin(now) { y0 = sp.y; t0 = now; silk = { x: sp.x, y: sp.y - S * 0.1 }; passing(); },
       run(now) {
         const k = Math.min(1, (now - t0) / ms);
         sp.y = y0 + (y - y0) * ease(k); sp.legs = 0; sp.mood = "walk";
@@ -316,7 +321,8 @@
   function climb(ms) {            // back up the thread; the thread goes with it
     let y0, t0;
     return {
-      begin(now) { y0 = sp.y; t0 = now; },
+      fade: true,
+      begin(now) { y0 = sp.y; t0 = now; passing(); },
       run(now) {
         if (!silk) return -1;
         const k = Math.min(1, (now - t0) / ms);
@@ -533,11 +539,13 @@
     return 0;
   }
 
-  let lastX = NaN, lastY = NaN, silkOn = false, dim = false, lastMood = "";
+  let lastX = NaN, lastY = NaN, silkOn = false, dim = false, lastMood = "", faded = false;
   function paint(now) {           // writes two transforms; reads nothing from the layout
     const x = Math.round(clamp(sp.x + sp.ox - fx, S / 2, fw - S / 2) - S / 2);
     const y = Math.round(clamp(sp.y + sp.oy - fy, S / 2, fh - S / 2) - S / 2);
     if (x !== lastX || y !== lastY) { body.style.transform = `translate3d(${x}px,${y}px,0)`; lastX = x; lastY = y; }
+    const over = !!(act && act.fade) && !clear({ x: x + S / 2 + fx, y: y + S / 2 + fy }, pass, false);   // crossing money
+    if (over !== faded) { faded = over; body.classList.toggle("over-money", over); }
     const blink = !sp.asleep && !reduced.matches && (now % 3200) < 150;
     pose(sp.legs ? Math.floor(now / sp.legs) % 2 : sp.pose, blink);
     if (sp.asleep !== dim) { dim = sp.asleep; body.classList.toggle("asleep", dim); }
