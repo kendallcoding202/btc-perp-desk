@@ -55,9 +55,10 @@
   --spider-eye: #f2b705;
   --entry: #383b48;
   --channel: #6f6b63;
-  --live: #a88000;          /* the chart's live price: its solid line and its "● LIVE" tag, a gold no other line on the
-                               chart has (3.5:1 as a line on --panel); lighter than the stop's burnt orange */
-  --on-live: #17161c;       /* the live tag's dot and lettering, ink on the gold (4.9:1) */
+  --live: #a68f00;          /* the chart's live price: its solid line and its "● LIVE" tag, a gold no other line on the
+                               chart has (3.1:1 as a line on --panel); greener and lighter than the stop's burnt orange,
+                               so a red-green-blind eye still tells the two apart */
+  --on-live: #17161c;       /* the live tag's dot and lettering, ink on the gold (5.6:1) */
   --candle-up: hollow;      /* up candles hollow, down ones filled */
   --entry-mark: pin;        /* entries as ink pins lettered L / S (no triangles: arrows mean money) */
   --web-silk: rgba(35, 72, 200, .7);

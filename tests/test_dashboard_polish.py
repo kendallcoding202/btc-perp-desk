@@ -218,7 +218,8 @@ console.log(JSON.stringify(out));"""
     assert out == {"ahead_fresh": False, "just_now_fresh": True, "old_beat_fresh": False, "paint_delay": 1000,
                    "dead_after_setback": True, "quiet_with_new_message": False}
     assert "Math.min(CB_GAP, cb.last + CB_GAP - Date.now())" in _function(APP, "cbConnect")
-    assert "near(now, live.at) > STALE" in _function(APP, "livePrice")
+    assert "stale: hlStale(now)" in _function(APP, "livePrice")
+    assert "const hlStale = (now) => !!live.at && near(now, live.at) > STALE;" in APP
 
 
 @node

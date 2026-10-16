@@ -101,13 +101,12 @@ def test_vt_and_the_other_tabs_keep_hyperliquid():
 def test_labels_name_the_source():
     for text in ('dot("LIVE (COINBASE)")', '" (HYPERLIQUID PROXY)"', '" (HL proxy)"', '"Price (HL proxy)"', '"Price (Coinbase live)"',
                  "s ago from Coinbase`", "s ago from Hyperliquid`", '"CLOSED (COINBASE) · "',
-                 "no live price until a run finds it open", "is closed now by its schedule", '"STALE (HYPERLIQUID PROXY) · "',
+                 "no live price until a run finds it open", "is closed now by its schedule", '`STALE (HYPERLIQUID${v ? " PROXY" : ""}) · `',
                  "its own feed does`"):
         assert text in APP, text
     # the chart's live marker only with the chart's own fresh price: Coinbase's on BTC's (never the proxy's),
     # Hyperliquid's on the others; no candle made up for it
-    assert ('if (lp.source === "coinbase" || (!s.venue && near(Date.now(), lp.at) <= STALE)) { s.chart.live = mid; '
-            's.chart.liveAt = lp.at; }') in APP
+    assert 'if (lp.source === "coinbase" || (!s.venue && !lp.stale)) s.chart.live = mid;' in APP
     for text in ('"Coinbase feed"', "FROM COINBASE'S OWN PRICES", "A PROXY FOR COINBASE'S", 'from ${o.feed ? "Coinbase"',
                  "AT THE LAST RUN'S PRICE${basket() ? \"S\" : \"\"} (NO LIVE PRICE YET)"):
         assert text in ACT, text
@@ -170,7 +169,8 @@ const show = (r) => [r.source, r.closed ? r.closed.by : null, !!r.stale];
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
 def test_where_the_price_comes_from():
     """Closed as the last run found it (a scheduled closure: until its end, then until Coinbase's own feed is fresh
-    again), closed by the schedule, Coinbase's own while fresh, else the proxy, stale once Hyperliquid is 20 s quiet."""
+    again), closed by the schedule, Coinbase's own while fresh, else the proxy, stale once Hyperliquid is 20 s quiet
+    (another coin's Hyperliquid price too: ETH's chart and ticker stop calling it live then)."""
     rules = _between(APP, "const CB_BEAT", "  // quiet: the ticker") + _between(APP, "const cbFresh", "  const cbWanted")
     js = rules + _STUB + """
 const now = Date.now(), out = {};
@@ -197,7 +197,7 @@ console.log(JSON.stringify(out));"""
         "window_over_fresh": ["coinbase", None, False], "fresh": ["coinbase", None, False],
         "quiet_59s": ["coinbase", None, False], "quiet_61s": ["hyperliquid", None, False],
         "no_heartbeat": ["hyperliquid", None, False], "scheduled_past_end_not_fresh": [None, "run", False],
-        "proxy_stale": ["hyperliquid", None, True], "other_coin": ["hyperliquid", None, False]}
+        "proxy_stale": ["hyperliquid", None, True], "other_coin": ["hyperliquid", None, True]}
 
 
 def test_a_quiet_ticker_reconnects_and_then_takes_an_update():
@@ -268,10 +268,11 @@ def test_the_live_tag_is_clear_of_the_other_tags():
     short's), inside the canvas, none left out. The live tag stays at its price unless the tags past it have no room
     before the canvas's edge; the others are at theirs or pushed on past it. Checked over every few pixels. When the
     newest candle's close is the live price (BTC's forming candle carried on with Coinbase's feed, ETH's and SOL's
-    from Hyperliquid), the live tag says it: no second tag. An axis label under any tag is left out."""
+    from Hyperliquid), the live tag says it: no second tag. A price label under any tag is left out; "MT" moves left."""
     draw = _function(APP, "drawChart")
     assert "const merged = chart.live && chart.live === lastC;" in draw and "if (!merged) tag(g, w - padR, ty[1]" in draw
-    assert "if (under(y)) continue;" in draw and "if (!under(h - 7)) g.fillText(TZ" in draw
+    assert "if (under(y)) continue;" in draw and "const tzW = under(h - 7) ? g.measureText(TZ).width + 6 : 0;" in draw
+    assert "g.fillText(TZ, tzW ? w - padR - tzW + 2 : w - padR + 6, h - 4);" in draw
     js = _function(APP, "stackTags") + """
 const out = { n: 0, bad: [], moved: 0, same: 0 }, top = 8, bot = 252;
 for (let close = 12; close <= 248; close += 7) for (const stop of [null, ...Array.from({ length: 28 }, (_, k) => 12 + 8.5 * k)])

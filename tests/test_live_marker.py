@@ -89,7 +89,7 @@ const board = (coin, venue) => ({ header: { coin }, venue, analysis: { stats: {}
   chart: { bar_ms: 2 * H, candles: [[T - 4 * H, 1, 2, 1, 2], [T - 2 * H, 2, 3, 2, 2440]], ema_fast: [1, 1], ema_slow: [1, 1],
     don_hi: [3, 3], don_lo: [1, 1], markers: [] } });
 const venue = (o) => ({ name: "coinbase", product: "P", closed_now: null, session: { next_closure: null }, ...o });
-const mark = (s) => { const c = withLive(s).chart; return [c.live ?? null, c.liveAt ?? null, c.candles[c.candles.length - 1][4], c.side]; };
+const mark = (s) => { const c = withLive(s).chart; return [c.live ?? null, !!c.canLive, c.candles[c.candles.length - 1][4], c.side]; };
 const out = {};
 cb.ws = { readyState: 1 }; cb.at = now - 400; cb.beat = now - 400; cb.bars.set(T, { o: 81000, h: 81300, l: 80900, c: 81230, at: cb.at });
 live.mids = { BTC: "81250", ETH: "2441.5" }; live.at = now - 1000;
@@ -112,6 +112,10 @@ live.at = now - 20500;
 out.eth_21s = mark(board("ETH", null));
 live.mids = {}; live.at = 0;
 out.eth_no_price = mark(board("ETH", null));
+live.mids = { ETH: "2441.5" }; live.at = now - 1000;
+out.hl_fresh = livePrice({ header: { coin: "ETH" }, venue: null });
+live.at = now - 20500;
+out.hl_stale = livePrice({ header: { coin: "ETH" }, venue: null });
 console.log(JSON.stringify({ out, now, cbAt: cb.at }));""")
 
 
@@ -119,17 +123,19 @@ console.log(JSON.stringify({ out, now, cbAt: cb.at }));""")
 def test_the_marker_only_with_the_charts_own_fresh_live_price():
     """chart.live (the marker) is BTC's Coinbase price while the feed is fresh, and ETH's (or SOL's) Hyperliquid mid
     while it is under STALE (20 s) old; never the proxy's on BTC's chart, a stale price, or anything while Coinbase is
-    closed. liveAt is that price's time (its dot beats for a new one). With Hyperliquid's forming candle on the chart,
-    its close is the live price: one tag says both."""
+    closed. Each of these charts can have one (canLive: its room is kept while it has none). ETH's Hyperliquid price
+    is called stale past 20 s, as the proxy's is. With Hyperliquid's forming candle on the chart, its close is the live
+    price: one tag says both."""
     r = _node(_withlive())
-    o, now = r["out"], r["now"]
-    assert o["btc_coinbase"][:3] == [81230, r["cbAt"], 81230]          # the forming candle carried on to it: merged
+    o = r["out"]
+    assert o["btc_coinbase"][:3] == [81230, True, 81230]               # the forming candle carried on to it: merged
     for case in ("btc_proxy", "btc_proxy_stale", "btc_closed_at_run", "btc_closed_by_schedule", "eth_21s", "eth_no_price"):
-        assert o[case][:2] == [None, None], case
-    assert o["eth_fresh"][:2] == [2441.5, now - 1000] and o["eth_fresh"][2] == 2440   # no candle yet: a tag of its own
+        assert o[case][:2] == [None, True], case
+    assert o["eth_fresh"][:2] == [2441.5, True] and o["eth_fresh"][2] == 2440       # no candle yet: a tag of its own
     assert o["eth_candle"][0] == 2441.5 and o["eth_candle"][2] == 2441.5               # Hyperliquid's candle closes at it
     assert o["eth_19s"][0] == 2441.5
     assert o["eth_fresh"][3] == "short"                                                # the stop's side, from the position
+    assert o["hl_fresh"]["stale"] is False and o["hl_stale"]["stale"] is True             # ETH's ticker says STALE then
     live = _function(APP, "withLive")
     assert live.index('if (s.header.kind === "basket") return withLiveBasket(s);') < live.index("s.chart.live = mid")   # VT: none
 
@@ -194,8 +200,12 @@ const frame = (tok, ch) => {
   const labels = ops.filter((o) => o.k === "text" && !/bold/.test(o.font) && o.x === w - padR + 6).map((o) => [o.t, o.y]);
   const words = ops.filter((o) => o.k === "text" && o.t === "LIVE").map((o) => ({ color: o.color, font: o.font }));
   const dots = ops.filter((o) => o.k === "fill" && o.pts.length === 1 && o.pts[0][2] === 2.5).map((o) => o.color);
-  return { tags, lines, curves, labels, words, dots, padR, w, yLive: ch.live ? Y(ch.live) : null, yStop: ch.stop ? Y(ch.stop) : null,
-    beats: beats.length };
+  const tz = ops.filter((o) => o.k === "text" && o.t === TZ).map((o) => ({ x: o.x, y: o.y, w: 0.6 * 10 * TZ.length }));
+  const dates = ops.filter((o) => o.k === "text" && /^\\d\\d-\\d\\d$/.test(o.t)).map((o) => ({ x: o.x, w: 30 }));
+  const pins = ops.filter((o) => o.k === "fillRect" && o.w === 11 && o.h === 12).map((o) => ({ x: o.x, y: o.y, w: o.w, h: o.h }));
+  const order = ops.filter((o) => o.k === "stroke" && o.pts.length === 2 && o.pts[0][1] === o.pts[1][1] && o.pts[1][0] === w - padR).map((o) => o.color);
+  return { tags, lines, curves, labels, words, dots, tz, dates, pins, order, padR, w, yLive: ch.live ? Y(ch.live) : null,
+    yStop: ch.stop ? Y(ch.stop) : null, beats: beats.length };
 };
 """)
 
@@ -218,9 +228,9 @@ def test_one_live_tag_on_the_price_in_a_color_no_other_line_has(edition):
     drawn on its own (filled, as a closed candle's) when it isn't."""
     tok = DAY if edition == "day" else NIGHT
     o = _draw(f"""
-const ch = chartOf(); ch.live = ch.candles[N - 1][4]; ch.liveAt = 1;
+const ch = chartOf(); ch.live = ch.candles[N - 1][4];
 out.merged = frame(TOKS.{edition}, ch);
-const c2 = chartOf(); c2.live = c2.candles[N - 1][4] - 700; c2.liveAt = 2;
+const c2 = chartOf(); c2.live = c2.candles[N - 1][4] - 700;
 out.apart = frame(TOKS.{edition}, c2);""")
     live, on = tok["--live"], tok["--on-live"]
     for case in ("merged", "apart"):
@@ -246,10 +256,12 @@ out.apart = frame(TOKS.{edition}, c2);""")
 def test_the_live_lines_color_is_no_other_lines(edition):
     """The live line's color is the only one of its kind on the chart: not the fast (--cyan) or slow (--blue)
     average, the channel, the entry or the stop, the candles or the grid, as drawn and as the theme defines them, and
-    far from each by eye (CIE76 delta E 25 or more); readable on the panel (3:1 as a line), its lettering 4.5:1."""
+    far from each by eye (CIE76 delta E 25 or more); readable on the panel (3:1 as a line), its lettering 4.5:1. Apart
+    from the stop's orange for a red-green-blind (deuteranope) eye too: delta E 15 or more as such an eye sees them
+    (the day edition's first gold was 13)."""
     tok = DAY if edition == "day" else NIGHT
     o = _draw(f"""
-const ch = chartOf({{ stop: 79000, entry: 81000 }}); ch.live = ch.candles[N - 1][4]; ch.liveAt = 1;
+const ch = chartOf({{ stop: 79000, entry: 81000 }}); ch.live = ch.candles[N - 1][4];
 out.f = frame(TOKS.{edition}, ch);""")["f"]
     live = tok["--live"]
     others = {x["color"] for x in o["lines"] if x["color"] != live} | set(o["curves"])
@@ -258,19 +270,26 @@ out.f = frame(TOKS.{edition}, ch);""")["f"]
         assert tok[name] in others or name in ("--pen", "--green", "--red", "--dim"), name   # each is a line on this chart
         assert _de76(live, tok[name]) >= 25, (name, tok[name], live, _de76(live, tok[name]))
     assert _contrast(live, tok["--panel"]) >= 3 and _contrast(tok["--on-live"], live) >= 4.5
+    assert _de76(live, tok["--orange"], deutan=True) >= 15, _de76(live, tok["--orange"], deutan=True)
 
 
-def _lab(h: str):
+# a deuteranope's view of a linear RGB color (Machado, Oliveira and Fernandes 2009, severity 1)
+_DEUTAN = ((0.367322, 0.860646, -0.227968), (0.280085, 0.672501, 0.047413), (-0.011820, 0.042940, 0.968881))
+
+
+def _lab(h: str, deutan: bool = False):
     c = [int(h.lstrip("#")[i:i + 2], 16) / 255 for i in (0, 2, 4)]
     r, g, b = [x / 12.92 if x <= 0.04045 else ((x + 0.055) / 1.055) ** 2.4 for x in c]
+    if deutan:
+        r, g, b = [min(1.0, max(0.0, m[0] * r + m[1] * g + m[2] * b)) for m in _DEUTAN]
     x, y, z = ((0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047, 0.2126 * r + 0.7152 * g + 0.0722 * b,
                (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883)
     f = lambda t: t ** (1 / 3) if t > 0.008856 else 7.787 * t + 16 / 116  # noqa: E731
     return 116 * f(y) - 16, 500 * (f(x) - f(y)), 200 * (f(y) - f(z))
 
 
-def _de76(a: str, b: str) -> float:
-    return sum((p - q) ** 2 for p, q in zip(_lab(a), _lab(b))) ** 0.5
+def _de76(a: str, b: str, deutan: bool = False) -> float:
+    return sum((p - q) ** 2 for p, q in zip(_lab(a, deutan), _lab(b, deutan))) ** 0.5
 
 
 def _contrast(a: str, b: str) -> float:
@@ -317,20 +336,20 @@ def test_a_stop_at_the_live_price_and_tags_near_it_never_overlap(side):
     """A stop exactly at the live price (and just either side of it, and at the chart's low or high where it is the
     extreme): the LIVE tag stays on its line and the STOP tag goes on the stop's side of it (below a long's price,
     above a short's), clear of it, inside the canvas. The newest close's tag (not the live price) and the axis labels
-    are clear of both, and so is the run's held RUN tag, dashed as before; "MT" is left out only when a tag takes
-    its corner."""
+    are clear of both, and so is the run's held RUN tag, dashed as before. "MT" is always there: under the price axis,
+    or just left of it when a tag takes that corner, clear of the tags and of the dates."""
     o = _draw(f"""
 const side = "{side}";
 for (const [name, d] of [["at", 0], ["above", 40], ["below", -40], ["near", 150]]) {{
-  const ch = chartOf({{ side }}); ch.live = ch.candles[N - 1][4] - 300; ch.stop = ch.live + d; ch.entry = side === "long" ? ch.live + 900 : ch.live - 900; ch.liveAt = 1;
+  const ch = chartOf({{ side }}); ch.live = ch.candles[N - 1][4] - 300; ch.stop = ch.live + d; ch.entry = side === "long" ? ch.live + 900 : ch.live - 900;
   out[name] = frame(TOKS.night, ch);
 }}
 for (const [name, ext] of [["low", -1], ["high", 1]]) {{   // the stop the chart's extreme, the price on it
-  const ch = chartOf({{ side }}); ch.stop = ext < 0 ? 77000 : 84000; ch.live = ch.stop; ch.liveAt = 1;
+  const ch = chartOf({{ side }}); ch.stop = ext < 0 ? 77000 : 84000; ch.live = ch.stop;
   out[name] = frame(TOKS.night, ch);
 }}
 // the run's own candle held (RUN, dashed) a few px from the live price, the stop between them
-const ch = chartOf({{ side, prov: [N - 1] }}); ch.runIdx = N - 1; ch.live = ch.candles[N - 1][4] - 30; ch.stop = ch.live + 15; ch.liveAt = 1;
+const ch = chartOf({{ side, prov: [N - 1] }}); ch.runIdx = N - 1; ch.live = ch.candles[N - 1][4] - 30; ch.stop = ch.live + 15;
 out.held = frame(TOKS.day, ch);""")
     for name, f in o.items():
         tags = f["tags"]
@@ -343,32 +362,124 @@ out.held = frame(TOKS.day, ch);""")
         if name == "at" or name in ("low", "high"):
             assert (stop["y"] > live["y"]) == (side == "long"), (name, side, stop, live)
         for text, y in f["labels"]:
-            assert all(abs((y - 3) - t["y"]) >= 13 or text == "MT" for t in tags), (name, text, y)
-    assert not any(t == "MT" for t, _ in o["low"]["labels"]) if side == "long" else True
+            assert all(abs((y - 3) - t["y"]) >= 13 for t in tags), (name, text, y)
+        assert len(f["tz"]) == 1, name                                            # MT, once, never left out
+        z = f["tz"][0]
+        assert all(abs((z["y"] - 3) - t["y"]) >= 13 or z["x"] + z["w"] <= t["x"] for t in tags), (name, z, tags)
+        assert all(d["x"] + d["w"] <= z["x"] for d in f["dates"]), (name, z, f["dates"])
+    if side == "long":                                                           # the stop's tag in the corner: MT left of it
+        assert o["low"]["tz"][0]["x"] + o["low"]["tz"][0]["w"] <= o["low"]["w"] - o["low"]["padR"]
     held = next(t for t in o["held"]["tags"] if t["text"].startswith("RUN "))
     assert held["dash"] and len(o["held"]["tags"]) == 3                          # still dashed, still there, clear
+
+
+@node
+@pytest.mark.parametrize("side", ["long", "short"])
+def test_an_entry_pin_on_the_newest_candle_stays_clear_of_the_tags(side):
+    """ETH's newest candle (about 1.5 px a slot on a phone) with an entry on it at the live price and the stop 2
+    above (a short) or below (a long): the pin's box stays left of the tags past the axis (it reached 3 px under the
+    STOP tag), its point still on the candle and the price."""
+    o = _draw(f"""
+const side = "{side}", M = 140;
+const cs = Array.from({{ length: M }}, (_, k) => {{ const c = 2400 + 40 * Math.sin(k / 6); return [T0 + 2 * H * k, c - 3, c + 8, c - 8, c + 1]; }});
+const ch = {{ bar_ms: 2 * H, candles: cs, ema_fast: cs.map((c) => c[4] + 10), ema_slow: cs.map((c) => c[4] - 12), don_hi: cs.map(() => 2460),
+  don_lo: cs.map(() => 2340), prov: [], side, live: cs[M - 1][4], entry: cs[M - 1][4], stop: cs[M - 1][4] + (side === "short" ? 2 : -2),
+  markers: [{{ ts: cs[M - 1][0], price: cs[M - 1][4], kind: "entry", side }}] }};
+TOK = {{ ...TOKS.night, "--entry-mark": "pin" }};
+out.f = frame(TOK, ch);
+out.f.x = lastGeom.X(M - 1); out.f.points = ops.filter((p) => p.k === "fill" && p.pts.length === 1 && p.pts[0][2] === 1.8).map((p) => p.pts[0][0]);""")["f"]
+    assert len(o["pins"]) == 1 and len(o["tags"]) == 2
+    pin, edge = o["pins"][0], min(t["x"] for t in o["tags"])
+    assert edge - (o["w"] - o["padR"]) == 2                                       # the tags start 2 px past the axis
+    assert pin["x"] + pin["w"] <= edge, (pin, edge)
+    assert o["points"] == [o["x"]]                                                # its point on the newest candle
+
+
+@node
+@pytest.mark.parametrize("edition", ["day", "night"])
+def test_a_stop_at_the_live_price_shows_over_the_live_line(edition):
+    """A stop at the live price: its dashed line is drawn again over the solid live one (it was hidden under it), so
+    both read on the chart while its tag is stacked past the live tag; a stop away from the price is drawn once,
+    under the live line as before."""
+    o = _draw(f"""
+const a = chartOf({{ side: "long" }}); a.live = a.candles[N - 1][4] - 300; a.stop = a.live;
+out.at = frame(TOKS.{edition}, a);
+const b = chartOf({{ side: "long" }}); b.live = b.candles[N - 1][4] - 300; b.stop = b.live - 900;
+out.apart = frame(TOKS.{edition}, b);""")
+    tok = DAY if edition == "day" else NIGHT
+    live, stop = tok["--live"], tok["--orange"]
+    at = o["at"]["order"]
+    assert at.count(stop) == 2 and at.index(live) < len(at) - 1 - at[::-1].index(stop)   # the stop's dashes on top
+    assert o["apart"]["order"].count(stop) == 1 and o["apart"]["order"].index(stop) < o["apart"]["order"].index(live)
+
+
+@node
+@pytest.mark.parametrize("held", [False, True])
+def test_the_live_tags_room_is_kept_so_the_candles_never_move_sideways(held):
+    """A chart that can have a live price (canLive: BTC's on Coinbase, ETH's, SOL's) keeps the live tag's room in its
+    price axis while it has none (the proxy, stale, closed, Hyperliquid quiet), so the plot is as wide with the marker
+    as without it and nothing jumps when it comes and goes; a chart that can't have one is as before (64 px at least)."""
+    o = _draw(f"""
+const held = {"true" if held else "false"};
+const mk = (o) => {{ const ch = chartOf(held ? {{ prov: [N - 1] }} : {{}}); if (held) ch.runIdx = N - 1; return Object.assign(ch, o); }};
+out.live = frame(TOKS.night, mk({{ canLive: true, live: chartOf().candles[N - 1][4] }}));
+out.none = frame(TOKS.night, mk({{ canLive: true }}));
+out.cannot = frame(TOKS.night, mk({{}}));""")
+    assert o["live"]["padR"] == o["none"]["padR"] > o["cannot"]["padR"] >= 64
+    assert o["none"]["words"] == [] and all(t["text"].count("LIVE") == 0 for t in o["none"]["tags"])   # room only, no marker
+
+
+@node
+def test_a_price_tag_rounds_the_cent_as_the_title_does():
+    """pxAxis (the tags and the axis) rounds a price under 1,000 as px (the title, the ticker) does: SOL at 104.345 is
+    "104.35" on its LIVE tag and in its title, never 104.34 on one and 104.35 on the other."""
+    js = (_between(APP, "  const NF = new Map()", "\n") + "\n" + _between(APP, "  const usd =", "\n") + "\n"
+          + _between(APP, "  const px =", "\n") + "\n" + _between(APP, "  const pxAxis =", "\n") + """
+const bad = [];
+for (let c = 1; c < 100000; c += 7) { const x = c / 100 + 0.005; if ("$" + pxAxis(x) !== px(x)) bad.push(x); }
+for (let c = 2001; c < 300000; c += 13) { const x = c / 2; if ("$" + pxAxis(x) !== px(x)) bad.push(x); }
+console.log(JSON.stringify({ bad: bad.slice(0, 5), sol: pxAxis(104.345), title: px(104.345), big: pxAxis(81475.5), low: pxAxis(0.5) }));""")
+    r = _node(js)
+    assert r["bad"] == [] and r["sol"] == "104.35" == r["title"][1:]
+    assert r["big"] == "81,476" and r["low"] == "0.50"
 
 
 # ---------------------------------------------------------------- the legend
 
 @node
 def test_the_legend_says_what_the_marker_is_and_wraps_between_entries():
-    """'live' with a small tag swatch (● on --live) while the marker is drawn, never without it; every entry
-    whole in a nowrap span, the dot after it glued with a no-break space, so a phone breaks only after a '·'."""
+    """'live' with a small tag swatch (● on --live), last, while the marker is drawn; on a chart that can have one
+    (canLive) but has none just now, the same entry kept unseen (visibility hidden), so the legend has as many lines
+    and the chart under it doesn't move when the price comes and goes; none at all on a chart that can't have one.
+    Every entry whole in a nowrap span, the dot after it glued with a no-break space, so a phone breaks only after a
+    '·'."""
     js = _function(APP, "legend") + """
-const ch = { live: 82290, prov: [139] };
-console.log(JSON.stringify([legend(ch, "<span>24h +2.10%</span>"), legend({ prov: [] }, "<span>24h</span>")]));"""
-    with_live, without = _node(js)
-    assert with_live == ('<span class="lg"><span>24h +2.10%</span></span>&nbsp;· <span class="lg">fast <i class="swatch fast"></i></span>'
-                         '&nbsp;· <span class="lg">slow <i class="swatch slow"></i></span>&nbsp;· <span class="lg">channel '
-                         '<i class="swatch channel"></i></span>&nbsp;· <span class="lg">stop <i class="swatch stop"></i></span>'
-                         '&nbsp;· <span class="lg">live <i class="swatch live"></i></span>&nbsp;· <span class="lg">'
-                         'newest candle <i class="swatch prov"></i> provisional</span>')
+console.log(JSON.stringify([legend({ live: 82290, canLive: true, prov: [139] }, "<span>24h +2.10%</span>"),
+  legend({ canLive: true, prov: [] }, "<span>24h</span>"), legend({ prov: [] }, "<span>24h</span>")]));"""
+    with_live, kept, without = _node(js)
+    entries = ('<span class="lg"><span>24h +2.10%</span></span>&nbsp;· <span class="lg">fast <i class="swatch fast"></i></span>'
+               '&nbsp;· <span class="lg">slow <i class="swatch slow"></i></span>&nbsp;· <span class="lg">channel '
+               '<i class="swatch channel"></i></span>&nbsp;· <span class="lg">stop <i class="swatch stop"></i></span>'
+               '&nbsp;· <span class="lg">newest candle <i class="swatch prov"></i> provisional</span>')
+    entry = '&nbsp;· <span class="lg">live <i class="swatch live"></i></span></span>'
+    assert with_live == entries + '<span class="lg-live">' + entry
+    assert kept.endswith('<span class="lg-live off">' + entry) and "provisional" not in kept
     assert "live" not in without and "provisional" not in without
     assert ".chart-head .lg { white-space: nowrap; }" in STYLE
+    assert re.search(r"\.chart-head \.lg-live\.off \{ visibility: hidden; \}", STYLE)
     sw = re.search(r"\.swatch\.live \{([^}]*)\}", STYLE).group(1)
     assert "var(--live)" in sw and "var(--on-live)" in sw
     assert 'put($("chart-sub"), legend(s.chart, ' in _function(APP, "renderStage")
+
+
+def test_the_bubbles_follow_the_chart_down_when_its_legend_wraps():
+    """On a wide window the agents' bubbles sit on the chart under its head: BUBBLE_SPOTS are for a head of one line,
+    and when the legend wraps (BTC's at 1,280 px with its live entry, any tab's at 1,000) the bubbles move down by as
+    much as the legend reaches below the title's line, on every redraw (the legend changes with a light one too)."""
+    stage = _function(APP, "renderStage")
+    assert "const more = Math.max(0, Math.round(sub.offsetTop + sub.offsetHeight - ttl.offsetTop - ttl.offsetHeight));" in stage
+    assert 'bb.style.transform = more ? `translateY(${more}px)` : "";' in stage
+    assert stage.index('put($("chart-sub"), legend(') < stage.index("const more =")
 
 
 # ---------------------------------------------------------------- the beat
@@ -380,9 +491,11 @@ def _beat() -> str:
 @node
 @pytest.mark.parametrize("reduced", [False, True])
 def test_the_dot_beats_once_per_new_price_and_never_under_reduced_motion(reduced):
-    """liveBeat: one short animation (0.5 s) for each new price's time, none for a redraw with the same price, none
-    once the marker is gone (an animation in flight is cancelled), and none at all under prefers-reduced-motion. No
-    loop: no interval or animation frame; the page's own redraws (a Coinbase message, an allMids answer) drive it."""
+    """liveBeat: one short animation (0.5 s) each time the live price drawn moves, none for a redraw with the same price
+    (a Coinbase message with the book moved and no trade, an allMids answer with the same mid, a board or a resize),
+    none once the marker is gone (an animation in flight is cancelled), the next price after it is back beating again,
+    and none at all under prefers-reduced-motion. No loop: no interval or animation frame; the page's own redraws (a
+    Coinbase message, an allMids answer) drive it, and cbPaint's redraw-free path for the same price doesn't call it."""
     js = """
 const anims = [], cancelled = [], el = { style: {}, setAttribute() {}, className: "",
   animate: (k, o) => { anims.push([k.map((x) => x.transform), o.duration]); return {}; },
@@ -391,10 +504,10 @@ const canvas = { offsetLeft: 6, offsetTop: 40, animate() {}, after() {} };
 const $ = () => canvas, document = { createElement: () => el };
 const matchMedia = () => ({ matches: %s });
 """ % ("true" if reduced else "false") + _beat() + """
-liveBeat(1000, [10, 20]); liveBeat(1000, [10, 20]); liveBeat(1000);   // a redraw for another reason: the same price
-liveBeat(2000);                                                        // a new price (cbPaint's no-redraw path)
-liveBeat(0, null);                                                     // the marker gone: proxy, stale, closed
-liveBeat(3000, [10, 25]);
+liveBeat(82290.5, [10, 20]); liveBeat(82290.5, [10, 20]); liveBeat(82290.5, [10, 22]);   // the same price, redrawn
+liveBeat(82290.7, [10, 20]);                                                             // it moved (a cent)
+liveBeat(0, null);                                                                       // the marker gone: proxy, stale, closed
+liveBeat(82290.7, [10, 25]);                                                             // back: a beat
 console.log(JSON.stringify({ anims, cancelled: cancelled.length, left: el.style.left, top: el.style.top }));"""
     r = _node(js)
     if reduced:
@@ -408,16 +521,43 @@ console.log(JSON.stringify({ anims, cancelled: cancelled.length, left: el.style.
     assert re.search(r"\.live-beat \{[^}]*opacity: 0;", STYLE)                    # nothing at rest
     reduce = STYLE[STYLE.rindex("@media (prefers-reduced-motion: reduce)"):]
     assert ".live-beat { display: none; }" in reduce
-    paint = _function(APP, "cbPaint")
-    assert "liveBeat(cb.at);" in paint                                             # a Coinbase message, the same price
+    assert "liveBeat" not in _function(APP, "cbPaint")                             # the same Coinbase price: no beat
+    assert "liveBeat(chart.live, liveTag(g, w - padR, ty[0], chart.live));" in _function(APP, "drawChart")
 
 
-def test_a_quiet_hyperliquid_takes_the_marker_off_with_one_timer():
-    """ETH and SOL: one setTimeout to the moment the shown mid turns STALE, reset by each redraw, so the marker goes
-    when Hyperliquid goes quiet and nothing runs while prices keep coming. BTC's Coinbase price: cbWatch already
-    redraws when it stops being fresh."""
+# ---------------------------------------------------------------- a quiet Hyperliquid
+
+def test_a_quiet_hyperliquid_takes_live_off_everywhere_with_one_timer():
+    """ETH, SOL and VT: one setTimeout to the moment Hyperliquid's last answer turns STALE (20 s), reset by each redraw,
+    so when it goes quiet the chart's marker, the ticker's LIVE (STALE then, as the proxy's on BTC), the page's has-live
+    glow and the footer all change together; nothing runs while prices keep coming. A failed allMids still counts the
+    footer's age. BTC's Coinbase price and the proxy: cbWatch already redraws when either stops being fresh."""
     render = _function(APP, "render")
     assert "clearTimeout(liveDue);" in render
-    assert ("if (!basket && !s.venue && s.chart.live) liveDue = setTimeout(() => render(true), "
-            "Math.max(0, s.chart.liveAt + STALE - Date.now()) + 50);") in render
+    assert ("if (!s.venue && live.at && !hlStale(Date.now())) liveDue = setTimeout(() => render(true), "
+            "Math.max(0, live.at + STALE - Date.now()) + 50);") in render
+    assert ": !!live.at && !hlStale(Date.now()));" in render                    # has-live: off once stale
+    assert "const hlStale = (now) => !!live.at && near(now, live.at) > STALE;" in APP
+    assert 'if (!v) return { source: "hyperliquid", price: hlMid, at: live.at, stale: hlStale(now) };' in _function(APP, "livePrice")
+    assert ': lp.stale ? `STALE (HYPERLIQUID${v ? " PROXY" : ""}) · `' in _function(APP, "renderStage")
+    assert 'hlStale(now) ? "STALE (HYPERLIQUID) · "' in _function(APP, "renderBasket")
+    assert "!s.venue && hlStale(Date.now()) ? ` · stale price: Hyperliquid's last came ${secs(live.at)}s ago`" in _function(APP, "foot")
+    assert "if (state && !state.venue) txt($(\"foot\"), foot(state));" in _function(APP, "pollMids")
     assert "if (cbMode(livePrice(on, now)) !== cb.mode) cbPaint(true);" in _function(APP, "cbWatch")
+
+
+@node
+def test_the_footer_says_stale_once_hyperliquid_is_quiet():
+    """ETH's footer: "live price 3s ago from Hyperliquid" while it answers, "stale price: Hyperliquid's last came 25s
+    ago" once it hasn't for over 20 s, never "live" then."""
+    js = ("const DAY_MS = 86400000;\n" + _between(APP, "  const deskMT = (() => {", "  window.deskMT = deskMT;")
+          + "const MT = deskMT, TZ = deskMT.zone, hhmm = (ms) => MT.clock(ms), missing = null;\n"
+          + _between(APP, "  const STALE = 20000;", "  const CB_SKEW") + _between(APP, "  const near =", "  // quiet: the ticker")
+          + _function(APP, "foot") + _function(APP, "provNote") + """
+const live = { mids: { ETH: "2441.5" }, at: Date.now() - 3000 };
+const s = { header: { coin: "ETH" }, updated: Date.now() - 60000, livePx: {}, chart: { prov: [] }, venue: null };
+const a = foot(s); live.at = Date.now() - 25000; const b = foot(s);
+console.log(JSON.stringify([a, b]));""")
+    a, b = _node(js)
+    assert " · live price 3s ago from Hyperliquid · " in a
+    assert " · stale price: Hyperliquid's last came 25s ago · " in b and "live price" not in b

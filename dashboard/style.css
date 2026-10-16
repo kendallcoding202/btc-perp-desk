@@ -219,6 +219,7 @@ html[data-desk="up"] .card.active::after { animation: sheen 4.8s ease-in-out inf
 .swatch.prov { width: 8px; height: 9px; background: none; border: 1px dashed var(--muted); border-radius: 0; }   /* BTC's provisional newest candle */
 .swatch.live { width: 14px; height: 9px; border-radius: 1px; background: radial-gradient(circle at 4px 50%, var(--on-live) 0 1.8px, transparent 2.3px), var(--live); }   /* the live tag: ● LIVE */
 .chart-head .lg { white-space: nowrap; }   /* a legend entry stays whole: a phone wraps between entries */
+.chart-head .lg-live.off { visibility: hidden; }   /* no live price now: its entry's room kept, nothing shown */
 /* the live tag's dot beating once for a new price (app.js liveBeat: an animation of 0.5 s, none at rest) */
 .live-beat { position: absolute; width: 5px; height: 5px; margin: -2.5px 0 0 -2.5px; border-radius: 50%; background: var(--on-live); opacity: 0; pointer-events: none; z-index: 1; }
 .chart-wrap::before {
