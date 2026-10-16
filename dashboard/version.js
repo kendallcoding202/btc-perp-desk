@@ -5,17 +5,17 @@
 // #hash) with the same storage (the SHADOW key, day or night). The footer shows the build, so a screenshot says which
 // code the phone runs. No meta (the local server, a test page): none of this runs.
 // Never a loop: Pages' CDN can go on serving the old page for a while after a deploy, so a reload is remembered for this
-// tab (sessionStorage) and there's at most one per 15 minutes, and none where it can't be remembered. A version.json
-// that's missing, unreadable or empty, or no network, changes nothing; neither does a form being filled in (the SHADOW
-// page's key: focused, or typed in and not sent).
+// tab and page (sessionStorage; each page its own) and there's at most one per 15 minutes, and none where it can't be
+// remembered. A version.json that's missing, unreadable or empty, or no network, changes nothing; neither does a form
+// being filled in (the SHADOW page's key: focused, or typed in and not sent).
 (function () {
   "use strict";
   const KEY = "desk-build", EVERY = 10 * 60 * 1000, ONCE_PER = 15 * 60 * 1000, ASKING = 20 * 1000;
   const BUILD = /^[0-9a-f]{7,64}$/;
   const FIELDS = "textarea, input:not([type]), input[type=text], input[type=password], input[type=search], input[type=email], input[type=url], input[type=tel], input[type=number]";
 
-  // own: this page's build. io: what it reads and does (node runs it with its own): fetch, now, typing, the tab's
-  // record of its last reload ({ from, to, at, told }: read, and write, which says whether it stuck), reload
+  // own: this page's build. io: what it reads and does (node runs it with its own): fetch, now, typing, this page's
+  // record of its last reload in this tab ({ from, to, at, told }: read, and write, which says whether it stuck), reload
   function updater(own, io) {
     let asking = 0;
     return async function check() {
@@ -33,9 +33,10 @@
         if (build === own) return "same";
         if (io.typing()) return "typing";   // the next check, once it's sent or left
         const last = io.read(), now = io.now();
-        // reloaded under 15 min ago (either way: a phone clock set back never holds it longer) and still not this
-        // build: the CDN's old page; the next check after that tries again
-        if (last && Math.abs(now - last.at) < ONCE_PER) return "waiting";
+        // reloaded under 15 min ago and still not this build: the CDN's old page; the next check after that tries
+        // again. A reload the clock puts in the future (the phone's clock set back) waits its 15 min from now
+        if (last && now < last.at) { io.write({ ...last, at: now }); return "waiting"; }
+        if (last && now - last.at < ONCE_PER) return "waiting";
         if (!io.write({ from: own, to: build, at: now })) return "unrecorded";
         io.reload();
         return "reload";
@@ -47,18 +48,22 @@
     };
   }
 
-  // a reload onto this build that the page hasn't said yet: when it was (said once; a reload by hand after says nothing)
+  // the reload this page just made, when it brought the build it went for: when it was. Only the load right after it
+  // says so: a reload the CDN answered with the old page says nothing, and nor does a load by hand after
   function told(own, io) {
     const last = io.read();
-    if (!last || last.to !== own || last.told) return 0;
+    if (!last || last.told) return 0;
     io.write({ ...last, told: true });
-    return last.at || 0;
+    return last.to === own ? last.at || 0 : 0;
   }
 
-  // a field being filled in: focused (the remember box too), or holding text not sent yet
+  // a field being filled in, on screen: focused (the remember box too), or holding text not sent yet (a field hidden
+  // with its form, the SHADOW key's once sent, isn't, even where the browser leaves it focused)
   function typing(doc) {
+    const shown = (el) => el.getClientRects().length > 0;
     const a = doc.activeElement;
-    return !!(a && a.matches && a.matches("input, textarea, select")) || [...doc.querySelectorAll(FIELDS)].some((el) => el.value !== "");
+    return !!(a && a.matches && a.matches("input, textarea, select") && shown(a)) ||
+      [...doc.querySelectorAll(FIELDS)].some((el) => el.value !== "" && shown(el));
   }
 
   // "9:12 am MT" (America/Denver's own rules, whatever zone the phone is in); no time where the browser can't
@@ -77,10 +82,11 @@
     const meta = document.querySelector('meta[name="desk-build"]');
     const own = meta ? String(meta.content).trim() : "";
     if (BUILD.test(own)) {
+      const slot = `${KEY} ${location.pathname.replace(/index\.html$/, "")}`;   // this page's record ("./" and index.html: one)
       const io = {
         fetch: (url, opt) => fetch(url, opt), now: () => Date.now(), typing: () => typing(document), reload: () => location.reload(),
-        read() { try { return JSON.parse(sessionStorage.getItem(KEY)); } catch { return null; } },
-        write(rec) { try { const s = JSON.stringify(rec); sessionStorage.setItem(KEY, s); return sessionStorage.getItem(KEY) === s; } catch { return false; } },
+        read() { try { return JSON.parse(sessionStorage.getItem(slot)); } catch { return null; } },
+        write(rec) { try { const s = JSON.stringify(rec); sessionStorage.setItem(slot, s); return sessionStorage.getItem(slot) === s; } catch { return false; } },
       };
       const el = document.getElementById("build");
       if (el) {

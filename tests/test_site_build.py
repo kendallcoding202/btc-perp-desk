@@ -198,7 +198,11 @@ def test_the_stamp_step_comes_right_after_the_build_and_cant_stop_the_deploy():
     assert "steps.stamp" not in str(steps) and "id" not in stamp      # nothing waits on the stamp
     assert stamp["continue-on-error"] is True and stamp["timeout-minutes"] <= 2
     assert "env" not in stamp and "secrets." not in str(stamp) and "git " not in stamp["run"]
-    assert stamp["run"].startswith('timeout 60 python3 -m tools.stamp_site _site "$GITHUB_SHA" \\\n  || echo "::warning::')
+    run = stamp["run"].splitlines()
+    assert run[0] == 'timeout 60 python3 -m tools.stamp_site _site "$GITHUB_SHA" || {' and run[-1] == "}"
+    assert run[1:-1] == ["  rm -f _site/*.tmp _site/version.json || true",            # nothing a failed stamp left
+                         '  echo "::warning::the site goes up without version.json this run (why: above), so an open page '
+                         "won't update itself to it\""]
     assert upload["with"] == {"path": "_site"}
     assert not [p for p in DASH.iterdir() if p.is_dir() or p.suffix == ".py"]   # the helper is never copied into the site
 
@@ -215,7 +219,24 @@ def test_the_only_workflow_change_is_the_stamp_step():
         {k: v for k, v in was["jobs"]["step"].items() if k != "steps"}
 
 
-@pytest.mark.parametrize("case", ["stamped", "no helper", "a page it can't stamp", "no commit"])
+# the helper stopped by the step's timeout part way (a stalled disk, say): it hangs renaming a file into place, before
+# the rename (shadow.html: its .tmp written) or after it (version.json: in, the run never done). The step's 60 s is 2 s
+# here, for the test only
+STALL = """
+import pathlib, time
+_replace = pathlib.Path.replace
+def replace(self, target):
+    if pathlib.Path(target).name == %r:
+        if %r:
+            _replace(self, target)
+        time.sleep(600)
+    return _replace(self, target)
+pathlib.Path.replace = replace
+"""
+
+
+@pytest.mark.parametrize("case", ["stamped", "no helper", "a page it can't stamp", "no commit", "stopped part way",
+                                  "stopped after version.json"])
 def test_the_stamp_step_stamps_the_site_or_warns_and_the_deploy_goes_on(tmp_path, case):
     ws = tmp_path / "ws"
     site = _site(ws)
@@ -228,16 +249,35 @@ def test_the_stamp_step_stamps_the_site_or_warns_and_the_deploy_goes_on(tmp_path
     run = next(s for s in _yaml()["jobs"]["step"]["steps"] if s.get("name") == STAMP)["run"]
     env = {k: v for k, v in os.environ.items() if k not in ("JEV_API_KEY", "NTFY_TOPIC", "NTFY_TOKEN")}
     env["GITHUB_SHA"] = "" if case == "no commit" else SHA
+    if case.startswith("stopped"):
+        assert run.count("timeout 60 ") == 1
+        run = run.replace("timeout 60 ", "timeout 2 ")
+        (ws / "hook").mkdir()
+        hang = ("shadow.html", False) if case == "stopped part way" else ("version.json", True)
+        (ws / "hook" / "sitecustomize.py").write_text(STALL % hang)
+        env["PYTHONPATH"] = "hook"
     res = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", run], cwd=ws, env=env,
                          capture_output=True, text=True, timeout=120)
     assert res.returncode == 0, res.stderr                                  # GitHub runs a step as bash -eo pipefail
+    now = _files(site)
     if case == "stamped":
         assert res.stdout.strip() == "stamped build e94d763: index.html, shadow.html, version.json"
         assert json.loads((site / "version.json").read_text()) == {"build": SHA}
         assert f'<meta name="desk-build" content="{SHA}">' in (site / "shadow.html").read_text()
+        return
+    assert res.stdout.strip() == ("::warning::the site goes up without version.json this run (why: above), so an open "
+                                  "page won't update itself to it")
+    assert set(now) == set(before)                                         # no version.json, no temp copy goes up
+    stamped = _site(tmp_path / "ok")
+    stamp_site.stamp_site(stamped, SHA)
+    want = _files(stamped)
+    if case == "stopped part way":                                         # each page whole: stamped or as built
+        assert now["index.html"] == want["index.html"] and now["shadow.html"] == before["shadow.html"]
+    elif case == "stopped after version.json":
+        assert now["index.html"] == want["index.html"] and now["shadow.html"] == want["shadow.html"]
     else:
-        assert "::warning::the site goes up unstamped this run" in res.stdout
-        assert _files(site) == before                                     # the site as the Build left it
+        assert now == before                                               # the site as the Build left it
+    assert {k: v for k, v in now.items() if not k.endswith(".html")} == {k: v for k, v in before.items() if not k.endswith(".html")}
 
 
 # ---------------------------------------------------------------- the page
@@ -290,6 +330,9 @@ def test_a_new_build_reloads_the_page_once_and_it_says_so_once():
   w.now += 60 * MIN; out.later = await after();
   out.reloads = w.reloads.length;
   out.old_page_told = m.told(A, world(ok(B)).io);     // never reloaded: nothing to say
+  // a reload the CDN answered with the old page says nothing, and nor does the new one loaded by hand after it
+  const s = world(ok(B)); await m.updater(A, s.io)();
+  out.stale = [m.told(A, s.io), m.told(B, s.io)];
   console.log(JSON.stringify(out));
 })();"""
     out = _node(js)
@@ -297,26 +340,36 @@ def test_a_new_build_reloads_the_page_once_and_it_says_so_once():
     assert out["asked"] == ["version.json?t=1792100000000", {"cache": "no-store"}]
     assert out["rec"] == {"from": "a" * 40, "to": "b" * 40, "at": 1792100000000 + 600000}
     assert out["told"] is True and out["told_again"] == 0 and out["old_page_told"] == 0
+    assert out["stale"] == [0, 0]
     assert out["after"] == ["same", "same"] and out["later"] == "same"
 
 
 @node
 def test_the_cdns_old_page_reloads_at_most_once_per_15_minutes():
     """version.json says B while the CDN still serves page A: a reload gets A again. Checked every minute for two hours
-    (the foreground's events, the 10 min timer), it reloads at most once per 15 minutes; a phone clock set back an hour
-    never holds the next reload longer, and never makes it loop."""
+    (the foreground's events, the 10 min timer), it reloads at most once per 15 minutes. A phone clock set back never
+    makes that sooner (it waits 15 min from when it's seen) nor holds it more than 15 min longer, and never loops."""
     js = WORLD + """
 (async () => {
   const w = world(ok(B)), t0 = w.now, seen = [];
   for (let k = 0; k <= 120; k++) { w.now = t0 + k * MIN; seen.push(await m.updater(A, w.io)()); }   // each reload: page A again
-  const gaps = w.reloads.slice(1).map((t, i) => (t - w.reloads[i]) / MIN);
+  const gaps = (at) => at.slice(1).map((t, i) => (t - at[i]) / MIN);
+  // the clock set back 30 min at minute 60, and an hour at minute 140: real minutes between reloads
+  const lag = world(ok(B)), real = [];
+  for (let k = 0; k <= 240; k++) {
+    lag.now = t0 + k * MIN - (k >= 60 ? 30 * MIN : 0) - (k >= 140 ? 60 * MIN : 0);
+    if ((await m.updater(A, lag.io)()) === "reload") real.push(k * MIN);
+  }
   const back = world(ok(B)); const c = m.updater(A, back.io), r = [];
   r.push(await c()); back.now -= 60 * MIN; r.push(await c()); back.now += MIN; r.push(await c()); back.now += 14 * MIN; r.push(await c());
-  console.log(JSON.stringify({ n: w.reloads.length, gaps, waiting: seen.filter((s) => s === "waiting").length, back: r }));
+  console.log(JSON.stringify({ n: w.reloads.length, gaps: gaps(w.reloads), waiting: seen.filter((s) => s === "waiting").length,
+    lag: gaps(real), back: r }));
 })();"""
     out = _node(js)
     assert out["n"] == 9 and set(out["gaps"]) == {15} and out["waiting"] == 121 - 9
-    assert out["back"] == ["reload", "reload", "waiting", "reload"]
+    # set back at 60 (15 min after the last reload) and at 140 (5 after): 15 min from then
+    assert out["lag"] == [15, 15, 15, 30, 15, 15, 15, 15, 20, 15, 15, 15, 15, 15]
+    assert out["back"] == ["reload", "waiting", "waiting", "reload"]
 
 
 @node
@@ -348,18 +401,23 @@ def test_no_reload_while_a_field_is_being_filled_in_or_where_the_tab_cant_rememb
   // the foreground's events together (visible, focus): one request
   const t = world(ok(A)), c = m.updater(A, t.io);
   out.together = await Promise.all([c(), c(), c()]); out.requests = t.asked.length;
-  // what counts as filling in: the SHADOW key's field focused or typed in, the remember box focused
-  const doc = (active, values) => ({ activeElement: active, querySelectorAll: () => values.map((value) => ({ value })) });
-  const input = { matches: (q) => q === "input, textarea, select" }, body = { matches: () => false };
-  out.fields = [m.typing(doc(input, [""])), m.typing(doc(body, ["s3cret-not-sent"])), m.typing(doc(body, [""])),
-    m.typing(doc(null, [])), m.typing(doc(body, ["", ""]))];
+  // what counts as filling in: the SHADOW key's field focused or typed in, the remember box focused; on screen only
+  // (its form hidden once the key is sent: some browsers leave the field focused)
+  const rects = (shown) => () => shown ? [{ width: 200, height: 30 }] : [];
+  const field = (value, shown = true) => ({ value, getClientRects: rects(shown) });
+  const doc = (active, fields) => ({ activeElement: active, querySelectorAll: () => fields });
+  const input = (shown = true) => ({ matches: (q) => q === "input, textarea, select", getClientRects: rects(shown) });
+  const body = { matches: () => false, getClientRects: rects(true) };
+  out.fields = [m.typing(doc(input(), [field("")])), m.typing(doc(body, [field("s3cret-not-sent")])),
+    m.typing(doc(body, [field("")])), m.typing(doc(null, [])), m.typing(doc(body, [field(""), field("")])),
+    m.typing(doc(input(false), [field("", false)])), m.typing(doc(body, [field("left-in-a-hidden-form", false)]))];
   console.log(JSON.stringify(out));
 })();"""
     out = _node(js)
     assert out["typing"] == ["typing", 0, None] and out["sent"] == "reload"
     assert out["stuck"] == ["unrecorded", 0]
     assert sorted(out["together"]) == ["asking", "asking", "same"] and out["requests"] == 1
-    assert out["fields"] == [True, True, False, False, False]
+    assert out["fields"] == [True, True, False, False, False, False, False]
     fields = re.search(r'const FIELDS = "([^"]+)";', VERSION).group(1).split(", ")
     assert "input[type=password]" in fields and "textarea" in fields
     assert not [f for f in fields if re.search(r"checkbox|radio|submit|button|hidden", f)]
@@ -388,19 +446,17 @@ def test_a_request_that_never_answers_holds_the_next_for_20_seconds_at_most():
 })();"""
     assert _node(js) == ["asking", "asking", "unread", "asking", "unread", "reload", 1]
 
-@node
-def test_the_page_wires_itself_only_with_a_build_and_checks_only_while_it_shows():
-    """version.js as the page runs it, in node with a stand-in document: no meta (the local server, a fixture), nothing
-    at all; with one, the footer's build, the foreground's events and the 10 minute timer, never while hidden."""
-    js = """
+# version.js as a page runs it, in node with a stand-in document: page(meta, what version.json says, hidden, its path),
+# every page in one tab (one sessionStorage)
+PAGE = """
 const src = require("fs").readFileSync(%s, "utf8");
 const A = "a".repeat(40), B = "b".repeat(40), store = {};
-async function page(meta, served, hidden = false) {
+async function page(meta, served, hidden = false, pathname = "/btc-perp-desk/") {
   const p = { on: {}, reloads: 0, asked: 0, el: { hidden: true, textContent: "", title: "" } };
   const document = { hidden, activeElement: null, querySelectorAll: () => [],
     querySelector: (q) => q === 'meta[name="desk-build"]' && meta != null ? { content: meta } : null,
     getElementById: (id) => id === "build" ? p.el : null, addEventListener: (e, f) => { p.on["document " + e] = f; } };
-  const g = { document, module: undefined, location: { reload: () => { p.reloads++; } },
+  const g = { document, module: undefined, location: { pathname, reload: () => { p.reloads++; } },
     addEventListener: (e, f) => { p.on[e] = f; }, setInterval: (f, ms) => { p.on.every = ms; p.tick = f; },
     sessionStorage: { getItem: (k) => k in store ? store[k] : null, setItem: (k, v) => { store[k] = String(v); } },
     fetch: async () => { p.asked++; return { ok: true, status: 200, json: async () => ({ build: served }) }; } };
@@ -409,6 +465,14 @@ async function page(meta, served, hidden = false) {
   p.fire = async (name) => { (name === "tick" ? p.tick : p.on[name])(); await new Promise((r) => setTimeout(r, 5)); };
   return p;
 }
+""" % json.dumps(str(DASH / "version.js"))
+
+
+@node
+def test_the_page_wires_itself_only_with_a_build_and_checks_only_while_it_shows():
+    """No meta (the local server, a fixture), nothing at all; with one, the footer's build, the foreground's events and
+    the 10 minute timer, never while hidden."""
+    js = PAGE + """
 (async () => {
   const out = {};
   for (const meta of [null, "", "not-a-build", "<b>"]) {
@@ -429,7 +493,7 @@ async function page(meta, served, hidden = false) {
   out.again = (await page(B, B)).el.textContent;
   out.store = Object.keys(store);
   console.log(JSON.stringify(out));
-})();""" % json.dumps(str(DASH / "version.js"))
+})();"""
     out = _node(js)
     for meta in ("null", "", "not-a-build", "<b>"):
         assert out[meta] == {"on": [], "hidden": True, "text": "", "asked": 0}, meta
@@ -441,7 +505,32 @@ async function page(meta, served, hidden = false) {
     assert re.fullmatch(r"build\u00a0bbbbbbb · this page updated itself to the newest version at "
                         r"\d{1,2}:\d\d [ap]m MT", out["after"]), out["after"]
     assert out["quiet"] == [2, 0] and out["again"] == "build\u00a0bbbbbbb"
-    assert out["store"] == ["desk-build"]
+    assert out["store"] == ["desk-build /btc-perp-desk/"]
+
+
+@node
+def test_each_page_keeps_its_own_record_and_only_the_page_that_reloaded_says_so():
+    """index.html and shadow.html in one tab: each reloads at most once per 15 minutes on its own record, so one's
+    reload never holds the other on old code; and only the load a page's own reload brings says it updated itself."""
+    js = PAGE + """
+(async () => {
+  const out = {}, IX = "/btc-perp-desk/", SH = "/btc-perp-desk/shadow.html";
+  const i1 = await page(A, B, false, IX); await i1.fire("pageshow");      // the index, B out: it reloads
+  const i2 = await page(A, B, false, IX); await i2.fire("pageshow");      // and the CDN answers with its old page
+  const i3 = await page(A, B, false, "/btc-perp-desk/index.html"); await i3.fire("pageshow");   // the same, by name
+  out.index = [i1.reloads, i2.el.textContent, i2.reloads, i3.reloads];
+  out.byHand = (await page(B, B, false, SH)).el.textContent;              // the SHADOW link: the new page, by hand
+  const s1 = await page(A, B, false, SH); await s1.fire("pageshow");      // or its old one: its own reload, now
+  out.shadow = [s1.reloads, (await page(B, B, false, SH)).el.textContent];
+  out.store = Object.keys(store).sort();
+  console.log(JSON.stringify(out));
+})();"""
+    out = _node(js)
+    assert out["index"] == [1, "build\u00a0aaaaaaa", 0, 0]
+    assert out["byHand"] == "build\u00a0bbbbbbb"
+    assert out["shadow"][0] == 1 and re.fullmatch(r"build\u00a0bbbbbbb · this page updated itself to the newest version at "
+                                                  r"\d{1,2}:\d\d [ap]m MT", out["shadow"][1]), out["shadow"]
+    assert out["store"] == ["desk-build /btc-perp-desk/", "desk-build /btc-perp-desk/shadow.html"]
 
 
 @node
@@ -465,9 +554,11 @@ def test_both_pages_load_it_and_keep_everything_else_they_store():
         assert "desk-build" not in page                                # unstamped here: the local server never reloads
     assert 'const KEY = "desk-build", EVERY = 10 * 60 * 1000, ONCE_PER = 15 * 60 * 1000, ASKING = 20 * 1000;' in VERSION
     assert "location.reload()" in VERSION and 'cache: "no-store"' in VERSION
-    assert not re.search(r"removeItem|\.clear\(|localStorage|location\.(href|hash|search)\s*=|replace\(", VERSION)
-    assert re.findall(r"sessionStorage\.(\w+)\((\w+)", VERSION) == [("getItem", "KEY"), ("setItem", "KEY"),
-                                                                     ("getItem", "KEY")]   # its own record only
+    assert not re.search(r"removeItem|\.clear\(|localStorage|location\.(href|hash|search)\s*=|location\.replace", VERSION)
+    assert re.findall(r"sessionStorage\.(\w+)\((\w+)", VERSION) == [("getItem", "slot"), ("setItem", "slot"),
+                                                                     ("getItem", "slot")]   # its own record only
+    assert "const slot = `${KEY} ${location.pathname" in VERSION
     for p in DASH.iterdir():                                           # the SHADOW key, the edition, the tab: untouched
         assert p.name == "version.js" or "desk-build" not in p.read_text(), p.name
-    assert re.search(r"\.foot \.build \{ display: block; \}", (DASH / "style.css").read_text())   # its own line
+    css = (DASH / "style.css").read_text()
+    assert ".foot .build { display: block; }" in css and ".foot .build[hidden] { display: none; }" in css   # its own line

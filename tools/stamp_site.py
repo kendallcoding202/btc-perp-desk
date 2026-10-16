@@ -11,7 +11,8 @@ the new one. Then version.json, {"build": "<commit>"}, last: when it's there, ev
 The same commit stamps the same bytes (every run on one commit: a run that only brings new boards changes nothing a
 page compares), and stamping again changes nothing; another commit's stamp is replaced. Every page is stamped in memory
 first, then each file is replaced whole (written beside it, renamed over it), so a failure leaves each file either as
-it was or fully stamped; it exits 1 saying why, and the workflow deploys the site as it is.
+it was or fully stamped; it exits 1 saying why. The workflow then takes out version.json and any <name>.tmp left
+beside a page (a run stopped part way, which never got to remove it) and deploys the site as it is.
 """
 
 from __future__ import annotations
