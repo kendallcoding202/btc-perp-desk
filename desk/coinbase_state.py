@@ -461,6 +461,12 @@ LIVE_FILES = tuple(f"{kind}-live{suffix}" for kind, suffix in
                    (("state", ".enc.json"), ("state", ".prev.enc.json"), ("board", ".enc.json")))
 
 
+def _has_mode(branch, mode: str) -> bool:
+    """Whether `branch` holds any encrypted file of `mode`'s (its state, the state before, its board)."""
+    return any(branch.show(f"{COIN}/{kind}-{mode}{suffix}") is not None for kind, suffix in
+               (("state", ".enc.json"), ("state", ".prev.enc.json"), ("board", ".enc.json")))
+
+
 def _local(state_dir: Path, branch, loaded=None) -> dict[str, bytes]:
     """The desk's files in the state dir (BTC/'s, by name). Anything else in it came from the load step, which
     extracts the whole branch: with the load known (`loaded`, the branch as it was loaded) it must be exactly as
@@ -550,14 +556,6 @@ def check(state_dir: str | Path, remote_ref: str | None = None, branch=None, loa
     if new["mode"] == "LIVE" and new.get("armed") is not True:
         raise StateCheckError(f"{COIN}/status.json is a LIVE status that isn't armed: a LIVE run that never armed "
                               f"saves nothing (it isn't a LIVE start)")
-    if state not in files:
-        if status_only and new["runs"] == 0 and b.show(f"{COIN}/{state}") is None:
-            said.append(f"a status-only save: {new['mode']} was refused before it ever had a state")
-            return said
-        if b.show(f"{COIN}/{state}") is not None:
-            raise StateCheckError(f"{COIN}/{state} is on the branch but this run has none: not saving a status beside "
-                                  f"a state it didn't load")
-        raise StateCheckError(f"{COIN}/{state} is missing next to a {new['mode']} status")
     old_raw = b.show(f"{COIN}/status.json")
     old, unreadable = None, False
     if old_raw is not None:
@@ -567,13 +565,33 @@ def check(state_dir: str | Path, remote_ref: str | None = None, branch=None, loa
             old = check_status(_json(old_raw, f"saved {COIN}/status.json"), f"saved {COIN}/status.json")
         except StateCheckError:
             unreadable = True           # edited: read as no status (it never decides whose the state is)
+    prev = f"{COIN}/state-{mode}.prev.enc.json"
+    if b.show(prev) is not None and b.show(f"{COIN}/{state}") is None and \
+            not (old is not None and old["mode"] == new["mode"] and old["runs"] > 0):
+        # the state and its status were deleted, the state before the last kept: any save now (a new state, or a
+        # status alone, even one that says no run has worked yet) would let a later run start a new state over the
+        # record, and each save replaces the branch's one commit, so your commit and what it deleted would leave its
+        # history. (Only the state deleted, its status kept: the status's own start refuses a new state, below.)
+        raise StateCheckError(f"the branch has {prev} but neither {COIN}/{state} nor a status.json of its runs "
+                              f"(deleted?): not starting a new state over the record, and not saving anything else "
+                              f"beside it. Put the state and its status back as they were (revert the commit that "
+                              f"deleted them), or delete the coinbase-state branch to start over")
+    if state not in files:
+        if status_only and new["runs"] == 0 and b.show(f"{COIN}/{state}") is None:
+            said.append(f"a status-only save: {new['mode']} was refused before it ever had a state")
+            return said
+        if b.show(f"{COIN}/{state}") is not None:
+            raise StateCheckError(f"{COIN}/{state} is on the branch but this run has none: not saving a status beside "
+                                  f"a state it didn't load")
+        raise StateCheckError(f"{COIN}/{state} is missing next to a {new['mode']} status")
     written_back = status_only and new.get("problem") == "state" and new.get("note") == STATUS_BACK and new["runs"] >= 1
     on_branch = b.show(f"{COIN}/{state}")
     if on_branch is not None and written_back and files[state] == on_branch and \
-            (old is None or old["mode"] == new["mode"]):
+            (old is None or old["mode"] == new["mode"] or not _has_mode(b, old["mode"].lower())):
         # the status was deleted, edited into something the desk didn't write, or edited so it doesn't match the
-        # state: the run that found it so wrote it back from the state it opened, and saved that state as it is
-        # (nothing replaced: the state on the branch stays exactly as it was)
+        # state (its mode included, while the branch holds no file of that other mode's): the run that found it so
+        # wrote it back from the state it opened, and saved that state as it is (nothing replaced: the state on the
+        # branch stays exactly as it was)
         said.append(f"{COIN}/status.json written back beside the branch's {COIN}/{state}, which is unchanged")
         return said
     if old is None:
@@ -589,12 +607,6 @@ def check(state_dir: str | Path, remote_ref: str | None = None, branch=None, loa
                 f": not replacing the state blind. The next run that opens the state writes the status back; or put "
                 f"{COIN}/status.json back as it was (revert the commit that changed it), or delete the coinbase-state "
                 f"branch to start over")
-        prev = f"{COIN}/state-{mode}.prev.enc.json"
-        if b.show(prev) is not None:
-            raise StateCheckError(f"the branch has {prev} but neither {COIN}/{state} nor a status.json the desk can "
-                                  f"read (deleted?): not starting a new state over the record. Put them back as they "
-                                  f"were (revert the commit that deleted them), or delete the coinbase-state branch to "
-                                  f"start over")
         said.append("no saved state on the branch: a first save" + (
             " (its status.json wasn't one the desk wrote)" if unreadable else ""))
         return said

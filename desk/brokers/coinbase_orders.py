@@ -292,13 +292,16 @@ def parse_fill(f: dict) -> dict | None:
 
 
 def parse_permissions(resp: dict) -> dict:
-    """GET /key_permissions: {can_view, can_trade, can_transfer, portfolio_uuid, portfolio_type}. A missing flag is
-    read as the riskier answer for trade and transfer (True) and the safer one for view (False)."""
+    """GET /key_permissions: {can_view, can_trade, can_transfer, portfolio_uuid, portfolio_type}. Each of the three
+    flags must be there, true or false: one missing or of another type (a field Coinbase renamed, say) is an answer
+    the desk can't read (CoinbaseDataError, refused as that), never read as what the key can or can't do."""
     if not isinstance(resp, dict):
         raise CoinbaseDataError("Coinbase's key permissions answer isn't an object")
-    return {"can_view": resp.get("can_view") is True, "can_trade": resp.get("can_trade") is not False,
-            "can_transfer": resp.get("can_transfer") is not False, "portfolio_uuid": resp.get("portfolio_uuid"),
-            "portfolio_type": resp.get("portfolio_type")}
+    odd = [k for k in ("can_view", "can_trade", "can_transfer") if not isinstance(resp.get(k), bool)]
+    if odd:
+        raise CoinbaseDataError(f"Coinbase's key permissions answer has no true or false for {', '.join(odd)}")
+    return {"can_view": resp["can_view"], "can_trade": resp["can_trade"], "can_transfer": resp["can_transfer"],
+            "portfolio_uuid": resp.get("portfolio_uuid"), "portfolio_type": resp.get("portfolio_type")}
 
 
 # ---------------------------------------------------------------- money in and out (the v2 USD wallet)

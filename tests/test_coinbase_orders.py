@@ -172,8 +172,15 @@ def test_internal_moves_are_not_flows_and_anything_unclear_is_refused():
         ["final", "candidate", "candidate", "void", "void", "void", "unknown"]
 
 
-def test_key_permissions_read_a_missing_flag_as_the_riskier_answer():
-    assert co.parse_permissions({"can_view": True}) == {"can_view": True, "can_trade": True, "can_transfer": True,
-                                                        "portfolio_uuid": None, "portfolio_type": None}
+def test_key_permissions_with_a_flag_missing_or_not_a_boolean_is_an_answer_it_cant_read():
+    """Round 8: a missing or odd flag (a field Coinbase renamed, say) was read as an answer (can't View, or can trade),
+    and SHADOW told you to make a new key, which would never help. Now it's an answer the desk can't read."""
+    for odd in ({"can_view": True}, {"can_view": "maybe", "can_trade": False, "can_transfer": False},
+                {"can_view": True, "can_trade": 0, "can_transfer": False},
+                {"can_view": True, "can_trade": False, "can_transfer": None}, {"portfolio_uuid": 7}):
+        with pytest.raises(CoinbaseDataError, match="no true or false"):
+            co.parse_permissions(odd)
     assert co.parse_permissions({"can_view": True, "can_trade": False, "can_transfer": False,
-                                 "portfolio_type": "DEFAULT"})["can_trade"] is False
+                                 "portfolio_type": "DEFAULT"}) == {"can_view": True, "can_trade": False,
+                                                                   "can_transfer": False, "portfolio_uuid": None,
+                                                                   "portfolio_type": "DEFAULT"}

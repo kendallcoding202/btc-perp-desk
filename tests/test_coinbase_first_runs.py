@@ -238,7 +238,7 @@ def test_the_shadow_page_says_the_status_is_missing_when_only_the_board_is_there
                                     text=True, timeout=60, check=True).stdout)
     assert "NOT SAVED: the SHADOW status is missing from the coinbase-state branch" in out["gone"]
     assert "delete the coinbase-state branch to start over" in out["gone"] and "secrets are set" not in out["gone"]
-    assert "No SHADOW status yet" in out["none"]
+    assert "No SHADOW status on the coinbase-state branch" in out["none"]
     assert "no run has worked yet" in out["zero"] and "run 0" not in out["zero"]
 
 

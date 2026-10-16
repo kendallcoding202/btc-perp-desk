@@ -48,6 +48,7 @@ class Branch:
         self.said: list[list[str]] = []
         self.errors: list[str] = []
         self.loaded: str | None = None
+        self.clock = None               # set (the fake's clock): each commit is dated by it, as GitHub's are by now
 
     def files(self) -> dict:
         out = _git("ls-tree", "-r", "--name-only", REF, cwd=self.repo, check=False).stdout.split()
@@ -75,11 +76,14 @@ class Branch:
         if idx.exists():
             idx.unlink()
         env = {**os.environ, "GIT_INDEX_FILE": str(idx)}
+        if self.clock is not None:
+            when = f"{int(self.clock())} +0000"
+            env.update(GIT_COMMITTER_DATE=when, GIT_AUTHOR_DATE=when)
         subprocess.run(["git", "--work-tree", str(work), "add", "-A", "-f", "."], cwd=self.repo, env=env, check=True)
         tree = subprocess.run(["git", "write-tree"], cwd=self.repo, env=env, capture_output=True, text=True,
                               check=True).stdout.strip()
         c = subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@x.invalid", "commit-tree", tree, "-m", "s"],
-                           cwd=self.repo, capture_output=True, text=True, check=True).stdout.strip()
+                           cwd=self.repo, env=env, capture_output=True, text=True, check=True).stdout.strip()
         _git("update-ref", REF, c, cwd=self.repo)
 
     def save(self, state_dir: Path) -> bool:

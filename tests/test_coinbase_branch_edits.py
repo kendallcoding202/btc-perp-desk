@@ -10,7 +10,8 @@ the state dir, as the workflow writes it). Each fails on the code before it (4c0
 - the state and the status deleted together, the state before the last still there: a new state opened silently, over
   SHADOW's record (each save replaces the branch's one commit, so the deleted files left its history too). Now every
   run is refused, nothing written, until you put them back (or delete the branch), and the save check refuses it too;
-- every file deleted: SHADOW started over silently ("connected (read only)"). Now it says it started over.
+- every file deleted: SHADOW started over silently ("connected (read only)"). Now it says its record starts from that
+  run (round 8: "started over" only while the branch shows SHADOW worked there).
 
 Everything runs against the local fake Coinbase (tests/fake_coinbase.py) on 127.0.0.1; every key is a fresh fake."""
 
@@ -189,8 +190,11 @@ def test_every_file_deleted_starts_over_and_says_so(worked):
     assert br.files() == {}
     code, r, saved = _run(job)
     assert code == 0 and saved and job.status()["runs"] == 1
-    assert _titles(sh) == ["BTC SHADOW: connected, started over (read only)"], _titles(sh)   # before: "connected"
-    assert "started a new state" in sh.pushes[0][1] and "starts again" in sh.pushes[0][1]
+    # round 8: with nothing left on the branch to show SHADOW worked there, it isn't called a start over (a branch you
+    # made yourself looks the same), but the push says SHADOW's record starts from this run. With its board left, it's
+    # "started over" (tests/test_coinbase_deleted_record.py)
+    assert _titles(sh) == ["BTC SHADOW: connected (read only)"], _titles(sh)
+    assert "SHADOW's record (the 14 days LIVE needs) starts from this run" in sh.pushes[0][1]
     _next(fake)
     code, r, saved = _run(job)
     assert code == 0 and saved and _titles(sh) == [] and job.status()["runs"] == 2

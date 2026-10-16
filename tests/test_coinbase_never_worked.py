@@ -143,7 +143,7 @@ def test_first_run_failing_after_the_key_passed_then_desk_state_key_changed(firs
     got = [b for t, b, *_ in sh.pushes if t == "BTC SHADOW: not working"]
     assert got and got[0].startswith("SHADOW stopped part way this run:") and "DESK_STATE_KEY can still change" in \
         got[0], got
-    assert "stopped (read) part way" in r.public_line() and "only its status is saved" in r.public_line()
+    assert "stopped (read) part way" in r.public_line() and "its status and its board are saved" in r.public_line()
     new = "a-new-password-for-shadow-" + "n" * 20
     _next(fake)
     code, r, saved = _run(job, {**GH, "DESK_STATE_KEY": new})

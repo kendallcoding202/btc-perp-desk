@@ -82,6 +82,7 @@ PUSH_EVERY_MS = 6 * 3600_000
 PUSH_WINDOW_MS = 35 * 60_000        # a refusal with no state to remember a push in: pushed again while the clock is in
                                     # the first 35 minutes of a 6-hour block (the :04 and :19 runs land ~:10 and ~:25)
 FRESH_STATUS_MS = 25 * 60_000       # saved this recently: the run before this one saved (runs are 15 minutes apart)
+COMMIT_SKEW_MS = 5 * 60_000         # a commit dated up to this far ahead of the runner's clock is still "now"
 HEALTH_DAYS = 30
 LOG_KEEP = 400
 FIRST_FILLS_MS = 30 * 86400_000
@@ -125,6 +126,12 @@ def failure(exc, mode: str) -> tuple[str, str, str]:
     if isinstance(exc, CoinbaseUnavailable):
         return "read", "Coinbase didn't answer part of the run (the next run tries again)", \
             f"Coinbase didn't answer ({name})"
+    short = next((said for word, said in FEED_SHORT if word in str(exc)), None) if isinstance(exc, FeedError) else None
+    if short:
+        # a market that was empty, or an answer that came back short: Coinbase's, for now, not a change the desk's
+        # code needs to follow
+        return "read", "Coinbase's answer was incomplete, or its market was empty (the next run tries again)", \
+            f"{short} ({name})"
     if isinstance(exc, (CoinbaseDataError, FeedError)):
         return "read", f"Coinbase's answer couldn't be read (the reason is on {where}; the next run tries again)", \
             f"Coinbase answered, but in a shape the desk can't read ({name})"
@@ -188,6 +195,18 @@ UNWORKED_PUBLIC = {"read": "a read from Coinbase failed (the reason is on your p
                    "error": "SHADOW hit an error of its own, not Coinbase's (the reason is on your phone and the "
                             "SHADOW page; the next run tries again)",
                    "key": "a secret isn't set right"}
+# the public phrase of a run refused because SHADOW's state and status were deleted beside the state before the last
+# (record_deleted: nothing is written, so it's only said in the job's log line and on your phone)
+RECORD_GONE = ("SHADOW's state and status were deleted from the coinbase-state branch (put them back, or delete the "
+               "branch to start over)")
+# FeedError's market conditions and short answers, as desk/feeds/coinbase.py says them: a market that was empty, or an
+# answer that came back short, not an answer in a shape the desk can't read. (word in its text, what it was, plainly)
+FEED_SHORT = (("candles missing from Coinbase's answer", "Coinbase's candles came back short (candles missing)"),
+              ("no candles", "Coinbase's candles came back short (no candles)"),
+              ("is empty on one side", "Coinbase's order book was empty on one side"),
+              ("has no book for", "Coinbase had no order book for the product"),
+              ("answers have no price", "Coinbase's answers had no price while its session reads closed"),
+              ("no funding rate", "Coinbase has no funding rate for the product yet"))
 # DESK_COINBASE_KILL (a repository variable) reads kills.json's switch words (coinbase_state.named_switches): flat,
 # close or flatten anywhere in it is flat_kill, entry (entries, no_entries) entry_kill, both can be set together; a
 # value with neither is entry_kill, alerted (failing closed)
@@ -723,7 +742,10 @@ class Run:
         self._urgent_kinds: set[str] = set()
         self.step = "starting"              # what the run is doing, in plain words: where an error stopped it
         self.status_wrote = False           # a refusal wrote the public status (refused_early)
-        self.started_over = False           # SHADOW: the branch had files of the desk's, but no state or status
+        self.started_over = False           # SHADOW: the branch shows SHADOW worked there, but has no state or status
+        self.no_state_found = False         # SHADOW: the branch was there, with no SHADOW state on it (a first save)
+        self.record_gone = False            # SHADOW: the state and its status deleted, the state before kept
+        self.board_sealed = False           # a refused run saved its board (refused_unworked)
         self.password: str | None = None
         self.now = int(clock() * 1000)
 
@@ -1128,8 +1150,7 @@ class Run:
             self.checks.add("decided", CHECKS["decided"], False, f"candles: {type(exc).__name__}")
             problem, public, what = failure(exc, self.mode)
             self.log(f"the candles or the book: {type(exc).__name__}: {exc}")
-            raise Stop(problem, f"Coinbase's candles or book couldn't be read: {what}", code=1, public=public) \
-                from None
+            raise Stop(problem, f"{what}, while reading the candles and the book", code=1, public=public) from None
         return vstate, rules, feed, bars, funding, ctx
 
     def mark(self, ctx) -> float:
@@ -1148,6 +1169,14 @@ class Run:
         try:
             password, _ = self.preflight()
         except Stop as s:
+            gone = self.record_deleted() if self.mode == "shadow" else None
+            if gone:
+                # the state and its status deleted beside the state before the last, and a secret wrong too: nothing
+                # is written (a status now, even one that says no run has worked, would let the next run start a new
+                # state over the record), and the push names both
+                return self.refused_early(Stop(gone.problem, f"{gone.text.rstrip('. ')}. And a secret is wrong too: "
+                                                             f"{s.text}", code=gone.code, public=gone.public),
+                                          status=False)
             return self.refused_early(s)
         try:
             bundle = open_bundle(paths["state"], password, self.mode)
@@ -1162,6 +1191,14 @@ class Run:
         if self.mode == "shadow" and bundle is None:
             gone = self.record_deleted()
             if gone:
+                try:        # the state before the last says whether DESK_STATE_KEY changed too (nothing else does now)
+                    open_bundle(self.dir / f"state-{self.mode}.prev.enc.json", password, self.mode)
+                except statebox.WrongKey:
+                    gone = Stop(gone.problem, f"{gone.text}. And DESK_STATE_KEY doesn't open the state before the last "
+                                              f"either: it changed since SHADOW last saved, so put the old password "
+                                              f"back too", code=gone.code, public=gone.public)
+                except (ValueError, OSError):       # statebox.BoxError included: said by the refusal as it is
+                    pass
                 return self.refused_early(gone, status=False)
             self.started_over = self.branch_emptied()
         work = Path(tempfile.mkdtemp(prefix=f"desk-{self.mode}-"))
@@ -1287,6 +1324,7 @@ class Run:
         if keep and self.status_wrote and self.password:
             try:
                 self.seal_board(self.password, False)
+                self.board_sealed = True
             except (OSError, statebox.BoxError) as exc:
                 self.log(f"the board couldn't be written ({type(exc).__name__})")
         return code
@@ -1312,7 +1350,16 @@ class Run:
         except Exception:           # noqa: BLE001 (any file the desk didn't write: read as unreadable)
             return "unreadable"
         m = saved_meta or {}
-        if st["mode"] == self.mode.upper() and m.get("started_ts") is not None:
+        if st["mode"] != self.mode.upper():
+            # another mode's status beside this mode's state, with no file of that other mode's on the branch (its
+            # "mode" edited, to go LIVE say): the save check would refuse every save, as the branch's state being the
+            # other mode's
+            other = st["mode"].lower()
+            if not any(f"{COIN}/{kind}-{other}{suffix}" in tree for kind, suffix in
+                       (("state", ".enc.json"), ("state", ".prev.enc.json"), ("board", ".enc.json"))):
+                return "edited"
+            return None
+        if m.get("started_ts") is not None:
             try:
                 if int(st["started_ts"]) != int(m["started_ts"]) or int(st["runs"]) > int(m.get("runs") or 0):
                     return "edited"
@@ -1344,8 +1391,8 @@ class Run:
 
     STATUS_TROUBLE = {"missing": "isn't on the coinbase-state branch (deleted?)",
                       "unreadable": "on the coinbase-state branch isn't one the desk wrote (edited, or not JSON)",
-                      "edited": "on the coinbase-state branch doesn't match the saved state (edited? its start or its "
-                                "runs differ)"}
+                      "edited": "on the coinbase-state branch doesn't match the saved state (edited? its mode, its "
+                                "start or its runs differ)"}
 
     def status_written_back(self, why: str = "missing") -> int:
         """SHADOW, BTC/status.json missing, unreadable or edited beside the state it just opened: this run writes the
@@ -1360,6 +1407,7 @@ class Run:
         self.problem, self.code, self.public_why = s.problem, s.code, s.public
         self.log(f"refused: {s.text}")
         wrote = self.status_only(s, counts=self.meta)
+        self.status_wrote = bool(wrote)
         github_output(wrote, self.env)
         self.changed = False
         self.public_note = s.text
@@ -1383,28 +1431,54 @@ class Run:
         prev = f"{COIN}/state-{self.mode}.prev.enc.json"
         if prev not in tree or f"{COIN}/state-{self.mode}.enc.json" in tree or not self.from_load_step():
             return None
-        st = self.saved_status()
-        try:
-            if st is not None and coinbase_state.check_status(dict(st)) and st.get("mode") != "LIVE":
-                return None             # a status of SHADOW's: the save check refuses a new state beside it
-        except coinbase_state.StateCheckError:
-            pass
+        if self.status_of_a_record():
+            return None                 # a status of SHADOW's: the save check refuses a new state beside it
+        self.record_gone = True
         return Stop("state", f"{COIN}/state-{self.mode}.enc.json and {COIN}/status.json aren't on the coinbase-state "
                              f"branch (deleted?), but the state before them is ({prev}): SHADOW doesn't start a new "
                              f"state over its record. Put them back as they were (revert the commit that deleted them: "
                              f"until a run saves, the branch's history has them), or delete the coinbase-state branch "
-                             f"to start over", code=2)
+                             f"to start over", code=2, public=RECORD_GONE)
+
+    def status_of_a_record(self) -> bool:
+        """BTC/status.json as loaded is a SHADOW status the desk can read, of an account that has had runs: it keeps
+        the record (its start, its runs), so the save check refuses a new state beside it. A status that says no run
+        has worked yet (runs 0: saved beside a deleted record by a run refused over a secret) isn't one: SHADOW had
+        runs here, or the state before the last wouldn't be on the branch."""
+        st = self.saved_status()
+        try:
+            return st is not None and bool(coinbase_state.check_status(dict(st))) and st.get("mode") != "LIVE" and \
+                int(st.get("runs") or 0) > 0
+        except (coinbase_state.StateCheckError, TypeError, ValueError):
+            return False
 
     def branch_emptied(self) -> bool:
-        """SHADOW, no state on the branch as loaded and no status.json the desk can read (and nothing record_deleted
-        refuses over), but the branch is there (the load step's marker beside the state dir names the commit it
-        loaded) or holds files of the desk's: every SHADOW file on it was deleted. This run starts a new state, as it
-        does once the branch is deleted, and says so (started over)."""
+        """SHADOW, no state and no status on the branch as loaded (and nothing record_deleted refuses over), but the
+        branch is there (the load step's marker beside the state dir names the commit it loaded): this run's state is
+        a first save there (no_state_found: its push says SHADOW's record starts from this run). It's a start over
+        (said so) only when the branch shows SHADOW worked there before: a board of a run that worked (opened with
+        DESK_STATE_KEY), or the desk's own kill record (BTC/kills.desk.json). A branch you made yourself (only your
+        kills.json or a note on it), or one where SHADOW never worked, is no start over."""
         b = self.branch_loaded()
         tree = b.tree()
         if f"{COIN}/state-{self.mode}.enc.json" in tree or self.saved_status() is not None:
             return False
-        return bool(self.load_marker()) or any(coinbase_state.desks_own(p) for p in tree)
+        self.no_state_found = bool(self.load_marker()) or any(coinbase_state.desks_own(p) for p in tree)
+        if not self.no_state_found:
+            return False
+        return coinbase_state.DESK_KILLS in tree or self.board_worked()
+
+    def board_worked(self) -> bool:
+        """The branch's board (as loaded) is a board of a run that worked (it has numbers: its "updated"), opened with
+        this run's DESK_STATE_KEY. False: none, a board of a run that never worked, or one the key doesn't open."""
+        raw = self.branch_loaded().show(f"{COIN}/board-{self.mode}.enc.json")
+        if raw is None or not self.password:
+            return False
+        try:
+            board = statebox.open_json(raw.decode(), self.password, statebox.board_aad(self.mode))
+            return bool((board or {}).get("updated"))
+        except (ValueError, TypeError, AttributeError):        # statebox.BoxError (a wrong key) included
+            return False
 
     def in_window(self) -> bool:
         return self.now % PUSH_EVERY_MS < PUSH_WINDOW_MS
@@ -1425,12 +1499,15 @@ class Run:
         loaded (BTC/status.json, plain, readable without DESK_STATE_KEY) is the memo. A refusal that writes itself
         there (status_only: over a secret, or before SHADOW ever worked) is news when the loaded status doesn't show it
         yet (an OK one, another reason, or none). Any other refusal writes nothing: it's news when the loaded status
-        was saved by the run before. With no status at all, a refusal that writes nothing is news when the branch's
-        board (which DESK_STATE_KEY opens) says the last save was the run before's."""
+        was saved by the run before. With no status at all (deleted, say), or for the state and its status deleted
+        (record_deleted), a refusal that writes nothing is news when the branch changed just before this run
+        (branch_fresh: the run before saved, or your commit is that recent)."""
         wrote = s.problem == "key" if wrote is None else wrote
         st = self.saved_status()
+        if self.record_gone:
+            return self.branch_fresh()
         if not st:
-            return wrote or 0 < self.now - self.board_checked() < FRESH_STATUS_MS
+            return wrote or self.branch_fresh()
         if st.get("mode") != self.mode.upper():
             return False
         if wrote:
@@ -1467,6 +1544,32 @@ class Run:
             self.push(f"{COIN} {self.mode.upper()}: not working",
                       f"{self.mode.upper()} {lead}: {s.text.rstrip('. ')}. Nothing was sent.{gone} Paper is "
                       f"unaffected.", "high", "warning")
+
+    def branch_fresh(self) -> bool:
+        """The coinbase-state branch changed within FRESH_STATUS_MS of this run, so this is the first run (or the
+        second) to find it as it is: the board as loaded says its run saved that recently (opened with DESK_STATE_KEY),
+        or the commit the load step extracted was made that recently (git's own time for it, readable without the key:
+        your commit deleting a file, or the run before's save). A refusal that writes nothing has no other memo."""
+        if 0 < self.now - self.board_checked() < FRESH_STATUS_MS:
+            return True
+        made = self.loaded_commit_ms()
+        return made is not None and -COMMIT_SKEW_MS < self.now - made < FRESH_STATUS_MS
+
+    def loaded_commit_ms(self) -> int | None:
+        """When the commit the load step extracted (its marker, $RUNNER_TEMP/cb.loaded) was made, by git's committer
+        time, in ms: None when there's no branch or git can't say. The workflow's load step fetched that commit into
+        the checkout this run is in."""
+        sha = self.load_marker() or ""
+        if not re.fullmatch(r"[0-9a-f]{7,64}", sha):
+            return None
+        import subprocess
+
+        try:
+            out = subprocess.run(["git", "show", "-s", "--format=%ct", sha, "--"], capture_output=True, text=True,
+                                 timeout=30)
+            return int(out.stdout.strip()) * 1000 if out.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
 
     def board_checked(self) -> int:
         """When the branch's board (as loaded) says its run was saved, opened with this run's DESK_STATE_KEY: 0 when
@@ -1586,9 +1689,11 @@ class Run:
         news = (self.account.get("problem"), self.account.get("problem_note")) != (self.problem, self.public_why)
         if first or news or self.now - int(memo.get("not_working") or 0) >= PUSH_EVERY_MS:
             memo["not_working"] = self.now
+            # (before the key passed, the account wasn't read: the run didn't get as far as running)
+            lead = "stopped part way this run" if self.key_passed else "didn't run"
             self.push(f"{COIN} {self.mode.upper()}: not working",
-                      f"{self.mode.upper()} stopped part way this run: {why.rstrip('. ')}. {self.sent_note()} Paper is "
-                      f"unaffected.", "high", "warning")
+                      f"{self.mode.upper()} {lead}: {why.rstrip('. ')}. {self.sent_note()} Paper is unaffected.",
+                      "high", "warning")
 
     def body(self, work: Path, password: str, saved_desk: dict) -> None:
         self.work = work
@@ -2003,9 +2108,7 @@ class Run:
         if getattr(getattr(self, "shot", None), "unexplained", False):
             health(self.account, now, unexplained=1)
         first_ok = ok and not self.account.get("first_ok_ts")
-        before = self.saved_status() or {}         # the public status as loaded: the last saved run's
-        was_down = self.account.get("problem") or (before.get("mode") == self.mode.upper() and before.get("ok") is False
-                                                   and (before.get("problem") or before.get("note")))
+        was_down = self.stopped_before()
         self.account["last_run_ts"] = now
         self.account["problem"] = self.problem
         self.account["problem_note"] = None if ok else self.public_why     # the reason as said: a new one is news
@@ -2031,16 +2134,18 @@ class Run:
         if ok and was_down and not first_ok and not self.save_refused_why:
             bad = [r["label"] for r in self.checks.ordered() if r["ok"] is False]
             self.push(f"{COIN} {self.mode.upper()}: working again",
-                      f"{self.mode.upper()} ran and saved this run (the runs before had stopped: "
-                      f"{before.get('note') or was_down})."
+                      f"{self.mode.upper()} ran and saved this run. The runs before had stopped: {was_down}."
                       + (f" Not every read was OK: {'; '.join(bad)} failed (the board says why)." if bad else "")
                       + f" {self.sent_note()}", "default", "white_check_mark")
         if first_ok and not self.save_refused_why:
             # (a first run whose save will be refused, a state deleted on the branch say, is no start: NOT SAVED says
             # why, and its "connected" would come again at every run, none of them saved)
-            over = (f"SHADOW found no state and no status on the coinbase-state branch, though the branch is there "
-                    f"(were its files deleted?), so it started a new state, as it does once the branch is deleted: its "
-                    f"record for LIVE (14 days of SHADOW) starts again from this run.\n\n") if self.started_over else ""
+            over = (f"SHADOW's state and status are gone from the coinbase-state branch, though SHADOW had worked "
+                    f"there (its board or its kill record is still there), so it started a new state, as it does once "
+                    f"the branch is deleted: its record for LIVE (14 days of SHADOW) starts again from this run.\n\n"
+                    if self.started_over else
+                    f"No SHADOW state was on the coinbase-state branch, so SHADOW's record (the 14 days LIVE needs) "
+                    f"starts from this run.\n\n" if self.no_state_found else "")
             self.push(f"{COIN} SHADOW: connected, started over (read only)" if self.started_over else
                       f"{COIN} {self.mode.upper()}: connected (read only)" if self.mode == "shadow" else
                       f"{COIN} LIVE: armed and connected",
@@ -2052,6 +2157,31 @@ class Run:
         if len(self.push_failures) > failed0:
             self.seal(work, password, ok)       # a push that didn't go out after the seal: in the log and board too
         self.public_note = "" if ok else (self.problem or "")
+
+    def stopped_before(self) -> str | None:
+        """Why the runs before this one stopped, in plain words (no parenthesis), or None: they didn't. The saved
+        state's own record (its last run stopped part way), or the public status as loaded when a run after the
+        state's last refused and saved only that status (a secret wrong for a while, say: it's newer than the state's
+        last run). A status you edited (its "ok" set to false, a note of yours) isn't a run's, so it's never said as
+        one."""
+        before = self.saved_status() or {}
+        try:
+            after = before.get("mode") == self.mode.upper() and before.get("ok") is False and \
+                before.get("problem") in coinbase_state.PROBLEMS - {None} and \
+                int(before.get("updated") or 0) > int(getattr(self, "saved_run_ts", 0) or 0)
+        except (TypeError, ValueError):
+            after = False
+        if after and before.get("note") == STATUS_BACK:
+            said = f"{COIN}/status.json was missing or edited on the coinbase-state branch, and the run before " \
+                   f"wrote it back"
+        elif after:
+            said = before.get("note") or UNWORKED_PUBLIC.get(before["problem"]) or before["problem"]
+        elif self.account.get("problem"):
+            problem = self.account["problem"]
+            said = self.account.get("problem_note") or UNWORKED_PUBLIC.get(problem) or problem
+        else:
+            return None
+        return re.sub(r"\s*\([^()]*\)\s*$", "", str(said)) or str(said)
 
     def seal(self, work: Path, password: str, ok: bool) -> None:
         """This run's state and board, encrypted (statebox), with its log as it stands."""
@@ -2209,9 +2339,16 @@ class Run:
         if not self.changed:
             why = self.public_why or self.problem or "error"
             what = "" if self.problem in (None, "key") else f" ({self.problem})"     # the key's own: auth, permissions
-            if self.key_passed:         # a SHADOW that never worked, stopped part way: its status alone
-                return (f"{m} BTC: stopped{what} part way: {why} (it hasn't had a run that works yet: only its status "
-                        f"is saved, no state; nothing sent)")
+            kept = ("its status and its board are saved" if self.board_sealed else "only its status is saved") \
+                if self.status_wrote else "nothing is saved"
+            if self.record_gone:        # the state deleted: nothing about it is "unchanged"
+                return f"{m} BTC: refused{what} before reading the account: {why} (nothing read, sent or saved)"
+            if self.key_passed:         # a SHADOW that never worked, stopped part way: its status (and board)
+                return (f"{m} BTC: stopped{what} part way: {why} (it hasn't had a run that works yet: {kept}, no "
+                        f"state; nothing sent)")
+            if f"{COIN}/state-{self.mode}.enc.json" not in self.branch_loaded().tree():
+                return (f"{m} BTC: refused{what} before reading the account: {why} (nothing read or sent; {kept}, no "
+                        f"state)")
             return (f"{m} BTC: refused{what} before reading the account: {why} (nothing read or sent; the state is "
                     f"unchanged)")
         if self.public_why and self.problem:

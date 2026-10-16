@@ -71,7 +71,7 @@ def test_the_page_opens_the_encrypted_board_with_webcrypto_and_renders_it(tmp_pa
         assert "undefined" not in text and "NaN" not in text
     assert "REAL ACCOUNT (COINBASE)" in out["html"] and "SHADOW (EST.)" in out["html"] and "NONE SENT" in out["html"]
     assert "View only" in out["status"] and "OK" in out["status"] and "NOT UPDATED" in out["stale"]
-    assert "No SHADOW status yet" in out["none"]
+    assert "No SHADOW status on the coinbase-state branch" in out["none"]
     # a run that's OK can still have something to say (an unreadable kills.json): the status shows it
     assert "OK" in out["noted"] and "kills.json on the coinbase-state branch can't be read" in out["noted"]
 
