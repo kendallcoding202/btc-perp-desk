@@ -8,11 +8,13 @@ says is always what the desk actually thought.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import indicators as ind
+from . import mountain
 from . import venue as venue_mod
 from .models import Verdict
 from .thresholds import EXPERIMENTS, report_name
@@ -36,6 +38,56 @@ def _usd(x: float | None, dp: int | None = None) -> str:
     if dp is None:
         dp = 0 if abs(x) >= 1000 else 2
     return f"${x:,.{dp}f}"
+
+
+# ---- Mountain Time ------------------------------------------------------------------------------------------------
+# The owner reads every time in Mountain Time (desk/mountain.py: America/Denver's own rules, MDT in summer, MST in
+# winter). The desk's own words keep UTC (they're in the ledger, which never changes for this); the board's copy of
+# them, and every time the board writes itself, say MT. Stored timestamps stay epoch ms.
+_UTC_STAMP = re.compile(r"\b(\d{4}-\d{2}-\d{2}) (\d{2}):(\d{2}) UTC\b")      # "2026-10-12 22:00 UTC"
+_UTC_CLOCK = re.compile(r"\b(\d{2}):(\d{2}) UTC\b")                           # "reopens 23:00 UTC"
+_UTC_TOMORROW = re.compile(r"\buntil tomorrow UTC\b")                         # the daily loss limit's day
+_DAY_MS = 86400_000
+
+
+def day_turns(ms: int) -> str:
+    """When the desk's day turns after `ms` (00:00 UTC: the daily loss limit's day, VT's daily close), as Mountain
+    Time: "6:00 pm MT" while Denver is on MDT, "5:00 pm MT" on MST."""
+    return mountain.clock((ms // _DAY_MS + 1) * _DAY_MS)
+
+
+def in_mountain_time(text, ref_ms: int):
+    """A board string's UTC times, as Mountain Time: "the 2026-10-12 22:00 UTC candle" -> "the Oct 12, 4:00 pm MT
+    candle"; a time of day with no date ("reopens 23:00 UTC", "the next 00:00 UTC close") is the first one at or after
+    `ref_ms` (when the text was said: they all look ahead), so it's right on either side of a clock change; "until
+    tomorrow UTC" -> "until the desk's day turns at 6:00 pm MT". Anything else is returned as it was."""
+    if not isinstance(text, str) or "UTC" not in text:
+        return text
+
+    def stamp(m):
+        d = datetime.strptime(f"{m[1]} {m[2]}:{m[3]}", "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+        return mountain.when(int(d.timestamp() * 1000))
+
+    def clock(m):
+        t = ref_ms // _DAY_MS * _DAY_MS + (int(m[1]) * 60 + int(m[2])) * 60_000
+        return mountain.clock(t if t >= ref_ms else t + _DAY_MS)
+
+    text = _UTC_STAMP.sub(stamp, text)
+    text = _UTC_TOMORROW.sub(lambda m: f"until the desk's day turns at {day_turns(ref_ms)}", text)
+    return _UTC_CLOCK.sub(clock, text)
+
+
+def events(evs) -> list[dict]:
+    """Desk events as the board and the phone show them: their words with the times in Mountain Time."""
+    return [{"ts": e.ts, "agent": e.agent, "text": in_mountain_time(e.text, e.ts)} for e in evs]
+
+
+def _gate_row(g, now_ms: int) -> dict:
+    """A gate as the board shows it: its note's times in Mountain Time (a closure's reopening, say)."""
+    d = g.as_dict()
+    if d.get("note"):
+        d["note"] = in_mountain_time(d["note"], now_ms)
+    return d
 
 
 def _gate(decision, name):
@@ -184,7 +236,6 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
     bar = bars[i]
     price = ctx.mid if ctx and ctx.mid else bar.close
     now_ms = now_ms or (bar.ts + f.bar_ms)
-    now = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc)
     equity = broker.equity(price)
     pos = broker.position
     trades = broker.trades
@@ -267,7 +318,7 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
             f" margin {_usd(vrules.margin_in_use(pos.qty, price, pos.side.sign))} overnight." if vrules else "")
         size_val = _usd(notional)
     elif skip is not None:
-        quotes["size"], size_val = f"skipped: {skip.note}.", "SKIP"
+        quotes["size"], size_val = f"skipped: {in_mountain_time(skip.note, now_ms)}.", "SKIP"
     elif dec and dec.qty and vrules is not None:     # whole contracts: what they risk, not the budget they fit in
         d = abs(bar.close - dec.stop)
         eq_dec = dec.notional / dec.leverage if dec.leverage else equity
@@ -302,7 +353,8 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
     if r.halted:
         quotes["risk"], risk_state = f"HALTED. {r.halt_reason}. a human resets this, not me.", "blocked"
     elif desk.day_locked:
-        quotes["risk"], risk_state = "daily loss limit hit. flat until tomorrow UTC.", "blocked"
+        quotes["risk"], risk_state = f"daily loss limit hit. flat until the desk's day turns at {day_turns(now_ms)}.", \
+            "blocked"
     elif pos:
         dist = abs(price - pos.stop) / price
         quotes["risk"] = f"stop {_usd(pos.stop)}, {dist:.1%} away, trailing {p.strategy.trail_atr:g} ATR."
@@ -350,7 +402,7 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
             thr_rows.append({
                 "section": "SOFT" if g.name in ("trend_strength", "efficiency", "momentum_already_spent", "crowding")
                 or g.owner == "jev" else ("KILL" if g.owner in ("risk", "chief") else "HARD"),
-                **g.as_dict()})
+                **_gate_row(g, now_ms)})
 
     curve = _thin(desk.equity_curve, 400)
     k = desk.kills
@@ -365,7 +417,7 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
                         f"{mode.upper()} · SIMULATED ON {vrules.spec.name.upper()} RULES · NO ORDERS SENT"),
             "shorts": p.strategy.allow_shorts, "experiment": EXPERIMENTS.get(coin),
             "mode": mode.upper(), "venue": p.market.venue, "interval": p.market.interval,
-            "day": day_n, "date": now.strftime("%b %d").upper(), "time": now.strftime("%H:%M"),
+            "day": day_n, "date": mountain.day(now_ms).upper(), "time": mountain.clock(now_ms, label=False),
         },
         "ticker": {
             "price": price, "change_24h": chg_24h, "bank": equity, "pnl": equity - start_eq,
@@ -394,7 +446,7 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
                 "open_interest_usd": ctx.open_interest_usd if ctx else None,
                 "spread_bps": ctx.spread_bps if ctx else None, "depth_usd": ctx.depth_usd if ctx else None,
             },
-            "gates": [g.as_dict() for g in dec.gates] if dec else [],
+            "gates": [_gate_row(g, now_ms) for g in dec.gates] if dec else [],
             "outlook": trigger_outlook(f, i, p.strategy.breakout_bars, short=dec.direction.sign < 0)
             if (pos is None and dec is not None and (dec.direction.sign > 0 or shorts)) else [],
             "outlook_side": "short" if dec is not None and dec.direction.sign < 0 else "long",
@@ -409,7 +461,7 @@ def build(desk, f: ind.Features, i: int, *, mode: str, ctx=None, crawler: dict |
             "mode": p.jev.mode, "enabled": bool(jev_client and jev_client.enabled) and not k.jev_kill,
             "calls": getattr(jev_client, "calls", 0), "answers": dec.jev_answers if dec else None,
         },
-        "events": [{"ts": e.ts, "agent": e.agent, "text": e.text} for e in list(desk.events)[-30:]],
+        "events": events(list(desk.events)[-30:]),
         "rules": rules(p),
     }, flows, equity, now_ms)
     if vrules is not None:      # only an account with venue rules: the other boards are as they were
@@ -464,9 +516,14 @@ def venue_block(desk, f, i: int, price: float, equity: float, now_ms: int, venue
         "closed_now": closed_now,
         "waiting_for": vs.get("waiting_for"),      # a missing Coinbase candle the bars from it on wait for
         "stop_fill": "stops simulated as filled at the stop (Coinbase: stop-limit, which can miss in a fast market)",
-        "skipping": None if skip is None else {"gate": skip.name, "note": skip.note},
-        "skipped": dict(memo.get("skipped", {})), "last_skip": memo.get("last_skip"),
+        "skipping": None if skip is None else {"gate": skip.name, "note": in_mountain_time(skip.note, now_ms)},
+        "skipped": dict(memo.get("skipped", {})), "last_skip": _last_skip(memo.get("last_skip")),
     }
+
+
+def _last_skip(rec: dict | None) -> dict | None:
+    """The venue's last skipped entry ({ts, gate, note}), its note's times in Mountain Time."""
+    return None if not rec else {**rec, "note": in_mountain_time(rec.get("note"), rec.get("ts") or 0)}
 
 
 def with_flows(state: dict, flows, equity: float, now_ms: int) -> dict:
@@ -490,7 +547,6 @@ def basket(book, *, now_ms: int, marks: dict[str, float], meta: dict, crawler: d
     decided_ts None, so the table isn't empty until the first decision."""
     vt = book.vt
     day_ms = 86400_000
-    now = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc)
     equity = book.equity(marks)
     start_eq = meta.get("start_equity", vt.starting_equity)
     holdings = []
@@ -522,8 +578,8 @@ def basket(book, *, now_ms: int, marks: dict[str, float], meta: dict, crawler: d
             "tagline": f"{' · '.join(vt.coins)} · A THIRD EACH · LONG ABOVE THE {vt.sma_bars}-DAY AVERAGE",
             "experiment": EXPERIMENTS.get("VT"), "risk_per_trade": None, "shorts": False,
             "mode": "PAPER", "venue": "hyperliquid", "interval": vt.interval,
-            "day": int((now_ms - started) / day_ms) + 1, "date": now.strftime("%b %d").upper(),
-            "time": now.strftime("%H:%M"),
+            "day": int((now_ms - started) / day_ms) + 1, "date": mountain.day(now_ms).upper(),
+            "time": mountain.clock(now_ms, label=False),
         },
         "ticker": {
             "price": None, "change_24h": None, "bank": equity, "pnl": equity - start_eq,
@@ -546,7 +602,7 @@ def basket(book, *, now_ms: int, marks: dict[str, float], meta: dict, crawler: d
         "equity": [[ts, round(eq, 2)] for ts, eq in _thin(book.equity_curve, equity_points)],
         "pnl_bars": [round(t["net_pnl"], 2) for t in book.trades[-80:]],
         "goal": goal(equity, start_eq, vt.goal_equity, goal_pace, (now_ms - started) / day_ms, flows, now_ms),
-        "events": [{"ts": e.ts, "agent": e.agent, "text": e.text} for e in list(book.events)[-30:]],
+        "events": events(list(book.events)[-30:]),
         # what the desk boards have and the basket doesn't
         "agents": [],
         "chart": {"candles": [], "ema_fast": [], "ema_slow": [], "don_hi": [], "don_lo": [], "stop": None,

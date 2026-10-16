@@ -2,7 +2,7 @@
 //
 // Everything that moves here is tied to one of four real things. Nothing moves on a timer of its own:
 //   (a) the last desk run: its board (boards/<ACC>.json, built by desk/board.py), replayed in the order the desk
-//       ran its steps, always labelled "REPLAY · LAST RUN hh:mm UTC";
+//       ran its steps, always labelled "REPLAY · LAST RUN h:mm PM MT";
 //   (b) a live price, fetched in this browser by app.js ("desk:tick", which names its source): Hyperliquid's allMids
 //       every 5 s; on BTC's Coinbase tab, Coinbase's own feed while it's fresh (about once a second), else
 //       Hyperliquid's BTC as a proxy, named as one, and none while Coinbase is closed (as the last run found it, or
@@ -53,7 +53,7 @@
   // filter.py's KILLS: a brake that holds every new entry, whatever the price does (desk/engine.py kill_gates)
   const BRAKE = {
     drawdown_halt: ["drawdown halt", "until a human resets it"],
-    daily_loss: ["daily loss lock", "until the next UTC day"],
+    daily_loss: ["daily loss lock", "until the desk's day turns at {turn}"],
     cooldown: ["losing-streak cooldown", "until it ends"],
     flat_kill: ["flat kill switch on", "until it is switched off"],
     entry_kill: ["entry kill switch on", "until it is switched off"],
@@ -66,8 +66,12 @@
   const mid$ = (x) => x == null || !isFinite(x) ? "—" : "$" + Number(x).toLocaleString("en-US", { maximumFractionDigits: 6 });
   const pct = (x, dp = 2) => x == null || !isFinite(x) ? "—" : `${x < 0 ? "−" : "+"}${Math.abs(x * 100).toFixed(dp)}%`;
   const n2 = (x) => x == null || !isFinite(x) ? "—" : Math.abs(x) >= 1000 ? Math.round(x).toLocaleString("en-US") : fix(x, 2);
-  const iso = (ms) => new Date(ms).toISOString();
-  const hhmm = (ms) => iso(ms).slice(11, 16), hms = (ms) => iso(ms).slice(11, 19), ymd = (ms) => iso(ms).slice(0, 10);
+  // every time in Mountain Time, labelled MT (app.js's deskMT: America/Denver's own rules, whatever zone the phone is
+  // in); HHMM in the capitalised lines. The re-audit's dates (ymd) are calendar dates, not times: they stay UTC's
+  const MT = window.deskMT, TZ = MT ? MT.zone : "UTC";
+  if (!MT) return;
+  const hhmm = (ms) => MT.clock(ms), HHMM = (ms) => MT.clock(ms, { up: true }), hms = (ms) => MT.clock(ms, { sec: true });
+  const md = (ms) => MT.md(ms), ymd = (ms) => new Date(ms).toISOString().slice(0, 10);
   const clock = (ms) => {
     const s = Math.max(0, Math.floor(ms / 1000));
     return `${Math.floor(s / 3600)}:${String(Math.floor(s / 60) % 60).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
@@ -146,10 +150,12 @@
   // the brake holding new entries as of the last run, if any: [what, until]
   function brake() {
     const g = (B.analysis.gates || []).find((x) => phaseOf(x) === "KILLS" && x.verdict === "DROP");
-    if (g) return BRAKE[g.name === "manual_kill" ? (g.note === "flat_kill" ? "flat_kill" : "entry_kill") : g.name] || [g.name.replace(/_/g, " "), "for now"];
     const k = B.kills || {};
-    const key = k.flat_kill ? "flat_kill" : k.entry_kill ? "entry_kill" : k.halted ? "drawdown_halt" : k.daily_locked ? "daily_loss" : k.cooldown ? "cooldown" : null;
-    return key ? BRAKE[key] : null;
+    const key = g ? g.name === "manual_kill" ? (g.note === "flat_kill" ? "flat_kill" : "entry_kill") : g.name
+      : k.flat_kill ? "flat_kill" : k.entry_kill ? "entry_kill" : k.halted ? "drawdown_halt" : k.daily_locked ? "daily_loss" : k.cooldown ? "cooldown" : null;
+    const b = key ? BRAKE[key] || (g ? [g.name.replace(/_/g, " "), "for now"] : null) : null;
+    // the desk's day turns at 00:00 UTC: 6:00 pm MT in summer, 5:00 pm in winter
+    return b && [b[0], b[1].replace("{turn}", `${hhmm(MT.nextUtcDay(Date.now()))} ${TZ}`)];
   }
   const newestClose = () => basket() ? B.basket.last_close_ts
     : B.chart.candles.length ? last(B.chart.candles)[0] + B.chart.bar_ms : null;
@@ -291,14 +297,14 @@
     set(L.lmode, mode); L.lmode.classList.toggle("act-livemode", mode !== "PAPER");
     M.mode.dataset.mode = L.lmode.dataset.mode = mode.toLowerCase();   // theme hook: which mode, not only "not PAPER"
     M.dot.classList.toggle("act-stale", old || lost);
-    set(M.st, lost ? (narrow.matches ? `CAN'T READ THE BOARD SINCE ${hhmm(lastRead)}` : `CAN'T READ THE BOARD SINCE ${hhmm(lastRead)} UTC · SHOWING THE ONE BUILT ${hhmm(b.updated)} UTC`)
+    set(M.st, lost ? (narrow.matches ? `CAN'T READ THE BOARD SINCE ${HHMM(lastRead)}` : `CAN'T READ THE BOARD SINCE ${HHMM(lastRead)} ${TZ} · SHOWING THE ONE BUILT ${HHMM(b.updated)} ${TZ}`)
       : old ? `STALE · NO NEW BOARD FOR ${age}`      // the run's time is in the REPLAY label
-      : `LAST RUN ${hhmm(b.updated)} UTC · ${age} AGO`);
+      : `LAST RUN ${HHMM(b.updated)} ${TZ} · ${age} AGO`);
     M.st.classList.toggle("act-warn", old || lost);
     set(M.exp, b.header.shorts && b.header.experiment ? "SHORTS: PAPER EXPERIMENT" : "");
-    set(L.lrun, `${lost ? "CAN'T READ · " : old ? "STALE · " : ""}LAST RUN ${hhmm(b.updated)} UTC`);
+    set(L.lrun, `${lost ? "CAN'T READ · " : old ? "STALE · " : ""}LAST RUN ${HHMM(b.updated)} ${TZ}`);
     L.lrun.classList.toggle("act-warn", old || lost);
-    if (lost && !unreadSaid) { unreadSaid = true; tapeAdd(`${hms(now)} no board read since ${hms(lastRead)} · showing the one built ${hms(b.updated)} UTC`, "act-warn"); beat(now); }
+    if (lost && !unreadSaid) { unreadSaid = true; tapeAdd(`${hms(now)} no board read since ${hms(lastRead)} · showing the one built ${hms(b.updated)} ${TZ}`, "act-warn"); beat(now); }
     // a step that failed this run: the asked-for tab (app.js shows BTC's board when one is missing), or this one
     const asked = location.hash.slice(1).toUpperCase();
     const bad = IDX && IDX.coins ? IDX.coins.find((c) => c.error && (c.coin === asked || c.coin === shown)) : null;
@@ -315,9 +321,9 @@
 
   // ---- monitor row 2: the trigger meter (desk tabs) --------------------------------------------------------
   function priceCap(o, now) {
-    if (o.shut && o.shut.by === "schedule") return `${vName()} closed now by its schedule (${o.shut.why}, until ${hhmm(o.shut.until)} UTC) · price ${mid$(o.mid)} from the last run, ${hhmm(B.updated)} UTC`;
-    if (o.shut) return `${vName()} closed at the last run, ${hhmm(B.updated)} UTC (${o.shut.why}) · price ${mid$(o.mid)} from that run`;
-    if (!o.isLive) return `price ${mid$(o.mid)} at the last run, ${hhmm(B.updated)} UTC · no live price yet`;
+    if (o.shut && o.shut.by === "schedule") return `${vName()} closed now by its schedule (${o.shut.why}, until ${hhmm(o.shut.until)} ${TZ}) · price ${mid$(o.mid)} from the last run, ${hhmm(B.updated)} ${TZ}`;
+    if (o.shut) return `${vName()} closed at the last run, ${hhmm(B.updated)} ${TZ} (${o.shut.why}) · price ${mid$(o.mid)} from that run`;
+    if (!o.isLive) return `price ${mid$(o.mid)} at the last run, ${hhmm(B.updated)} ${TZ} · no live price yet`;
     const age = now - o.at;
     return age > (o.feed ? FEED_QUIET : NO_TICK) ? `no live price for ${Math.round(age / 1000)} s · showing the last one, ${mid$(o.mid)}`
       : `price ${mid$(o.mid)} from ${o.feed ? "Coinbase" : `Hyperliquid${venue() ? ", a proxy for Coinbase's" : ""}`} · ${Math.max(0, Math.round(age / 1000))}s ago`;
@@ -326,7 +332,7 @@
   function meter(now) {
     if (!B || basket()) return;
     const o = calc(now), r = o.rules, word2 = o.side === "short" ? "short line" : "buy line";
-    const trend = (o.side || "").toUpperCase(), at = `at the ${hhmm(o.c.next)} close`;
+    const trend = (o.side || "").toUpperCase(), at = `at the ${hhmm(o.c.next)} ${TZ} close`;
     let big = "—", to = "", cap = priceCap(o, now), f = null, ticks = "LINE", hot = false;
     if (o.pos) {
       ticks = "STOP";
@@ -341,7 +347,7 @@
       // a brake holds every entry: no line is in play, so no distance to one, and the price doesn't matter to it
       big = "NO NEW ENTRIES";
       to = o.brake[0];
-      cap = `${o.brake[1]} · as of the last run, ${hhmm(B.updated)} UTC`;
+      cap = `${o.brake[1]} · as of the last run, ${hhmm(B.updated)} ${TZ}`;
     } else if (o.side && o.level != null && o.bound && o.past) {
       // closes since the run can only move the line away (up for a buy line): the board's level is a bound the price
       // is already past, so where the line is now is not known here (the next desk run knows)
@@ -352,7 +358,7 @@
       f = o.past ? 0 : o.atr;
       // the strip's readout shows the line at the run's close; when this one (the next close's) differs, name its close
       const sg = (B.analysis.gates || []).find((g) => g.name === "setup");
-      const w = !o.bound && sg && sg.threshold != null && usd(sg.threshold) !== usd(o.level) ? `${hhmm(o.c.next)} ${word2}` : word2;
+      const w = !o.bound && sg && sg.threshold != null && usd(sg.threshold) !== usd(o.level) ? `${hhmm(o.c.next)} ${TZ} ${word2}` : word2;
       to = o.past ? `past the ${w} ${usd(o.level)}` : `to the ${w}${o.bound ? ", at " + (o.side === "short" ? "most" : "least") : ""} ${usd(o.level)}` +
         (o.atr != null && !o.bound ? ` · ${o.atr.toFixed(1)} ATR` : "");
       if (o.past) cap = `past the line now · only a ${(B.header.interval || "").toLowerCase()} close decides, at the next desk run · ` + cap;
@@ -389,7 +395,7 @@
       const px = isLive ? lv : h.mark, gap = h.sma50 ? px / h.sma50 - 1 : null;
       // the live price against the average as of the last close; ABOVE / BELOW is what that close said
       const html = `<b>${esc(h.coin)}</b> ${usd(px)} · ${gap == null ? "warming up" : `<i>${pct(gap, 1)}</i> vs ${n}-day avg`} · ` +
-        (h.sma50 == null ? "no average yet" : `<span class="${h.above_sma ? "act-up" : "act-dn"}">${h.above_sma ? "ABOVE" : "BELOW"}</span> at 00:00`);
+        (h.sma50 == null ? "no average yet" : `<span class="${h.above_sma ? "act-up" : "act-dn"}">${h.above_sma ? "ABOVE" : "BELOW"}</span> at the ${B.basket.last_close_ts ? `${hhmm(B.basket.last_close_ts)} ${TZ} ` : ""}close`);
       if (rows[k].innerHTML !== html) {
         const was = rows[k].querySelector("i"), now2 = gap == null ? null : pct(gap, 1);
         rows[k].innerHTML = html;
@@ -397,9 +403,9 @@
       }
     });
     const age = now - midsAt;
-    set(rows[3], !any ? `prices at the last run, ${hhmm(B.updated)} UTC · no live price yet`
+    set(rows[3], !any ? `prices at the last run, ${hhmm(B.updated)} ${TZ} · no live price yet`
       : age > NO_TICK ? `no live price for ${Math.round(age / 1000)} s · showing the last ones`
-      : `Hyperliquid · ${Math.round(age / 1000)}s ago · averages as of the ${ymd(B.basket.last_close_ts || B.updated).slice(5)} close`);
+      : `Hyperliquid · ${Math.round(age / 1000)}s ago · averages as of the ${md(B.basket.last_close_ts || B.updated)} close`);
   }
 
   // ---- monitor row 3: the gate strip, a labelled replay of the last run's checks ---------------------------
@@ -410,8 +416,8 @@
   }
   function restText() {
     const chief = agentOf("chief"), cl = last(B.chart.candles);
-    if (blocker < 0) return `every check passed at the ${cl ? hhmm(cl[0] + B.chart.bar_ms) + " " : ""}close · CHIEF ${chief ? chief.value : "—"}`;
-    const g = gates[blocker], when = cl ? ` ${hhmm(cl[0] + B.chart.bar_ms)}` : "";
+    if (blocker < 0) return `every check passed at the ${cl ? `${hhmm(cl[0] + B.chart.bar_ms)} ${TZ} ` : ""}close · CHIEF ${chief ? chief.value : "—"}`;
+    const g = gates[blocker], when = cl ? ` ${hhmm(cl[0] + B.chart.bar_ms)} ${TZ}` : "";
     if (g.name === "flat") return `${g.note}: no new entries while it is open`;
     if (g.verdict === "DROP" && phaseOf(g) === "KILLS") {
       const k = BRAKE[g.name === "manual_kill" ? (g.note === "flat_kill" ? "flat_kill" : "entry_kill") : g.name];
@@ -435,7 +441,7 @@
       (idx.length ? idx.map((k) => `<i class="act-node v-${gates[k].verdict}${k === blocker ? " act-block" : ""}${blocker >= 0 && k > blocker ? " act-after" : ""}" data-n="${k}" title="${esc(gateLine(gates[k]) + " · " + word(gates[k].verdict, gates[k]))}"></i>`).join("")
         : `<i class="act-node act-jev" title="${esc(jevNote)}"></i>`) + `</span>`).join("");
     M.nodes.dataset.jev = jevNote;
-    set(M.rl, `REPLAY · LAST RUN ${hhmm(B.updated)} UTC`);
+    set(M.rl, `REPLAY · LAST RUN ${HHMM(B.updated)} ${TZ}`);
     M.cnt.innerHTML = `<span class="act-wd">${gates.length} checks: </span>` + ["pass", "mark", "wait", "drop", "info", "skip"].filter((w) => tally[w])
       .map((w, k) => `<span class="c-${w}">${k ? " · " : ""}${tally[w]} ${w}</span>`).join("");
   }
@@ -467,7 +473,7 @@
   // ---- monitor row 3, VT: what the last run's close says per coin ------------------------------------------
   function vtStrip(play) {
     const hs = B.basket.holdings, decided = hs.some((h) => h.decided_ts != null);
-    set(M.rl, `REPLAY · LAST RUN ${hhmm(B.updated)} UTC · the ${ymd(B.basket.last_close_ts || B.updated).slice(5)} close`);
+    set(M.rl, `REPLAY · LAST RUN ${HHMM(B.updated)} ${TZ} · the ${md(B.basket.last_close_ts || B.updated)} close`);
     M.cnt.innerHTML = "";
     M.nodes.innerHTML = hs.map((h) => {
       const t = h.sma50 == null ? `${h.coin} warming up` : h.above_sma ? `${h.coin} → ${fix(h.target_units || 0, 2)} units` : `${h.coin} → 0 units`;
@@ -475,8 +481,8 @@
     }).join("");
     const orders = hs.filter((h) => h.pending).map((h) => `${h.coin} ${h.pending.kind === "exit" ? "close all" : `${h.pending.usd >= 0 ? "+" : "−"}$${fix(Math.abs(h.pending.usd), 2)}`} ${modeWord()} order, fills at the next open`);
     const dts = hs.map((h) => h.decided_ts).filter((x) => x != null);
-    set(M.read, !decided ? "PREVIEW · first decision at the next 00:00 close"
-      : `decided at the ${ymd(Math.max(...dts)).slice(5)} close · ${orders.length ? orders.join(" · ") : "no order waiting"}`);
+    set(M.read, !decided ? `PREVIEW · first decision at the next ${hhmm(MT.nextUtcDay(Date.now()))} ${TZ} close`
+      : `decided at the ${md(Math.max(...dts) + DAY)} close · ${orders.length ? orders.join(" · ") : "no order waiting"}`);
     stopRun("strip");
     const chips = [...M.nodes.children];
     if (!play || reduced.matches || !visible() || !monOn) { M.nodes.classList.remove("act-rp"); return; }
@@ -488,10 +494,10 @@
   // ---- monitor row 4: the countdown to the next close -------------------------------------------------------
   function countdown(now) {
     const c = closes(now), vt = basket();
-    set(M.next1, `NEXT ${vt ? "DECISION" : (B.header.interval || "").toUpperCase() + " CLOSE"} ${hhmm(c.next)} UTC IN ${clock(c.next - now)}`);
+    set(M.next1, `NEXT ${vt ? "DECISION" : (B.header.interval || "").toUpperCase() + " CLOSE"} ${HHMM(c.next)} ${TZ} IN ${clock(c.next - now)}`);
     const braked = !vt && !B.ticker.pos && brake();
     if (!c.missed) { if (M.next2.title) M.next2.title = ""; set(M.next2, vt ?"the close re-computes the averages and vol" : braked ? "the first desk run after it checks again" : "the first desk run after it decides it"); return; }
-    const when = c.list.map((t) => (vt ? ymd(t).slice(5) + " " : "") + hhmm(t)).join(", ");
+    const when = c.list.map((t) => (vt ? md(t) + " " : "") + hhmm(t)).join(", ") + ` ${TZ}`;
     const verb = braked ? "checks" : "decides";
     // a narrow phone: one line (the times are in the title); otherwise the closes by name
     const tip = `closed since the run: ${when}${c.missed > c.list.length ? ", …" : ""}`;
@@ -512,23 +518,23 @@
     // then that close's checks, then its decision and what filled after it (the forming bar)
     const ev = pp.new_events || [], closeAt = cl ? cl[0] + bar : null;
     const before = (e) => closeAt != null && (e.ts < closeAt || (e.ts === closeAt && e.agent !== "chief"));
-    const evLine = (e) => L1((e.agent || "").toUpperCase(), `${hhmm(e.ts)} ${e.text}`, null, "act-ev");
-    L1("RUN", `#${pp.runs ?? "—"} on this ledger · ${h.coin} · ${(h.mode || "").toLowerCase()} · board built ${hms(b.updated)} UTC`);
+    const evLine = (e) => L1((e.agent || "").toUpperCase(), `${hhmm(e.ts)} ${TZ} ${e.text}`, null, "act-ev");
+    L1("RUN", `#${pp.runs ?? "—"} on this ledger · ${h.coin} · ${(h.mode || "").toLowerCase()} · board built ${hms(b.updated)} ${TZ}`);
     L1("CRAWL", `${(cr.bars ?? ch.candles.length).toLocaleString("en-US")} ${iv} candles + ${cr.funding ?? 0} funding prints · ${cr.requests ?? "—"} requests to ${vName()}`);
     if (cl) {
       const closeTs = cl[0] + bar;
-      L1("CRAWL", `newest close ${hhmm(closeTs)} UTC at ${usd(cl[4])}${cr.age_s != null ? ` · ${ago(cr.age_s * 1000)} old at the run` : ""}`);
+      L1("CRAWL", `newest close ${hhmm(closeTs)} ${TZ} at ${usd(cl[4])}${cr.age_s != null ? ` · ${ago(cr.age_s * 1000)} old at the run` : ""}`);
       const n = pp.bars_processed_this_run || 0;
       if (pp.runs === 1) L1("CRAWL", `first run: the account opened here; its first decision is at the next ${iv} close`);
-      else if (!n) L1("CRAWL", `0 new closes this run: ${hhmm(closeTs)} was decided by an earlier run; the gates were re-checked against it`);
+      else if (!n) L1("CRAWL", `0 new closes this run: ${hhmm(closeTs)} ${TZ} was decided by an earlier run; the gates were re-checked against it`);
       else {
         const ts = []; for (let k = n - 1; k >= 0 && ts.length < 4; k--) ts.push(hhmm(closeTs - k * bar));
-        L1("CRAWL", n > 1 ? `${n} new closes this run (${n > 4 ? "…, " : ""}${ts.join(", ")}), each decided in turn` : `1 new close this run (${ts[0]}), decided by this run`);
+        L1("CRAWL", n > 1 ? `${n} new closes this run (${n > 4 ? "…, " : ""}${ts.join(", ")} ${TZ}), each decided in turn` : `1 new close this run (${ts[0]} ${TZ}), decided by this run`);
       }
       const early = ev.filter(before);
       if (early.length) {
-        L1("", `── THIS RUN, BEFORE THE ${hhmm(closeAt)} CLOSE'S CHECKS`, null, "act-ph"); early.forEach(evLine);
-        L1("", `── THE ${hhmm(closeAt)} CLOSE`, null, "act-ph");
+        L1("", `── THIS RUN, BEFORE THE ${HHMM(closeAt)} ${TZ} CLOSE'S CHECKS`, null, "act-ph"); early.forEach(evLine);
+        L1("", `── THE ${HHMM(closeAt)} ${TZ} CLOSE`, null, "act-ph");
       }
       const ef = last(ch.ema_fast), es = last(ch.ema_slow);
       const fe = r ? `${r.ema_fast}-EMA` : "fast EMA", se = r ? `${r.ema_slow}-EMA` : "slow EMA";
@@ -569,22 +575,23 @@
   function vtLines() {
     const b = B, bk = b.basket, r = bk.rules, cr = bk.crawler || {}, pp = b.paper || {}, out = [];
     const L1 = (tag, text, v, cls) => out.push({ tag, text, v, cls });
-    L1("RUN", `#${pp.runs ?? "—"} on this ledger · VT basket · ${(b.header.mode || "").toLowerCase()} · board built ${hms(b.updated)} UTC`);
+    L1("RUN", `#${pp.runs ?? "—"} on this ledger · VT basket · ${(b.header.mode || "").toLowerCase()} · board built ${hms(b.updated)} ${TZ}`);
     L1("CRAWL", `${cr.bars ?? "—"} daily candles (${r.coins.join(", ")}) · ${cr.requests ?? "—"} requests to Hyperliquid`);
-    if (bk.last_close_ts) L1("CRAWL", `newest close ${ymd(bk.last_close_ts)} 00:00 UTC${cr.age_s != null ? ` · ${ago(cr.age_s * 1000)} old at the run` : ""}`);
+    if (bk.last_close_ts) L1("CRAWL", `newest close ${MT.when(bk.last_close_ts)} ${TZ}${cr.age_s != null ? ` · ${ago(cr.age_s * 1000)} old at the run` : ""}`);
     const n = pp.bars_processed_this_run || 0, decided = bk.holdings.some((h) => h.decided_ts != null);
-    L1("CRAWL", pp.runs === 1 ? "first run: the account opened flat; its first decision is at the next 00:00 UTC close"
+    const nextClose = `${hhmm(MT.nextUtcDay(b.updated))} ${TZ}`;   // the desk's day turns at 00:00 UTC
+    L1("CRAWL", pp.runs === 1 ? `first run: the account opened flat; its first decision is at the next ${nextClose} close`
       : n ? `${n} new daily close${n > 1 ? "s" : ""} this run, each decided in turn`
       : decided ? "0 new daily closes this run: the last close was decided by an earlier run"
-      : "0 new daily closes this run · PREVIEW: what the rule sees at the last close; the first decision is at the next 00:00 close");
+      : `0 new daily closes this run · PREVIEW: what the rule sees at the last close; the first decision is at the next ${nextClose} close`);
     // this run's events in the desk's order (desk/paper.py step_basket): fills at earlier opens and earlier closes'
     // decisions first, then the newest close's decision, then the fills at the forming bar's open
     const ev = pp.new_events || [], T = bk.last_close_ts;
-    const evLine = (e) => L1((e.agent || "").toUpperCase(), `${ymd(e.ts).slice(5)} ${hhmm(e.ts)} ${e.text}`, null, "act-ev");
+    const evLine = (e) => L1((e.agent || "").toUpperCase(), `${md(e.ts)} ${hhmm(e.ts)} ${TZ} ${e.text}`, null, "act-ev");
     const early = T ? ev.filter((e) => e.ts < T) : [];
     if (early.length) {
-      L1("", `── THIS RUN, BEFORE THE ${ymd(T).slice(5)} CLOSE`, null, "act-ph"); early.forEach(evLine);
-      L1("", `── THE ${ymd(T).slice(5)} CLOSE`, null, "act-ph");
+      L1("", `── THIS RUN, BEFORE THE ${md(T)} ${HHMM(T)} ${TZ} CLOSE`, null, "act-ph"); early.forEach(evLine);
+      L1("", `── THE ${md(T)} ${HHMM(T)} ${TZ} CLOSE`, null, "act-ph");
     }
     bk.holdings.forEach((h) => {
       L1("CALC", h.sma50 == null ? `${h.coin} warming up the ${r.sma_bars}-day average` :
@@ -611,7 +618,7 @@
     L.lines.style.setProperty("--pad", pad);
     L.lines.innerHTML = lines.map((x) => `<li class="${x.cls || ""}"><span class="act-t">${esc(x.tag)}</span>${esc(x.text)}` +
       (x.v ? ` <span class="act-v v-${x.v}">${esc(x.w || x.v)}</span>` : "") + `</li>`).join("");
-    set(L.lrl, `REPLAY · LAST RUN ${hhmm(B.updated)} UTC · steps in the order the desk ran them`);
+    set(L.lrl, `REPLAY · LAST RUN ${HHMM(B.updated)} ${TZ} · steps in the order the desk ran them`);
     const hidden = Math.max(0, n - SHORT_SHOW);
     L.more.hidden = !hidden;
     shortLog(hidden);
@@ -659,16 +666,16 @@
     let o = null;
     if (basket()) {
       const n = B.basket.rules.sma_bars, age = Math.round((now - midsAt) / 1000);
-      rows.push(["PRICES", mids ? `allMids · ${age > NO_TICK / 1000 ? `no live price for ${age} s` : `${age}s ago`}` : `at the last run, ${hhmm(B.updated)} UTC · no live price yet`, ""]);
+      rows.push(["PRICES", mids ? `allMids · ${age > NO_TICK / 1000 ? `no live price for ${age} s` : `${age}s ago`}` : `at the last run, ${hhmm(B.updated)} ${TZ} · no live price yet`, ""]);
       B.basket.holdings.forEach((h) => {
         const lv = mids ? parseFloat(mids[h.coin]) : NaN, isLive = isFinite(lv) && lv > 0, px = isLive ? lv : h.mark;
-        rows.push([h.coin, `${mid$(px)} · ${h.sma50 ? `${pct(px / h.sma50 - 1, 2)} vs the ${n}-day avg ${usd(h.sma50)}, as of the ${ymd(B.basket.last_close_ts || B.updated)} close` : "no average yet"}`,
+        rows.push([h.coin, `${mid$(px)} · ${h.sma50 ? `${pct(px / h.sma50 - 1, 2)} vs the ${n}-day avg ${usd(h.sma50)}, as of the ${MT.when(B.basket.last_close_ts || B.updated)} ${TZ} close` : "no average yet"}`,
           ""]);
       });
     } else {
       o = calc(now);
       const iv = (B.header.interval || "").toLowerCase(), age = Math.round((now - o.at) / 1000);
-      rows.push(["PRICE", o.shut ? `${mid$(o.mid)} at the last run · ${vName()} ${o.shut.by === "schedule" ? `is closed now by its schedule (${o.shut.why}, until ${hhmm(o.shut.until)} UTC)` : `was closed then (${o.shut.why})`}`
+      rows.push(["PRICE", o.shut ? `${mid$(o.mid)} at the last run · ${vName()} ${o.shut.by === "schedule" ? `is closed now by its schedule (${o.shut.why}, until ${hhmm(o.shut.until)} ${TZ})` : `was closed then (${o.shut.why})`}`
         : o.isLive ? `${mid$(o.mid)} · ${o.feed ? "Coinbase feed" : "allMids"} · ${age > (o.feed ? FEED_QUIET : NO_TICK) / 1000 ? `no live price for ${age} s` : `${Math.max(0, age)}s ago`}` : `${mid$(o.mid)} at the last run · no live price yet`, ""]);
       const exp = B.header.shorts && B.header.experiment && o.side === "short" ? " · shorts: paper experiment" : "";
       if (o.pos) {
@@ -676,7 +683,7 @@
         // the price move only: the entry fee and funding are already out of the account's cash, the exit fee to come
         rows.push(["POSITION", `${o.pos.side} ${o.pos.qty} from ${usd(o.pos.entry)} · price move ${o.pnl >= 0 ? "+" : ""}${usd(o.pnl)} at ${mid$(o.mid)}, before fees and funding · ${modeWord()}`, ""]);
       } else if (o.brake) {
-        rows.push(["ENTRIES", `none: ${o.brake[0]}, ${o.brake[1]} · as of the last run, ${hhmm(B.updated)} UTC`, ""]);
+        rows.push(["ENTRIES", `none: ${o.brake[0]}, ${o.brake[1]} · as of the last run, ${hhmm(B.updated)} ${TZ}`, ""]);
       } else if (o.side) {
         const head = o.side === "short" ? "SHORT LINE" : "BUY LINE", way = o.side === "short" ? "lower" : "higher";
         const cond = o.bound ? `if the trend still says ${o.side.toUpperCase()} · ` : "";
@@ -693,7 +700,7 @@
         rows.push(["TREND IF IT CLOSED HERE", `${side}${near ? " ≈" : ""} · ${r.ema_fast}-EMA ${usd(o.ef)} ${near ? "≈" : o.ef >= o.es ? "≥" : "<"} ${r.ema_slow}-EMA ${usd(o.es)}${was && was !== side ? ` · flips from ${was}` : ""}`, ""]);
       }
     }
-    const head = LIVE_HEAD(basket() ? "00:00 UTC" : (B.header.interval || ""), o, basket() ? !mids : !o.shut && !o.isLive);   // it names the source
+    const head = LIVE_HEAD(basket() ? `daily ${HHMM(MT.nextUtcDay(now))} ${TZ}` : (B.header.interval || ""), o, basket() ? !mids : !o.shut && !o.isLive);   // it names the source
     const shape = rows.map((r) => r[0]).join("|") + "|" + head;
     if (shape !== liveShape) {
       liveShape = shape;
@@ -763,9 +770,9 @@
     if (po) po.takeRecords().forEach(take);
     const e = boardEntry && boardEntry.name.includes(`/boards/${shown}.json`) ? boardEntry : null;
     const kb = e && e.decodedBodySize ? ` · ${(e.decodedBodySize / 1024).toFixed(1)} KB` : "";
-    if (kind === "new") tapeAdd(`${hms(now)} NEW RUN · board built ${hms(B.updated)} UTC${kb}`, "act-ev");
-    else if (kind === "first") tapeAdd(`${hms(now)} board read${kb} · last run ${hms(B.updated)} UTC`, "act-bd");
-    else tapeAdd(`${hms(now)} board re-read${kb} · no new board since ${hms(B.updated)} UTC`, "act-bd");
+    if (kind === "new") tapeAdd(`${hms(now)} NEW RUN · board built ${hms(B.updated)} ${TZ}${kb}`, "act-ev");
+    else if (kind === "first") tapeAdd(`${hms(now)} board read${kb} · last run ${hms(B.updated)} ${TZ}`, "act-bd");
+    else tapeAdd(`${hms(now)} board re-read${kb} · no new board since ${hms(B.updated)} ${TZ}`, "act-bd");
   }
 
   // ---- the desk runs heartbeat: the last run's boards, account by account -------------------------------------
@@ -776,14 +783,14 @@
     if (IDX && IDX.coins) {
       chips = IDX.coins.map((c) => `<span class="act-hb${c.coin === shown ? " me" : ""}${c.error ? " bad" : ""}"${c.error ? ` title="${esc(c.error)}"` : ""}>${esc(c.coin)} ${c.updated ? hms(c.updated) : "failed"}</span>`).join(`<i>→</i>`);
       const ts = IDX.coins.map((c) => c.updated).filter(Boolean);
-      if (ts.length) built = ` · boards built ${hms(Math.min(...ts))}–${hms(Math.max(...ts))}`;
+      if (ts.length) built = ` · boards built ${hms(Math.min(...ts))}–${hms(Math.max(...ts))} ${TZ}`;
     } else chips = `<span class="act-hb me">${esc(shown)} ${hms(B.updated)}</span><i>live server</i>`;
     const bad = IDX && IDX.coins ? IDX.coins.filter((c) => c.error) : [];
     L.beat.innerHTML = `<div class="act-hbs">${chips}</div>` +
-      (lost ? `<div class="act-warn">can't read the board since ${hms(lastRead)} · the one shown was built ${hms(B.updated)} UTC</div>` : "") +
+      (lost ? `<div class="act-warn">can't read the board since ${hms(lastRead)} · the one shown was built ${hms(B.updated)} ${TZ}</div>` : "") +
       `<div class="${old ? "act-warn" : ""}">${old ? `no new board for ${ago(now - B.updated)}` : `last run ${ago(now - B.updated)} ago`}${built} · run #${pp.runs ?? "—"} on this ledger</div>` +
       bad.map((c) => `<div class="act-warn">${esc(c.coin)} step failed: ${esc(c.error.slice(0, 60))}</div>`).join("") +
-      (staticBoard ? `<div class="act-dim">scheduled ${mins} UTC · GitHub skips many runs · a late run catches up on every close it missed</div>` : "");
+      (staticBoard ? `<div class="act-dim">scheduled at ${mins} past each hour · GitHub skips many runs · a late run catches up on every close it missed</div>` : "");
   }
 
   // ---- research: backtests and audits, from research.json (verbatim quotes, pinned by a test) ------------------

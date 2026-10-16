@@ -33,7 +33,7 @@
     <div class="clock">
       <span class="mode" id="mode">—</span>
       <span class="daydate" id="daydate">DAY — · —</span>
-      <span class="time"><b id="time">--:--</b> UTC</span>
+      <span class="time"><b id="time">--:--</b> <span id="tz">MT</span></span>
     </div>
   </header>
 
@@ -70,7 +70,7 @@
   <!-- the VT basket's tab: its three coins instead of the price chart and the agents -->
   <section class="panel basket basket-only" id="basket">
     <div class="ticker" id="vt-ticker">‹ BASKET</div>
-    <div class="panel-head"><span>HOLDINGS · AT THE 00:00 UTC CLOSE</span><span class="wait" id="vt-next">NEXT DECISION 00:00 UTC</span></div>
+    <div class="panel-head"><span id="vt-head">HOLDINGS · AT THE DAILY CLOSE</span><span class="wait" id="vt-next">NEXT DECISION</span></div>
     <div class="vt-body">
       <div class="ol-exp" id="vt-exp"></div>
       <p class="vt-rule" id="vt-rule"></p>

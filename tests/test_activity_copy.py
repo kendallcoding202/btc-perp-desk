@@ -169,7 +169,10 @@ def test_every_brake_the_engine_can_pull_is_named():
     assert {"flat_kill", "entry_kill"} <= set(brake)
     engine = (ROOT / "desk/engine.py").read_text()
     assert "until a human resets it" in engine and brake["drawdown_halt"][1] == "until a human resets it"
-    assert "no entries until tomorrow UTC" in engine and brake["daily_loss"][1] == "until the next UTC day"
+    # the engine's day is UTC's; the board says when it turns in Mountain Time, and so does the monitor ({turn})
+    from desk.board import in_mountain_time
+    assert "no entries until tomorrow UTC" in engine and brake["daily_loss"][1] == "until the desk's day turns at {turn}"
+    assert in_mountain_time("no entries until tomorrow UTC", 0) == "no entries until the desk's day turns at 5:00 pm MT"
     assert "sitting out" in engine and brake["cooldown"][0] == "losing-streak cooldown"
     assert 'note="flat_kill" if k.flat_kill else ("entry_kill"' in engine
     # braked and flat: no distance to a line, in the monitor or the live rows

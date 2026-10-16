@@ -58,9 +58,67 @@
   const pct = (x, dp = 2) => x == null || isNaN(x) ? "—" : `${x >= 0 ? "+" : ""}${(x * 100).toFixed(dp)}%`;
   const num = (x, dp = 2) => x == null || isNaN(x) ? "—" : nf(dp).format(Number(x));
   const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-  const hhmm = (ms) => new Date(ms).toISOString().slice(11, 16);
-  const mmddhhmm = (ms) => new Date(ms).toISOString().slice(5, 16).replace("T", " ");
   const DAY_MS = 86400000;
+
+  // ---- Mountain Time: every time the page shows ----------------------------------------------------------------
+  // The owner reads times in Mountain Time, whatever zone the phone itself is in: America/Denver's own rules from the
+  // browser's time zone data (MDT in summer, MST from the first Sunday of November: never a fixed offset), labelled
+  // MT. Stored times stay epoch ms; the desk's day still turns at 00:00 UTC (6:00 pm MT in summer, 5:00 pm in winter).
+  // A browser without the zone (none current) shows UTC, labelled UTC, never a wrong time called MT. activity.js uses
+  // the same helper (window.deskMT), so the two never disagree.
+  const deskMT = (() => {
+    const MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let f = null;
+    try {
+      f = new Intl.DateTimeFormat("en-US", { timeZone: "America/Denver", year: "numeric", month: "numeric", day: "numeric",
+        weekday: "short", hour: "numeric", minute: "numeric", second: "numeric", hourCycle: "h23" });
+    } catch { f = null; }
+    const memo = new Map();   // a second's parts, made once: the chart's axis asks for the same candles every redraw
+    const parts = (ms) => {
+      const k = Math.floor(ms / 1000);
+      let p = memo.get(k);
+      if (p) return p;
+      if (f) {
+        const o = {};
+        for (const x of f.formatToParts(new Date(k * 1000))) o[x.type] = x.value;
+        p = { y: +o.year, mo: +o.month, d: +o.day, h: +o.hour % 24, mi: +o.minute, s: +o.second, wd: o.weekday };
+      } else {
+        const d = new Date(k * 1000);
+        p = { y: d.getUTCFullYear(), mo: d.getUTCMonth() + 1, d: d.getUTCDate(), h: d.getUTCHours(), mi: d.getUTCMinutes(),
+          s: d.getUTCSeconds(), wd: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d.getUTCDay()] };
+      }
+      if (memo.size > 5000) memo.clear();
+      memo.set(k, p);
+      return p;
+    };
+    const two = (n) => String(n).padStart(2, "0");
+    // "6:04 pm", "6:04:09 pm" (sec), "6:04 PM" (up)
+    const clock = (ms, o = {}) => {
+      const p = parts(ms), t = `${p.h % 12 || 12}:${two(p.mi)}${o.sec ? ":" + two(p.s) : ""} ${p.h < 12 ? "am" : "pm"}`;
+      return o.up ? t.toUpperCase() : t;
+    };
+    const day = (ms) => { const p = parts(ms); return `${MON[p.mo - 1]} ${p.d}`; };              // "Oct 15"
+    const key = (ms) => { const p = parts(ms); return p.y * 10000 + p.mo * 100 + p.d; };         // the MT date, as a number
+    return {
+      zone: f ? "MT" : "UTC", parts, clock, day, key,
+      md: (ms) => { const p = parts(ms); return `${two(p.mo)}-${two(p.d)}`; },                    // "10-15"
+      ymd: (ms) => { const p = parts(ms); return `${p.y}-${two(p.mo)}-${two(p.d)}`; },            // "2026-10-15"
+      wd: (ms) => parts(ms).wd,                                                                 // "Fri"
+      when: (ms) => `${day(ms)}, ${clock(ms)}`,                                                 // "Oct 15, 6:04 pm"
+      // from a to b: "3:00–4:00 pm", "11:00 pm–1:00 am", a day apart "Sat 8:00 pm–Sun 2:00 am"; days: the first day too
+      span: (a, b, days = false) => {
+        const pa = parts(a), pb = parts(b), same = key(a) === key(b), mer = (pa.h < 12) === (pb.h < 12);
+        const head = same && mer ? clock(a).slice(0, -3) : clock(a);
+        return `${days || !same ? pa.wd + " " : ""}${head}–${same ? "" : pb.wd + " "}${clock(b)}`;
+      },
+      // the start of ms's Mountain Time day (its midnight), as epoch ms
+      midnight: (ms) => { const p = parts(ms); return Math.floor(ms / 1000) * 1000 - ((p.h * 60 + p.mi) * 60 + p.s) * 1000; },
+      nextUtcDay: (ms) => Math.floor(ms / DAY_MS + 1) * DAY_MS,   // the desk's day turns: VT's close, the daily loss lock
+    };
+  })();
+  window.deskMT = deskMT;
+  const MT = deskMT, TZ = deskMT.zone;
+  const hhmm = (ms) => MT.clock(ms);
   // theme hook: a signed amount's classes. ok / bad exactly as before (style.css colors them: below zero is bad), plus
   // its direction for a theme: up, down, or flat when it is zero at the shown `dp` decimals (neither a gain nor a loss)
   const tone = (x, dp = 2) => `${x < 0 ? "bad" : "ok"}${x == null || isNaN(x) ? "" : Math.abs(x) * 10 ** dp < 0.5 ? " flat" : x < 0 ? " down" : " up"}`;
@@ -133,12 +191,18 @@
       if (liveY != null && Math.abs(y - liveY) < 13) continue;
       g.fillStyle = css("--dim"); g.fillText(pxAxis(p), w - padR + 6, y + 3);
     }
-    const step = Math.max(1, Math.round(cs.length / 6));
+    // the x axis in Mountain Time days: a tick where each day starts (its midnight, inside the candle it falls in: 5 am
+    // MT is a 2h candle's open in winter, not in summer), its date under as many as fit 44 px apart, and "MT" under
+    // the price axis to say whose days they are
     g.fillStyle = css("--dim");
-    for (let k = 0; k < cs.length; k += step) {
-      const d = new Date(cs[k][0]);
-      g.fillText(`${d.toISOString().slice(5, 10)}`, X(k) - 14, h - 4);
+    let lastDate = -1e9;
+    for (let k = 1; k < cs.length; k++) {
+      if (MT.key(cs[k][0]) === MT.key(cs[k - 1][0])) continue;
+      const mid = MT.midnight(cs[k][0]), x = X(k) - cw / 2 - Math.max(0, Math.min(1, (cs[k][0] - mid) / chart.bar_ms)) * cw;
+      line(g, [[x, h - padB], [x, h - padB + 4]], css("--dim"), 1);
+      if (x - lastDate >= 44 && x + 32 <= w - padR) { g.fillText(MT.md(cs[k][0]), x + 2, h - 4); lastDate = x; }
     }
+    g.fillText(TZ, w - padR + 6, h - 4);
 
     line(g, chart.don_hi.map((v, k) => [X(k), v == null ? null : Y(v)]), css("--channel") || rgba("--muted", .55), 1, [3, 4]);
     line(g, chart.don_lo.map((v, k) => [X(k), v == null ? null : Y(v)]), css("--channel") || rgba("--muted", .35), 1, [3, 4]);
@@ -398,7 +462,7 @@
     put(chips, s.agents.map((a) => `<span class="chip ${a.state === "idle" ? "off" : ""}" title="${esc(a.name)}: ${esc(a.state)}"
       style="background:var(${COLORS[a.key]})">${esc(a.name[0])}</span>`).join(""));
     if (!$("chief-sprite").children.length) $("chief-sprite").append(sprite("chief", 4));
-    txt($("mini-time"), s.header.time);
+    txt($("mini-time"), MT.clock(s.updated));
     put($("kill-state"), [
       ["flat_kill", k.flat_kill], ["entry_kill", k.entry_kill], ["jev_kill", k.jev_kill],
       ["drawdown halt", k.halted], ["daily loss lock", k.daily_locked], ["cooldown", k.cooldown],
@@ -456,7 +520,6 @@
     return `${v}${t}`;
   };
 
-  const DAYF = new Intl.DateTimeFormat("en-US", { weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "UTC" });
   // light: a redraw for a new price only (the gates and events are the board's)
   function renderAnalysis(s, light = false) {
     const st = s.analysis.stats, basket = s.header.kind === "basket", t = s.ticker;
@@ -481,28 +544,28 @@
     ];
     put($("stats"), cells.map(([k, v, cls]) => `<div class="${cls || ""}"><span>${k}</span><b>${esc(v)}</b></div>`).join(""));
     const ol = s.analysis.outlook || [];
-    const day = (ms) => DAYF.format(new Date(ms));
+    const day = (ms) => `${MT.wd(ms)} ${MT.clock(ms)}`;   // "Fri 6:00 pm"
     const olHead = s.analysis.outlook_side === "short"
       ? `SHORT LINE · a 2h close below it shorts; steps up as old lows age out (if ${esc(s.header.coin || "BTC")} makes no new low)`
       : `BUY LINE · steps down as old highs age out (if ${esc(s.header.coin || "BTC")} makes no new high)`;
     const nc = v && v.session.next_closure, sk = v && v.skipping, cn = v && v.closed_now, fs = v && v.funding.stale_since;
     const venueLine = v ? `<div class="ol-exp">${esc(v.display)} RULES · whole ${v.contract_size} BTC contracts (one is ${usd(v.one_contract_usd, 0)}), ` +
       `≤${v.max_leverage}x, overnight margin ${(v.margin_rate * 100).toFixed(1)}% · fees est. ${esc(v.fee_estimate)} · funding est. from ${v.funding.logged} logged hourly rates` +
-      (fs ? ` <b>(none new since ${mmddhhmm(fs)} UTC)</b>` : "") + (v.stop_fill ? ` · ${esc(v.stop_fill)}` : "") +
-      (cn ? ` · <b>${lp.closed || !s.livePx ? "CLOSED NOW" : "CLOSED AT THE LAST RUN"}: ${esc(cn.why)}${cn.until ? ` until ${hhmm(cn.until)} UTC` : ""}</b>` : "") +
-      (nc && !(cn && cn.scheduled) ? ` · next ${cn ? "scheduled " : ""}closure ${esc(nc.why)} ${day(nc.start)}–${hhmm(nc.end)} UTC` : "") +
-      (v.waiting_for ? ` · <b>WAITING for Coinbase's ${mmddhhmm(v.waiting_for)} UTC candle</b>` : "") +
+      (fs ? ` <b>(none new since ${MT.when(fs)} ${TZ})</b>` : "") + (v.stop_fill ? ` · ${esc(v.stop_fill)}` : "") +
+      (cn ? ` · <b>${lp.closed || !s.livePx ? "CLOSED NOW" : "CLOSED AT THE LAST RUN"}: ${esc(cn.why)}${cn.until ? ` until ${hhmm(cn.until)} ${TZ}` : ""}</b>` : "") +
+      (nc && !(cn && cn.scheduled) ? ` · next ${cn ? "scheduled " : ""}closure ${esc(nc.why)} ${MT.span(nc.start, nc.end, true)} ${TZ}` : "") +
+      (v.waiting_for ? ` · <b>WAITING for Coinbase's ${MT.when(v.waiting_for)} ${TZ} candle</b>` : "") +
       (sk ? ` · <b>SKIPPING: ${esc(sk.note)}</b>` : "") + `</div>` : "";
     put($("outlook"), venueLine + (s.header.experiment ? `<div class="ol-exp">EXPERIMENT · ${esc(s.header.experiment)}</div>` : "") +
       (ol.length ? `<div class="ol-head">${olHead}</div>` +
-      `<div class="ol-rows">` + ol.map((r, k) => `<div class="${k === 0 ? "now" : ""}"><span>${k === 0 ? "next close" : day(r.ts) + " UTC"}</span>` +
+      `<div class="ol-rows">` + ol.map((r, k) => `<div class="${k === 0 ? "now" : ""}"><span>${k === 0 ? "next close" : day(r.ts) + " " + TZ}</span>` +
       `<b>${px(r.level)}</b><i>${pct(r.level / st.price - 1, 1)}</i></div>`).join("") + `</div>` : ""));
     if (light) return;
     put($("gates"), s.analysis.gates.map((g) =>
       `<li><span>${esc(g.name.replace(/_/g, " "))} <i class="na">${esc(GATE_FMT(g))}</i></span><span class="v ${g.verdict}">${g.verdict}</span></li>`).join(""));
-    const when = basket ? mmddhhmm : hhmm;   // the basket trades once a day: its events need the date
+    const when = basket ? MT.when : hhmm;   // the basket trades once a day: its events need the date
     put($("events"), s.events.slice().reverse().map((e) =>
-      `<li><b style="color:var(${COLORS[e.agent] || "--muted"})">${esc(e.agent.toUpperCase())}</b>${when(e.ts)} ${esc(e.text)}</li>`).join("") ||
+      `<li><b style="color:var(${COLORS[e.agent] || "--muted"})">${esc(e.agent.toUpperCase())}</b>${when(e.ts)} ${TZ} ${esc(e.text)}</li>`).join("") ||
       `<li>no events yet — the desk speaks when something happens.</li>`);
   }
 
@@ -530,8 +593,9 @@
       `<span class="hl ${posCls}">${esc(t.position)}${t.position_detail ? " " + esc(t.position_detail) : ""}</span>` +
       ` · ${esc(t.record)} · HOLD <span class="${tone(t.hold_pct, 4)}">${pct(t.hold_pct)}</span>` +
       ` · ${pnlHtml(s)} · FEES ${usd(t.fees)} · FUNDING ${usd(t.funding)}`;
-    const next = Math.floor(now / DAY_MS + 1) * DAY_MS, left = next - now;   // every 00:00 UTC
-    $("vt-next").textContent = `NEXT DECISION 00:00 UTC · IN ${Math.floor(left / 3600000)}H ${Math.floor(left % 3600000 / 60000)}M`;
+    const next = MT.nextUtcDay(now), left = next - now;   // every 00:00 UTC: 6:00 pm MT in summer, 5:00 pm in winter
+    txt($("vt-head"), `HOLDINGS · AT THE ${MT.clock(next, { up: true })} ${TZ} DAILY CLOSE`);
+    $("vt-next").textContent = `NEXT DECISION ${MT.clock(next, { up: true })} ${TZ} · IN ${Math.floor(left / 3600000)}H ${Math.floor(left % 3600000 / 60000)}M`;
     $("vt-exp").textContent = s.header.experiment ? `EXPERIMENT · ${s.header.experiment}` : "";
     $("vt-rule").textContent = `A ${r.coins.length === 3 ? "third" : "share"} of the book per coin. A coin is held while its daily close ` +
       `is above its ${r.sma_bars}-day average, sized ${r.target_vol.toFixed(2)} ÷ its ${r.vol_lookback}-day vol (at most ${r.max_units} units; ` +
@@ -546,7 +610,7 @@
       const verb = o && (o.kind === "exit" ? "SELL ALL" : o.kind === "entry" ? "BUY" : o.usd > 0 ? "ADD" : "TRIM");
       const order = o ? [o.kind === "exit" ? verb : `${verb} ${usd(Math.abs(o.usd))}`, "fills at the next open"]
         : h.decided_ts == null ? ["PREVIEW", "the first decision is at the next close"]
-        : h.qty > 0 ? ["HOLD", h.entry_ts ? `since ${new Date(h.entry_ts).toISOString().slice(0, 10)}` : ""]
+        : h.qty > 0 ? ["HOLD", h.entry_ts ? `since ${MT.day(h.entry_ts)}` : ""]
         : h.target_units > 0 ? ["FLAT", `entry under the $${r.min_order_usd} minimum; checked again at the next close`]
         : ["FLAT", h.warm ? `waits for a close above the ${r.sma_bars}-day average` : "warming up the averages"];
       return `<div class="h-row">` +
@@ -560,14 +624,14 @@
     });
     $("holdings").innerHTML = `<div class="h-row h-head">${head.map((x) => `<div>${x}</div>`).join("")}</div>` + rows.join("");
     const caught = b.last_close_ts && b.last_close_ts < Math.floor(now / DAY_MS) * DAY_MS
-      ? " The latest 00:00 close is picked up on the desk's next run." : "";
+      ? ` The latest daily close (${MT.when(Math.floor(now / DAY_MS) * DAY_MS)} ${TZ}) is picked up on the desk's next run.` : "";
     $("vt-note").textContent = `Prices live from Hyperliquid; averages, vol and units are from the last close` +
-      (b.last_close_ts ? ` (${new Date(b.last_close_ts).toISOString().slice(0, 10)} 00:00 UTC)` : "") + `. ` +
+      (b.last_close_ts ? ` (${MT.when(b.last_close_ts)} ${TZ})` : "") + `. ` +
       `${b.orders.filled} fills, ${b.orders.blocked} orders skipped by the $${r.min_order_usd} minimum.${caught}`;
   }
 
   const RULES = {
-    coins: "one sleeve each, an equal share of the book", interval: "decided at the 00:00 UTC close, filled at the next open",
+    coins: "one sleeve each, an equal share of the book", interval: "decided at the daily close ({close}), filled at the next open",
     vol_lookback: "days of returns in the realised vol (x √365)", target_vol: "units = this ÷ the coin's realised vol",
     max_units: "no coin gets more units than this", sma_bars: "held only while the close is above this many days' average",
     band: "held units change only when the new size is further away than this", book_leverage: "a coin's notional = bank x this ÷ 3 x units",
@@ -576,8 +640,9 @@
   };
   function renderRules(rules) {
     const fmt = (k, v) => Array.isArray(v) ? v.join(" · ") : /usd|equity/.test(k) ? usd(v, 0) : String(v);
+    const close = `${MT.clock(MT.nextUtcDay(Date.now()))} ${TZ}`;   // the next daily close, in MT (an hour earlier in winter)
     $("thr").innerHTML = `<div class="thr-sec">VolTrend — frozen: these exact numbers passed the edge hunt's pre-set bar; not tuned</div>` +
-      Object.entries(rules).map(([k, v]) => `<div class="rule"><span class="n">${esc(k)}</span><b>${esc(fmt(k, v))}</b><i>${esc(RULES[k] || "")}</i></div>`).join("");
+      Object.entries(rules).map(([k, v]) => `<div class="rule"><span class="n">${esc(k)}</span><b>${esc(fmt(k, v))}</b><i>${esc((RULES[k] || "").replace("{close}", close))}</i></div>`).join("");
   }
 
   function renderKills(k) {
@@ -952,8 +1017,9 @@
     txt($("title"), hdr.title);
     txt($("tagline"), hdr.tagline);
     txt($("mode"), hdr.mode); $("mode").className = `mode ${hdr.mode.toLowerCase()}`;
-    txt($("daydate"), `DAY ${hdr.day} · ${hdr.date}`);
-    txt($("time"), hdr.time);
+    txt($("daydate"), `DAY ${hdr.day} · ${MT.day(s.updated).toUpperCase()}`);   // the run's time and date, in MT
+    txt($("time"), MT.clock(s.updated));
+    txt($("tz"), TZ);
     const basket = hdr.kind === "basket";
     document.body.classList.toggle("kind-basket", basket);
     document.body.dataset.coin = String(hdr.coin || "BTC").toUpperCase();
@@ -981,10 +1047,10 @@
     const hdr = s.header, lp = s.livePx || {};
     const age = Math.round((Date.now() - s.updated) / 60000), secs = (t) => Math.max(0, Math.round((Date.now() - t) / 1000));
     const cn = lp.closed;   // BTC on Coinbase: its own feed, else Hyperliquid's as a proxy, else closed (and why)
-    return `desk updated ${new Date(s.updated).toISOString().replace("T", " ").slice(0, 16)} UTC (${age} min ago)` +
-      (s.venue && cn ? (cn.by === "schedule" ? ` · Coinbase is closed now by its schedule (${cn.why}, until ${hhmm(cn.until)} UTC): no live price`
+    return `desk updated ${MT.when(s.updated)} ${TZ} (${age} min ago)` +
+      (s.venue && cn ? (cn.by === "schedule" ? ` · Coinbase is closed now by its schedule (${cn.why}, until ${hhmm(cn.until)} ${TZ}): no live price`
         : ` · Coinbase was closed at the last run (${cn.why}): no live price until a run finds it open` +
-          (cn.scheduled && cn.until ? ` or, after ${hhmm(cn.until)} UTC, its own feed does` : ""))
+          (cn.scheduled && cn.until ? ` or, after ${hhmm(cn.until)} ${TZ}, its own feed does` : ""))
       : s.venue && lp.source === "coinbase" ? ` · live price ${secs(lp.at)}s ago from Coinbase`
       : live.at ? ` · live price ${secs(live.at)}s ago from Hyperliquid` +
         (s.venue ? ` (a proxy: no price from Coinbase's own feed just now; the desk marks at Coinbase's price every run)` : "") : "") +
