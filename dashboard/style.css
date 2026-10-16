@@ -98,10 +98,10 @@ html[data-desk="up"] .ring::after { border-color: transparent; border-bottom-col
 .sh-two { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px; background: var(--line); }
 .sh-two > div { background: var(--panel); padding: 10px 12px; min-width: 0; }
 .sh-two .big { font-size: 26px; font-weight: 700; margin: 4px 0 8px; }
-#board .stats { display: grid; gap: 4px; padding: 8px 12px; }
+#board .stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 14px; padding: 8px 12px; }   /* its own grid, not the main board's 7 columns */
 #board .stats > div { display: flex; justify-content: space-between; gap: 10px; font-size: 11px; border-bottom: 1px dotted var(--line); padding-bottom: 3px; }
 #board .stats span { color: var(--muted); flex: 0 0 auto; }
-#board .stats b { text-align: right; font-weight: 600; overflow-wrap: anywhere; min-width: 0; }
+#board .stats b { text-align: right; font-weight: 600; white-space: normal; overflow-wrap: anywhere; min-width: 0; }
 .sh-body { padding: 8px 12px; font-size: 11.5px; line-height: 1.55; }
 .sh-body p { margin: 0 0 6px; }
 #board ul { list-style: none; margin: 0; padding: 8px 12px; display: grid; gap: 5px; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
@@ -353,7 +353,8 @@ body.has-live .big { text-shadow: 0 0 16px color-mix(in srgb, currentColor 50%, 
   body { padding: 4px; }
   .frame { padding: 6px; gap: 6px; }
   /* on a phone, what you check first goes first: money, position, chart, then the desk */
-  .header { order: 1; } .coins { order: 1; } .balance { order: 2; }
+  .header { order: 1; } .coins { order: 1; } .shadow-link { order: 1; } .balance { order: 2; }
+  #board .stats { grid-template-columns: minmax(0, 1fr); }
   .coins { grid-template-columns: repeat(2, minmax(0, 1fr)); } .stage, .basket { order: 3; } .agents { order: 4; }
   .coin.total:nth-child(odd) { grid-column: 1 / -1; }   /* five tabs: ALL takes the last row */
   .h-head { display: none; }

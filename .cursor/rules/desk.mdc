@@ -34,3 +34,7 @@ A GitHub Actions job (`.github/workflows/paper.yml`) runs `python -m desk step` 
 - `python3 -m pytest -q` passes.
 - `node --check` passes on each changed `dashboard/*.js` file.
 - The page has been looked at on a phone-sized screen (390×844 and 375×667) and on desktop: no horizontal scroll, and `prefers-reduced-motion` respected. See the dashboard rule for how to preview it.
+
+# Coinbase SHADOW and LIVE
+
+- `desk/coinbase_*.py` and `desk/brokers/coinbase*.py` run SHADOW, which only reads the real account (a View-only key). LIVE is locked in code: `desk/coinbase_live.py` has `LIVE_REVIEWED = False`, and arm() refuses before any request while it is. Never set it True or weaken the lock; its open problems are in `docs/coinbase-live-status.md`.

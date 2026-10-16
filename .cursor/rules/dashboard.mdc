@@ -23,6 +23,11 @@ A static site with no build step and no framework, published by the paper workfl
 - **Network:** only Hyperliquid's public API (`api.hyperliquid.xyz`), Coinbase's public market-data WebSocket (`advanced-trade-ws.coinbase.com`, one socket, BTC only, closed while the page is hidden, retries backed off) and Google Fonts, all already used. No new CDNs, trackers or libraries without a strong reason. There is no Content-Security-Policy; if one is ever added, its `connect-src` must allow exactly those two hosts.
 - Keep the PAPER badge visible, the four tabs, the spider, and its footer on/off toggle.
 
+# BTC SHADOW (the real Coinbase account, read only)
+
+- `shadow.html` + `shadow.js` are SHADOW's own page. It opens `boards/BTC-SHADOW.enc.json` in the browser with WebCrypto and the owner's `DESK_STATE_KEY` (typed on the device, never sent anywhere). `boards/BTC-SHADOW.status.json` is the public status (no amounts) that app.js shows as the BTC SHADOW bar under the tabs.
+- Both pages are read only: nothing on them sends an order or calls Coinbase with a key. Keep it that way. The SHADOW page must not scroll sideways at 320/375/390 px, locked or unlocked; its tables use their own `#board .stats` grid.
+
 # The theme (comic lab notebook, day and night editions)
 
 - `theme-comic.css` loads after `style.css` and `activity.css` and only overrides them; `edition.js` loads last. It runs the footer's `day · night · auto` switch (localStorage `desk-edition`, in try/catch) and fires the window event `desk:theme` when the edition changes, so canvases and sprites are redrawn (app.js and spider.js listen).
