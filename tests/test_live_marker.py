@@ -566,34 +566,6 @@ console.log(JSON.stringify([legend({ live: 82290, canLive: true, prov: [139] }, 
     assert 'put($("chart-sub"), legend(s.chart, ' in _function(APP, "renderStage")
 
 
-def test_the_bubbles_follow_the_chart_down_when_its_legend_wraps():
-    """On a wide window the agents' bubbles sit on the chart under its head: BUBBLE_SPOTS are for a head of one line,
-    and when the legend wraps (BTC's at 1,280 px with its live entry, any tab's at 1,000) the bubbles move down by as
-    much as the legend reaches below the title's line, on every redraw (the legend changes with a light one too)."""
-    stage = _function(APP, "renderStage")
-    assert "const more = Math.max(0, Math.round(sub.offsetTop + sub.offsetHeight - ttl.offsetTop - ttl.offsetHeight));" in stage
-    assert 'bb.style.transform = more ? `translateY(${more}px)` : "";' in stage
-    assert stage.index('put($("chart-sub"), legend(') < stage.index("const more =")
-
-
-@node
-def test_the_bubbles_stay_over_the_plot_clear_of_the_price_axis():
-    """On a wide window (1,024 to 1,280 px) CROWD's bubble reached up to 87 px past the price axis and covered the LIVE
-    tag (at 1,280 its shadow covered the beating dot), VET and RISK the price labels. The bubbles' box now ends short of
-    the axis by their 3 px shadow and one more, on every redraw after the chart's (its axis is as wide as its widest
-    tag, which a price can change): a bubble's spot is of the plot's width and a bubble near its edge wraps to fit."""
-    js = _function(APP, "plotBubbles") + """
-const bb = { style: { right: "" } }, wrap = { clientWidth: 700 }, cv = { parentElement: wrap, offsetLeft: 6 };
-const $ = (id) => id === "bubbles" ? bb : cv;
-let lastGeom = { w: 688, padR: 86 };
-plotBubbles(); const a = bb.style.right;
-lastGeom = { w: 688, padR: 100 }; plotBubbles();
-console.log(JSON.stringify([a, bb.style.right]));"""
-    assert _node(js) == ["96px", "110px"]                                          # 700 - 6 - 688 + padR + 4
-    assert "drawChart(s.chart); drawWeb(); plotBubbles(); }" in _function(APP, "render")
-    assert re.search(r"\.bubbles \{ position: absolute; inset: 0;", STYLE)            # its right edge: plotBubbles'
-
-
 def test_the_readme_says_what_the_marker_is():
     readme = (ROOT / "README.md").read_text()
     assert "cyan `LIVE` line" not in readme

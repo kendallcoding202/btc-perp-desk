@@ -414,6 +414,7 @@
   }
 
   // ---- the crawler's web: legs reaching out to the last candles' highs ------------
+  // (#web is under the chart's canvas, style.css .web: the candles, lines and tags are drawn over its silk)
   function drawWeb() {
     const canvas = $("web");
     const { g, w, h } = fit(canvas);
@@ -439,6 +440,117 @@
     g.beginPath(); g.ellipse(cx, cy, 13, 10, -0.4, 0, Math.PI * 2); g.fill(); g.stroke();
     g.fillStyle = silk; g.beginPath(); g.ellipse(cx + 12, cy + 6, 8, 6, -0.4, 0, Math.PI * 2); g.fill();
     g.restore();
+  }
+
+  // ---- an agent card pointing at what its note is about ------------------------------------------------------------
+  // Hovering a card, tabbing to it or tapping it (a phone: for 3 s) marks on the chart the thing its note is about, and
+  // only when the chart draws it: SCAN's 60-bar line (the high, or the low its note names) with its price at its right
+  // end, VET's fast and slow averages, RISK's and SIZE's stop and entry (a position only), FILLS' fills. CROWD, CHIEF
+  // and CRAWLER have nothing on the chart, nor has a card whose thing isn't drawn (flat, no fills on it, warming up):
+  // those point at nothing. key: (s, card) => what to mark, or null
+  const POINTS = {
+    scan: (s, a) => {
+      const m = /(\d+)-bar (high|low)/.exec(a.quote || "");
+      return m && pointLine(s.chart[m[2] === "high" ? "don_hi" : "don_lo"], (v) => `${m[1]}-bar ${m[2]} ${pxAxis(v)}`,
+        css("--channel") || rgba("--muted", .55), [3, 4]);
+    },
+    vet: (s) => [pointLine(s.chart.ema_fast, () => "fast", css("--cyan")), pointLine(s.chart.ema_slow, () => "slow", css("--blue"))],
+    risk: (s) => [pointLevel(s.chart.stop, "stop", css("--orange"), [6, 4]),
+      pointLevel(s.chart.entry, "entry", css("--entry") || "rgba(241,241,246,.6)", [2, 3])],
+    fills: (s) => {   // each fill as drawn: an entry's pin (or triangle) hangs off its price, an exit's dot is on it
+      const ch = s.chart, idx = new Map(ch.candles.map((c, k) => [c[0], k])), pin = css("--entry-mark") === "pin", { X, Y } = lastGeom;
+      return (ch.markers || []).map((m) => {
+        const k = nearest(idx, m.ts, ch.bar_ms, ch.candles), d = m.side === "short" ? -1 : 1;
+        return k == null || !onPlot(Y(m.price)) ? null : m.kind === "entry" ? { mark: true, x: X(k), y: Y(m.price) + d * 9, r: pin ? 12 : 9 }
+          : { mark: true, x: X(k), y: Y(m.price), r: 8 };
+      });
+    },
+  };
+  POINTS.size = POINTS.risk;
+  const onPlot = (y) => y >= 0 && y <= lastGeom.h - 18;   // above the date axis (drawChart's padB)
+  // a series as drawn (null where it has no value), named at its right end; a level across the plot, named at its end
+  function pointLine(xs, name, color, dash = []) {
+    let k = xs ? xs.length - 1 : -1;
+    while (k >= 0 && xs[k] == null) k--;
+    const { X, Y } = lastGeom;
+    return k >= 0 && onPlot(Y(xs[k])) ? { xs, x: X(k) - 2, y: Y(xs[k]), name: name(xs[k]), color, dash } : null;
+  }
+  function pointLevel(p, name, color, dash) {
+    const { Y, w, padR } = lastGeom;
+    return p && onPlot(Y(p)) ? { at: p, x: w - padR - 4, y: Y(p), name: `${name} ${pxAxis(p)}`, color, dash } : null;
+  }
+  function referent(key, s) {
+    const a = (s.agents || []).find((x) => x.key === key), f = POINTS[key];
+    if (!a || !f || !lastGeom || !s.chart.candles.length) return null;
+    const out = [].concat(f(s, a)).filter(Boolean);
+    return out.length ? out : null;
+  }
+
+  // On #point, a canvas over the chart's: the plot washed pale but for the live line (as drawn) and the fills marked,
+  // the thing redrawn wider over a halo in the card's color, a line named at its end. The chart's own canvas, its
+  // values, lines and tags, and the price axis's column (the live tag and its beat) aren't touched. It fades in and
+  // out (style.css .point; still under reduced motion). Each redraw of the chart redraws it, and says which cards can
+  // be tabbed to: the ones that point at something
+  const point = { key: null, timer: 0 };
+  function drawPoint() {
+    const cv = $("point"), s = state, desk = !!(s && s.chart && s.header.kind !== "basket");
+    document.querySelectorAll("#agents .card").forEach((el) => {
+      const on = desk && !!referent(el.id.slice(5), s);
+      if (on !== el.hasAttribute("tabindex")) { if (on) el.tabIndex = 0; else el.removeAttribute("tabindex"); }
+    });
+    const ref = desk && point.key ? referent(point.key, s) : null;
+    cv.classList.toggle("on", !!ref);
+    if (!ref) return;   // (what it drew fades out as it was)
+    const { g } = fit(cv), { X, Y, w, h, padR } = lastGeom, pw = w - padR, ch = s.chart, tint = COLORS[point.key], c = $("chart");
+    const out = (draw) => { g.save(); g.globalCompositeOperation = "destination-out"; g.fillStyle = "#000"; draw(); g.restore(); };
+    g.translate(c.offsetLeft, c.offsetTop);
+    g.fillStyle = rgba("--panel", .6); g.fillRect(0, 0, pw, h - 18);
+    if (ch.live) out(() => line(g, [[0, Y(ch.live)], [pw, Y(ch.live)]], "#000", 5));
+    const lines = ref.filter((r) => !r.mark), at = stackTags(lines.map((l) => ({ y: l.y - 11, tie: 0 })), 0, 8, h - 26);
+    for (const l of lines) {
+      const pts = l.xs ? l.xs.map((v, k) => [X(k), v == null ? null : Y(v)]) : [[0, Y(l.at)], [pw, Y(l.at)]];
+      line(g, pts, rgba(tint, .3), 8);
+      line(g, pts, l.color, 2.5, l.dash);
+    }
+    for (const m of ref.filter((r) => r.mark)) {
+      out(() => { g.beginPath(); g.arc(m.x, m.y, m.r, 0, Math.PI * 2); g.fill(); });
+      g.save(); g.strokeStyle = rgba(tint, .3); g.lineWidth = 6; g.beginPath(); g.arc(m.x, m.y, m.r + 2, 0, Math.PI * 2); g.stroke();
+      g.strokeStyle = css(tint); g.lineWidth = 2; g.beginPath(); g.arc(m.x, m.y, m.r, 0, Math.PI * 2); g.stroke(); g.restore();
+    }
+    lines.forEach((l, k) => pointTag(g, l.x, at[k], l.name, css(tint)));
+  }
+  // a line's name, right-aligned at x: a caption box with the pointing card's color down its left edge
+  function pointTag(g, x, y, text, tint) {
+    g.save(); g.font = "bold 10px JetBrains Mono, monospace";
+    const tw = g.measureText(text).width + 14, x0 = Math.max(2, x - tw);
+    g.fillStyle = css("--caption") || css("--panel"); g.fillRect(x0, y - 8, tw, 16);
+    g.strokeStyle = css("--pen") || css("--text"); g.lineWidth = 1; g.strokeRect(x0 + 0.5, y - 7.5, tw - 1, 15);
+    g.fillStyle = tint; g.fillRect(x0, y - 8, 4, 16);
+    g.fillStyle = css("--text"); g.fillText(text, x0 + 9, y + 4); g.restore();
+  }
+  function pointAt(key, ms = 0) {
+    clearTimeout(point.timer); point.timer = 0; point.key = key;
+    if (key && ms) point.timer = setTimeout(() => pointAt(null), ms);
+    drawPoint();
+  }
+  // A card's mouse (or pen) hover, its keyboard focus, and a tap: renderAgents, once as each card is made. The card
+  // takes no touch for itself (no preventDefault), so a swipe on it scrolls the page as before. A tap points for 3 s;
+  // on a phone the cards are far below the chart, so a tap on one that points brings the chart into view first when
+  // none of it is on screen (and points a second longer for the scroll)
+  function tapped(key) {
+    const c = $("chart"), r = c.getBoundingClientRect(), go = (r.bottom < 0 || r.top > innerHeight) && !!state && !!referent(key, state);
+    if (go) c.scrollIntoView({ block: "center", behavior: still.matches ? "auto" : "smooth" });
+    pointAt(key, go ? 4000 : 3000);
+  }
+  function aim(el, key) {
+    let touch = false;
+    const keys = () => { try { return el.matches(":focus-visible"); } catch { return true; } };   // not a click's focus
+    el.addEventListener("pointerdown", (e) => { touch = e.pointerType === "touch"; });
+    el.addEventListener("pointerenter", (e) => { if (e.pointerType !== "touch") pointAt(key); });
+    el.addEventListener("pointerleave", (e) => { if (e.pointerType !== "touch" && point.key === key && !point.timer) pointAt(null); });
+    el.addEventListener("focus", () => { if (keys()) pointAt(key); });
+    el.addEventListener("blur", () => { if (point.key === key && !point.timer) pointAt(null); });
+    el.addEventListener("click", () => { if (touch) tapped(key); });
   }
 
   // ---- equity + pnl bars ----------------------------------------------------
@@ -514,6 +626,7 @@
           <div class="bar"><i></i></div><div class="quote"></div>`);
         if (a.asks_jev) el.insertAdjacentHTML("beforeend", `<span class="asks">ASKS JEV</span>`);
         root.append(el);
+        aim(el, a.key);
       });
     }
     agents.forEach((a) => {
@@ -527,35 +640,10 @@
       const bar = el.querySelector(".bar i");
       bar.style.width = `${Math.round((a.score ?? (a.state === "active" ? 1 : 0.25)) * 100)}%`;
       bar.style.background = `var(${COLORS[a.key]})`;
-      el.querySelector(".quote").textContent = `"${a.quote}"`;
-      el.querySelector(".quote").title = a.quote;
-    });
-  }
-
-  const BUBBLE_SPOTS = { scan: [6, 6], vet: [52, 8], size: [8, 62], fills: [30, 80], risk: [58, 50], crowd: [62, 24] };
-  function renderBubbles(agents) {
-    const root = $("bubbles");
-    root.innerHTML = "";
-    agents.filter((a) => BUBBLE_SPOTS[a.key]).forEach((a) => {
-      const [x, y] = BUBBLE_SPOTS[a.key];
-      const b = document.createElement("div");
-      b.className = "bubble";
-      b.style.left = `${x}%`; b.style.top = `${y}%`;
-      b.style.borderColor = `var(${COLORS[a.key]})`;
-      b.innerHTML = `<b style="color:var(${COLORS[a.key]})">${esc(a.name)}</b>${esc(a.quote)}`;
-      root.append(b);
+      el.querySelector(".quote").textContent = `"${a.quote}"`;   // the whole note, wrapped: nothing over the chart says it
     });
     const chief = agents.find((a) => a.key === "chief");
-    $("chief-bubble").textContent = chief ? chief.quote : "";
-  }
-  // The bubbles (a wide window: phones have none) kept over the plot, their box and its 3 px shadow ending short of
-  // the price axis, so none hides a tag past it (the live price's) or a price label: their spots are of the plot's
-  // width, and a bubble near its right edge wraps its line to fit. After drawChart, which knows the axis's width
-  function plotBubbles() {
-    const bb = $("bubbles"), cv = $("chart");
-    if (!lastGeom) return;
-    const right = `${Math.round(cv.parentElement.clientWidth - cv.offsetLeft - lastGeom.w + lastGeom.padR + 4)}px`;
-    if (bb.style.right !== right) bb.style.right = right;
+    $("chief-bubble").textContent = chief ? chief.quote : "";   // the chief's line, beside the chart (never over it)
   }
 
   // With deposits or withdrawals (the board only has "flows" once there's one): the P&L leaves them out, and its
@@ -592,11 +680,6 @@
       ` · ${pnlHtml(s)} · FEES ${usd(t.fees)}${v ? " (EST.)" : ""} · FUNDING ${v ? "(EST.) " : ""}${usd(t.funding)}`);
     txt($("chart-title"), `${v ? v.product : coin + "-PERP"} · ${s.header.interval} · ${px(t.price)}${proxy ? " (HL proxy)" : ""}`);
     put($("chart-sub"), legend(s.chart, `<span class="${chgCls}">24h ${pct(t.change_24h)}</span>`));
-    // the agents' bubbles (BUBBLE_SPOTS: for a head of one line) moved down by as much as the legend reaches below the
-    // title's line (a wide window where it wraps), so they sit on the chart as before, never over its title or legend
-    const sub = $("chart-sub"), ttl = $("chart-title"), bb = $("bubbles");
-    const more = Math.max(0, Math.round(sub.offsetTop + sub.offsetHeight - ttl.offsetTop - ttl.offsetHeight));
-    if (bb._more !== more) { bb._more = more; bb.style.transform = more ? `translateY(${more}px)` : ""; }
     const chips = $("chips");
     put(chips, s.agents.map((a) => `<span class="chip ${a.state === "idle" ? "off" : ""}" title="${esc(a.name)}: ${esc(a.state)}"
       style="background:var(${COLORS[a.key]})">${esc(a.name[0])}</span>`).join(""));
@@ -1261,8 +1344,8 @@
     if (ACCOUNTS.includes(c) && c !== coin) show(c);
   });
 
-  // light: a redraw for a new price only (Coinbase's, once a second): what a price moves, not the agents, their
-  // bubbles, the P&L bars, the rules or the switches, which only a new board changes. drawn: what the last one showed
+  // light: a redraw for a new price only (Coinbase's, once a second): what a price moves, not the agents' cards, the
+  // P&L bars, the rules or the switches, which only a new board changes. drawn: what the last one showed
   const drawn = { bank: null, price: null, source: null, mids: 0 };
   // Only `true` is the light redraw. A resize hands render its event (a phone turned on its side): everything is redrawn
   // at the new size, the equity curve and the P&L bars too, a full render, once a frame at most
@@ -1294,7 +1377,7 @@
     renderCoins(); notice();
     if (s.venue) cb.mode = cbMode(lp);
     if (basket) renderBasket(s);
-    else { if (!light) renderAgents(s.agents); renderStage(s); if (!light) renderBubbles(s.agents); drawChart(s.chart); drawWeb(); plotBubbles(); }
+    else { if (!light) renderAgents(s.agents); renderStage(s); drawChart(s.chart); drawWeb(); drawPoint(); }
     // a Hyperliquid price is LIVE (ETH's, SOL's, VT's) until it is STALE old: then a redraw takes LIVE off the chart's
     // marker, the ticker and the footer, unless a newer one has come (BTC's Coinbase price and the proxy: cbWatch
     // redraws when either stops being fresh)
