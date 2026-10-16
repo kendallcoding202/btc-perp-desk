@@ -23,6 +23,12 @@ A static site with no build step and no framework, published by the paper workfl
 - **Network:** only Hyperliquid's public API (`api.hyperliquid.xyz`), Coinbase's public market-data WebSocket (`advanced-trade-ws.coinbase.com`, one socket, BTC only, closed while the page is hidden, retries backed off) and Google Fonts, all already used. No new CDNs, trackers or libraries without a strong reason. There is no Content-Security-Policy; if one is ever added, its `connect-src` must allow exactly those two hosts.
 - Keep the PAPER badge visible, the four tabs, the spider, and its footer on/off toggle.
 
+# The theme (comic lab notebook, day and night editions)
+
+- `theme-comic.css` loads after `style.css` and `activity.css` and only overrides them; `edition.js` loads last. It runs the footer's `day · night · auto` switch (localStorage `desk-edition`, in try/catch) and fires the window event `desk:theme` when the edition changes, so canvases and sprites are redrawn (app.js and spider.js listen).
+- A money span (a bank, the balance, HOLD, P&L) takes its classes from app.js's `tone(x, dp)`: today's `ok` / `bad` plus `up` / `down` / `flat`. The theme draws ▲ / ▼ from those classes, so never match inline colors in CSS, and never give LONG / SHORT an arrow. `CLOSED (COINBASE)` goes through `closedTag()`.
+- Canvas colors and shapes come from `:root` tokens with today's look as the fallback: `--entry`, `--channel`, `--candle-up: hollow`, `--entry-mark: pin`, `--web-silk` / `--web-dot` / `--web-glow` / `--web-hub`, `--spider-body` / `--spider-eye`. New drawing code reads a token the same way, never a hard-coded color. `tests/test_theme_hooks.py` checks the hooks.
+
 # Previewing locally (no keys needed)
 
 ```bash

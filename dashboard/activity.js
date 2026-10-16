@@ -289,6 +289,7 @@
     const mode = b.header.mode || "PAPER";
     set(M.mode, mode); M.mode.classList.toggle("act-livemode", mode !== "PAPER");
     set(L.lmode, mode); L.lmode.classList.toggle("act-livemode", mode !== "PAPER");
+    M.mode.dataset.mode = L.lmode.dataset.mode = mode.toLowerCase();   // theme hook: which mode, not only "not PAPER"
     M.dot.classList.toggle("act-stale", old || lost);
     set(M.st, lost ? (narrow.matches ? `CAN'T READ THE BOARD SINCE ${hhmm(lastRead)}` : `CAN'T READ THE BOARD SINCE ${hhmm(lastRead)} UTC · SHOWING THE ONE BUILT ${hhmm(b.updated)} UTC`)
       : old ? `STALE · NO NEW BOARD FOR ${age}`      // the run's time is in the REPLAY label
@@ -738,7 +739,7 @@
   function moved(src, m) {
     const d = prevMid && prevMid.src === src && isFinite(m) ? m - prevMid.m : null;
     if (isFinite(m)) prevMid = { src, m };
-    return d == null ? "" : d === 0 ? " ·0" : ` ${d > 0 ? "▲" : "▼"}${Number(Math.abs(d).toPrecision(6))}`;
+    return d == null ? "" : d === 0 ? " ·0" : ` ${d > 0 ? "+" : "−"}${Number(Math.abs(d).toPrecision(6))}`;
   }
   function tapeTick(now) {
     if (po) po.takeRecords().forEach(take);
