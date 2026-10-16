@@ -337,6 +337,7 @@ def cmd_step(args) -> int:
                                      for h in s["basket"]["holdings"]]})
         else:
             row.update({"kind": "desk", "risk_per_trade": p.sizing.risk_per_trade, "shorts": p.strategy.allow_shorts})
+            row.update(board_mod.index_marks(s))     # cash, position, sessions: the card's live re-mark
             if s.get("venue"):      # BTC on Coinbase: the tab says so, with the contracts it holds
                 row.update({"venue": s["venue"]["name"], "contracts": s["venue"]["contracts"]})
         summary.append(row)

@@ -907,11 +907,10 @@
     if (lp.source === "coinbase") s.chart.live = mid;
     const t = s.ticker;
     t.price = mid; s.analysis.stats.price = mid;
-    const p = t.pos;
-    const u = p ? (p.side === "long" ? 1 : -1) * p.qty * (mid - p.entry) : 0;
-    if (t.cash != null && t.cash + u > 0) {
-      t.hold_pct = p ? u / (p.qty * p.entry) : 0;
-      rebank(s, t.cash + u);
+    const p = t.pos, m = remark(t.cash, p, mid);
+    if (m) {
+      t.hold_pct = p ? m.u / (p.qty * p.entry) : 0;
+      rebank(s, m.bank);
     }
     const c = live.candle, ch = s.chart;   // never Hyperliquid's forming candle on a Coinbase chart
     if (c && !s.venue && live.candleCoin === (s.header.coin || "BTC") && ch.candles.length && c[0] > ch.candles[ch.candles.length - 1][0]) {
@@ -925,6 +924,27 @@
     return s;
   }
 
+  // A desk account's bank re-marked at `price`: its cash (the realised balance) plus the open position's move. The tab
+  // (withLive) and its card in the tab row both use this, so they agree. null: nothing to re-mark with
+  function remark(cash, pos, price) {
+    if (cash == null || !(price > 0)) return null;
+    const u = pos ? (pos.side === "long" ? 1 : -1) * pos.qty * (price - pos.entry) : 0;
+    return cash + u > 0 ? { bank: cash + u, u } : null;
+  }
+  // index.json's BTC row as a venue livePrice reads: Coinbase's product, closed now (and until when), its next closure
+  const rowVenue = (c) => c.product ? { name: c.venue, product: c.product, closed_now: c.closed_now || null,
+    session: { next_closure: c.next_closure || null } } : null;
+  // A desk account's card, priced as its own tab would be right now, so it reads the same whichever tab is open: ETH and
+  // SOL at Hyperliquid's mid; BTC on Coinbase by livePrice on its venue (Coinbase's own price while the feed is fresh,
+  // else Hyperliquid's as the proxy, the board's price while Coinbase is closed). The re-mark is the tab's (remark).
+  // {bank, price, lp}: the board's bank and price when there's no live price (or an index from before cash was in it)
+  function cardMark(c) {
+    const lp = c.venue === "coinbase" ? livePrice({ venue: rowVenue(c) || cb.venue, header: { coin: c.coin } })
+      : { source: "hyperliquid", price: live.at ? parseFloat(live.mids[c.coin]) : NaN };
+    const price = lp.source && lp.price > 0 ? lp.price : NaN, m = remark(c.cash, c.pos, price);
+    return { bank: m ? m.bank : c.bank, price: price > 0 ? price : c.price, lp };
+  }
+
   function renderCoins() {
     const nav = $("coins");
     if (!index || !index.coins) { nav.hidden = true; return; }
@@ -932,19 +952,19 @@
     let start = 0, bank = 0, net = 0;
     const cards = index.coins.map((c) => {
       if (c.error) return `<button class="coin err" data-coin="${esc(c.coin)}"><span class="c-name">${esc(c.coin)}</span><span class="c-sub">error: ${esc(c.error)}</span></button>`;
-      const basket = c.kind === "basket", lp = parseFloat(live.mids[c.coin]);
+      const basket = c.kind === "basket";
       const open = c.coin === (state && state.header.coin) && state.ticker.bank != null;
-      let b = open ? state.ticker.bank : c.bank;
+      // its tab open: what the tab shows; otherwise re-marked here by the tab's own rules (cardMark), every card and
+      // so the ALL total moving with the live prices whichever tab is open
+      const mk = basket ? null : cardMark(c);
+      let b = open ? state.ticker.bank : basket ? c.bank : mk.bank;
       if (basket && !open && live.at && c.holdings) {   // the basket's tab isn't open: re-mark it from the same mids
         const m = basketLive(c.cash, JSON.parse(JSON.stringify(c.holdings)));
         if (m.bank > 0) b = m.bank;
       }
       start += c.start; bank += b; net += c.net_flows || 0;
-      // BTC on Coinbase: its tab open, the price its ticker shows; otherwise by the same rules, from its board as last
-      // shown: the board's price while Coinbase is closed, Coinbase's own while the feed is fresh, else Hyperliquid's
-      const cbCard = c.venue === "coinbase" && !basket, cbq = cbCard && livePrice({ venue: cb.venue, header: { coin: c.coin } });
-      const label = basket ? (c.holdings || []).map((h) => h.coin).join("·") : cbCard && open && state.livePx ? px(state.ticker.price)
-        : cbCard ? (cb.mode = cbMode(cbq), px(cbq.source && cbq.price || c.price)) : lp ? px(lp) : px(c.price);
+      if (c.venue === "coinbase" && !basket && !open) cb.mode = cbMode(mk.lp);   // cbWatch redraws the card when it changes
+      const label = basket ? (c.holdings || []).map((h) => h.coin).join("·") : open ? px(state.ticker.price) : px(mk.price);
       const sub = basket ? " · basket" : ` · risk ${(c.risk_per_trade * 100).toFixed(0)}%${c.shorts ? " · +shorts" : ""}${c.venue ? ` · ${esc(c.venue)}` : ""}`;
       const made = c.units != null ? b - c.start - (c.net_flows || 0) : b - c.start;
       const pnlCls = b == null || c.start == null ? "" : tone(made);
@@ -1012,7 +1032,11 @@
     state = withLive(base);
     if (!state) return;
     const s = state, hdr = s.header, lp = s.livePx || {};
-    if (s.venue && s.venue.name === "coinbase" && s.venue.product) { cb.product = s.venue.product; cb.venue = s.venue; }   // kept for the BTC card
+    // Coinbase's product and closures for the socket and the BTC card: the BTC board's while it's open, else the
+    // index's row for it (the same run), so a page opened straight on another tab prices the BTC card by the same rules
+    const cbRow = !s.venue && index && index.coins ? index.coins.find((c) => c.venue === "coinbase" && !c.error && c.product) : null;
+    if (s.venue && s.venue.name === "coinbase" && s.venue.product) { cb.product = s.venue.product; cb.venue = s.venue; }
+    else if (cbRow) { cb.product = cbRow.product; cb.venue = rowVenue(cbRow); }
     cbSync();
     txt($("title"), hdr.title);
     txt($("tagline"), hdr.tagline);

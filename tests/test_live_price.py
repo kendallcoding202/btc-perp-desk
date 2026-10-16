@@ -212,12 +212,13 @@ def test_a_quiet_ticker_reconnects_and_then_takes_an_update():
 
 
 def test_the_btc_card_follows_the_same_rules_on_every_tab():
-    """On the other tabs the BTC card is priced by livePrice on the BTC board's venue as last shown: the board's price
-    while Coinbase is closed."""
-    coins = _function(APP, "renderCoins")
-    assert "livePrice({ venue: cb.venue, header: { coin: c.coin } })" in coins
-    assert "px(cbq.source && cbq.price || c.price)" in coins
-    assert "cb.venue = s.venue;" in APP
+    """On the other tabs the BTC card is priced by livePrice on its venue from index.json's row (the same run's
+    closures), else the BTC board's as last shown: the board's price while Coinbase is closed. tests/test_live_cards.py
+    runs it."""
+    mark = _function(APP, "cardMark")
+    assert "livePrice({ venue: rowVenue(c) || cb.venue, header: { coin: c.coin } })" in mark
+    assert "price: price > 0 ? price : c.price" in mark
+    assert "cb.venue = s.venue;" in APP and "cb.venue = rowVenue(cbRow);" in APP
 
 
 def test_listeners_hear_a_change_of_source_at_once():

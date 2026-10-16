@@ -538,6 +538,20 @@ def with_flows(state: dict, flows, equity: float, now_ms: int) -> dict:
     return state
 
 
+def index_marks(state: dict) -> dict:
+    """What index.json's row for a desk account needs so the page can re-mark its card between runs from the same price
+    its own tab uses (a card then reads the same whichever tab is open): the cash, the open position (side, quantity,
+    entry), and for an account on a venue with sessions (BTC on Coinbase) its product, whether the run found it closed
+    (why, until when) and its next closure: while Coinbase is closed the card keeps the board's price, as the tab does."""
+    t, v = state["ticker"], state.get("venue")
+    pos = t.get("pos")
+    out = {"cash": t.get("cash"), "pos": None if pos is None else {k: pos[k] for k in ("side", "qty", "entry")}}
+    if v is not None:
+        out.update({"product": v.get("product"), "closed_now": v.get("closed_now"),
+                    "next_closure": (v.get("session") or {}).get("next_closure")})
+    return out
+
+
 def basket(book, *, now_ms: int, marks: dict[str, float], meta: dict, crawler: dict | None = None,
            goal_pace: dict | None = None, preview: dict | None = None, equity_points: int = 400, flows=None) -> dict:
     """The VT basket's board (desk/voltrend.py). Its own panels are under "basket". The keys the desk boards carry
