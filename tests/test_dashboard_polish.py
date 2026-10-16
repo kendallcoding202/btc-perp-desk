@@ -107,8 +107,10 @@ live.at = now - 26000;
 const stale = foot(s({ source: "hyperliquid", price: 82046, at: live.at, stale: true }));
 live.at = now - 3000;
 const fresh = foot(s({ source: "hyperliquid", price: 82046, at: live.at, stale: false }));
-console.log(JSON.stringify({ stale, fresh }));"""
+const behind = foot({ ...s({ source: "hyperliquid", price: 82046, at: live.at }), updated: now + 13 * 60000 });   // the phone's clock behind
+console.log(JSON.stringify({ stale, fresh, behind }));"""
     out = _node(js)
+    assert "desk updated Oct 15, 8:00 pm MT (0 min ago)" in out["behind"]
     assert "stale price: Hyperliquid's (a proxy for Coinbase's) last came 26s ago" in out["stale"]
     assert "live price" not in out["stale"]
     assert "live price 3s ago from Hyperliquid (a proxy" in out["fresh"]
@@ -400,7 +402,7 @@ def test_the_walking_spider_fades_while_it_crosses_money():
         assert "fade: true" in body and "passing();" in body, fn
     assert "const passing = () => { pass = money(); };" in SPIDER
     paint = _function(SPIDER, "paint")
-    assert "!clear({ x: x + S / 2 + fx, y: y + S / 2 + fy }, pass, false)" in paint
+    assert "!clear({ x: x + S / 2 + fx, y: y + S / 2 + fy }, pass, false, 2)" in paint
     assert 'body.classList.toggle("over-money", over)' in paint
     assert "money()" not in paint and "getBoundingClientRect" not in paint and "getClientRects" not in paint
-    assert re.search(r"\.spider\.over-money \{ opacity: \.1\d?; \}", STYLE)
+    assert re.search(r"\.spider\.over-money \{ opacity: \.1\d?; transition-duration: 0s; \}", STYLE)

@@ -1185,7 +1185,8 @@
   }
   function foot(s) {
     const hdr = s.header, lp = s.livePx || {};
-    const age = Math.round((Date.now() - s.updated) / 60000), secs = (t) => Math.max(0, Math.round((Date.now() - t) / 1000));
+    // (a phone clock behind the desk's: 0 min, never a negative age)
+    const age = Math.max(0, Math.round((Date.now() - s.updated) / 60000)), secs = (t) => Math.max(0, Math.round((Date.now() - t) / 1000));
     const cn = lp.closed;   // BTC on Coinbase: its own feed, else Hyperliquid's as a proxy, else closed (and why)
     return `desk updated ${MT.when(s.updated)} ${TZ} (${age} min ago)` +
       (s.venue && cn ? (cn.by === "schedule" ? ` · Coinbase is closed now by its schedule (${cn.why}, until ${hhmm(cn.until)} ${TZ}): no live price`

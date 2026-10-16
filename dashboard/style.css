@@ -302,8 +302,8 @@ body.has-live .big { text-shadow: 0 0 16px color-mix(in srgb, currentColor 50%, 
 .spider[data-mood="found"] { filter: drop-shadow(0 0 3px #ffd84a); }
 .spider[data-mood="trade"] { filter: drop-shadow(0 0 3px #f7f8fb); }
 .spider.asleep, .spider[data-mood="asleep"] { opacity: .4; filter: none; }   /* no fresh board: the desk is not running */
-.spider { transition: opacity .12s linear; }
-.spider.over-money { opacity: .15; }   /* crossing a bank, a price or a P&L on its way: the figure shows through */
+.spider { transition: opacity .12s linear; }   /* back in view gently, out of the way at once: */
+.spider.over-money { opacity: .15; transition-duration: 0s; }   /* crossing a bank, a price or a P&L on its way */
 .spider-silk { display: none; width: 1px; height: 1px; background: var(--cyan); box-shadow: 0 0 6px var(--cyan); transform-origin: 0 0; }
 
 /* phones and narrow windows */

@@ -183,10 +183,10 @@
     return out;
   }
   // would the sprite standing at p touch none of these words? (its drawn part: S/2 either side, S/2 above, 11/24 S
-  // below; with `shake`, also while it twitches there: 2 px either side, 4 px up)
-  function clear(p, ws, shake) {
-    const sx = S / 2 + (shake ? 2 : 0), up = S / 2 + (shake ? 4 : 0);
-    return !ws.some((q) => q.r > p.x - sx && q.l < p.x + sx && q.b > p.y - up && q.t < p.y + S * 11 / 24);
+  // below; with `shake`, also while it twitches there: 2 px either side, 4 px up; `inset` px of overlap allowed)
+  function clear(p, ws, shake, inset = 0) {
+    const sx = S / 2 + (shake ? 2 : 0) - inset, up = S / 2 + (shake ? 4 : 0) - inset;
+    return !ws.some((q) => q.r > p.x - sx && q.l < p.x + sx && q.b > p.y - up && q.t < p.y + S * 11 / 24 - inset);
   }
   // the money on the page is never sat on: the tabs' banks and prices, the big balance and HOLD, the tickers, the cards'
   // values and the desk monitor. A perch on an edge over any of it slides along that edge to clear it, or isn't taken
@@ -544,7 +544,8 @@
     const x = Math.round(clamp(sp.x + sp.ox - fx, S / 2, fw - S / 2) - S / 2);
     const y = Math.round(clamp(sp.y + sp.oy - fy, S / 2, fh - S / 2) - S / 2);
     if (x !== lastX || y !== lastY) { body.style.transform = `translate3d(${x}px,${y}px,0)`; lastX = x; lastY = y; }
-    const over = !!(act && act.fade) && !clear({ x: x + S / 2 + fx, y: y + S / 2 + fy }, pass, false);   // crossing money
+    // crossing money (more than grazing it: a hop ends just above the price it points at, in full view)
+    const over = !!(act && act.fade) && !clear({ x: x + S / 2 + fx, y: y + S / 2 + fy }, pass, false, 2);
     if (over !== faded) { faded = over; body.classList.toggle("over-money", over); }
     const blink = !sp.asleep && !reduced.matches && (now % 3200) < 150;
     pose(sp.legs ? Math.floor(now / sp.legs) % 2 : sp.pose, blink);
