@@ -58,6 +58,7 @@
 .act-sh { display: flex; justify-content: space-between; gap: 8px; font-size: 10px; white-space: nowrap; overflow: hidden; }
 .act-sh > span:first-child { color: var(--blue); overflow: hidden; text-overflow: ellipsis; }
 .act-cnt { flex: none; color: var(--muted); }
+@media (max-width: 340px) { .act-sh .act-tz { display: none; } }   /* a 320 px phone: "REPLAY · LAST RUN 10:30 PM" whole */
 .act-wd, .act-cnt .c-info, .act-cnt .c-skip { display: none; }   /* a phone: the grey nodes need no count */
 .act-cnt .c-pass { color: var(--green); } .act-cnt .c-wait { color: var(--blue); } .act-cnt .c-drop { color: var(--red); }
 .act-cnt .c-mark { color: var(--yellow); } .act-cnt .c-info, .act-cnt .c-skip { color: var(--muted); }

@@ -95,9 +95,10 @@ const fix = (x, dp) => Number(x).toFixed(dp), esc = (x) => String(x), modeWord =
 const reduced = { matches: true }, visible = () => false, monOn = false, runs = {}, chain = () => null;
 const node = () => ({ textContent: "", innerHTML: "", children: [], classList: { add() {}, remove() {} } });
 const M = { rl: node(), cnt: node(), nodes: node(), read: node() };
-const B = """ + json.dumps(s) + ";\n" + _function(ACT, "vtStrip") + """
+const B = """ + json.dumps(s) + ";\n" + _function(ACT, "vtStrip") + (
+        _function(ACT, "replayLabel") if "function replayLabel(" in ACT else "") + """
 vtStrip(false);
-console.log(JSON.stringify({ rl: M.rl.textContent, read: M.read.textContent }));
+console.log(JSON.stringify({ rl: (M.rl.innerHTML || M.rl.textContent).replace(/<[^>]+>/g, ""), read: M.read.textContent }));
 """
     out = _node(js, tz)
     want = datetime.fromtimestamp(bk["last_close_ts"] / 1000, tz=timezone.utc).astimezone(mountain.TZ).strftime("%m-%d")
@@ -265,3 +266,5 @@ def test_the_one_line_readouts_keep_their_ends():
     assert '"BELOW"}</span> at ${B.basket.last_close_ts ? `${hr(B.basket.last_close_ts)} ${TZ}` : "the last close"}`' in ACT
     assert "last run ${hhmm(B.updated)}`" in ACT and "board built ${hhmm(B.updated)}${kb}`" in ACT
     assert ': tight.matches ? `LAST RUN ${age} AGO`' in ACT and 'matchMedia("(max-width: 380px)")' in ACT
+    assert '<span class="act-tz"> ${TZ}</span>' in _function(ACT, "replayLabel")       # 320 px: the zone goes, not the time
+    assert "@media (max-width: 340px) { .act-sh .act-tz { display: none; } }" in (DASH / "activity.css").read_text()

@@ -415,6 +415,12 @@
   }
 
   // ---- monitor row 3: the gate strip, a labelled replay of the last run's checks ---------------------------
+  // its label, "REPLAY · LAST RUN 10:30 PM MT": a 320 px phone drops the zone (activity.css), never the time; the
+  // header and the countdown say MT
+  function replayLabel(tail) {
+    const h = `REPLAY · LAST RUN ${HHMM(B.updated)}<span class="act-tz"> ${TZ}</span>${esc(tail)}`;
+    if (M.rl.innerHTML !== h) M.rl.innerHTML = h;
+  }
   let gates = [], blocker = -1;
   function gateLine(g) {
     const t = g.threshold == null ? "" : ` (${g.op === "min" ? "min" : g.op === "max" ? "max" : "vs"} ${n2(g.threshold)})`;
@@ -449,7 +455,7 @@
       (idx.length ? idx.map((k) => `<i class="act-node v-${gates[k].verdict}${k === blocker ? " act-block" : ""}${blocker >= 0 && k > blocker ? " act-after" : ""}" data-n="${k}" title="${esc(gateLine(gates[k]) + " · " + word(gates[k].verdict, gates[k]))}"></i>`).join("")
         : `<i class="act-node act-jev" title="${esc(jevNote)}"></i>`) + `</span>`).join("");
     M.nodes.dataset.jev = jevNote;
-    set(M.rl, `REPLAY · LAST RUN ${HHMM(B.updated)} ${TZ}`);
+    replayLabel("");
     M.cnt.innerHTML = `<span class="act-wd">${gates.length} checks: </span>` + ["pass", "mark", "wait", "drop", "info", "skip"].filter((w) => tally[w])
       .map((w, k) => `<span class="c-${w}">${k ? " · " : ""}${tally[w]} ${w}</span>`).join("");
   }
@@ -481,7 +487,7 @@
   // ---- monitor row 3, VT: what the last run's close says per coin ------------------------------------------
   function vtStrip(play) {
     const hs = B.basket.holdings, decided = hs.some((h) => h.decided_ts != null);
-    set(M.rl, `REPLAY · LAST RUN ${HHMM(B.updated)} ${TZ} · the ${md(B.basket.last_close_ts || B.updated)} close`);
+    replayLabel(` · the ${md(B.basket.last_close_ts || B.updated)} close`);
     M.cnt.innerHTML = "";
     M.nodes.innerHTML = hs.map((h) => {
       const t = h.sma50 == null ? `${h.coin} warming up` : h.above_sma ? `${h.coin} → ${fix(h.target_units || 0, 2)} units` : `${h.coin} → 0 units`;
