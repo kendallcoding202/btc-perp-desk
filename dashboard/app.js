@@ -280,8 +280,10 @@
     // edition's gold is lighter on its paper than the other lines are, so it is drawn wider there)
     if (chart.live) {
       line(g, [[0, Y(chart.live)], [w - padR, Y(chart.live)]], css("--live") || "#ffd84a", +(css("--live-width") || 1.5));
-      // a stop at the price: its dashes over the live line, not hidden under it (its tag is stacked past the live one)
+      // a stop at the price: its dashes over the live line, not hidden under it (its tag is stacked past the live one);
+      // an entry at it, its dots on top too, in the live tag's ink (the night entry's cream doesn't read on the gold)
       if (chart.stop && Math.abs(Y(chart.stop) - Y(chart.live)) < 2) line(g, [[0, Y(chart.stop)], [w - padR, Y(chart.stop)]], css("--orange"), 1.2, [6, 4]);
+      if (chart.entry && Math.abs(Y(chart.entry) - Y(chart.live)) < 2) line(g, [[0, Y(chart.entry)], [w - padR, Y(chart.entry)]], css("--on-live") || "#17161c", 1, [2, 3]);
       liveBeat(chart.live, liveTag(g, w - padR, ty[0], chart.live));
     } else liveBeat(0, null);
     lastGeom = { X, Y, cs, w, h, padR };
@@ -329,9 +331,8 @@
   // runs between prices, none for a message or an answer with the same price (the book moved, no trade), and none
   // under reduced motion. It grows to 1.6 times at most, so it stays clear of the tag's "LIVE". price: the live price
   // drawn (the same one again: no beat); dot: [x, y] on #chart, null when no live tag is drawn
-  const beat = { el: null, price: 0, dot: null }, still = matchMedia("(prefers-reduced-motion: reduce)");
+  const beat = { el: null, price: 0 }, still = matchMedia("(prefers-reduced-motion: reduce)");
   function liveBeat(price, dot) {
-    beat.dot = dot;
     if (!dot) { beat.price = 0; if (beat.el && beat.el.getAnimations) beat.el.getAnimations().forEach((a) => a.cancel()); return; }
     if (price === beat.price) return;
     beat.price = price;

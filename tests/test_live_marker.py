@@ -485,6 +485,29 @@ out.apart = frame(TOKS.{edition}, b);""")
 
 
 @node
+@pytest.mark.parametrize("edition", ["day", "night"])
+def test_an_entry_at_the_live_price_shows_over_the_live_line(edition):
+    """The price back at the entry: the entry's dotted line is drawn again over the solid live one (under it, it was
+    hidden), in the live tag's ink, which reads on the gold in both editions (the night entry's cream doesn't); an
+    entry away from the price is drawn once, in its own color, under the live line as before."""
+    o = _draw(f"""
+const a = chartOf({{ side: "long" }}); a.live = a.candles[N - 1][4] - 300; a.entry = a.live;
+out.at = frame(TOKS.{edition}, a);
+const b = chartOf({{ side: "long" }}); b.live = b.candles[N - 1][4] - 300; b.entry = b.live - 900;
+out.apart = frame(TOKS.{edition}, b);""")
+    tok = DAY if edition == "day" else NIGHT
+    live, entry, ink = tok["--live"], tok["--entry"], tok["--on-live"]
+    at = [x for x in o["at"]["lines"] if abs(x["y"] - o["at"]["yLive"]) < 2]
+    assert [(x["color"], x["dash"]) for x in at] == [(entry, "2,3"), (live, ""), (ink, "2,3")]   # the last one on top
+    assert _contrast(ink, live) >= 3
+    if edition == "night":
+        assert _contrast(entry, live) < 1.5                                            # why not in its own color
+    apart = o["apart"]["order"]
+    assert apart.count(entry) == 1 and ink not in apart and apart.index(entry) < apart.index(live)
+    assert "beat.dot" not in APP and "const beat = { el: null, price: 0 }," in APP     # (its dot only ever passed in)
+
+
+@node
 @pytest.mark.parametrize("held", [False, True])
 def test_the_live_tags_room_is_kept_so_the_candles_never_move_sideways(held):
     """A chart that can have a live price (canLive: BTC's on Coinbase, ETH's, SOL's) keeps the live tag's room in its
@@ -569,6 +592,12 @@ console.log(JSON.stringify([a, bb.style.right]));"""
     assert _node(js) == ["96px", "110px"]                                          # 700 - 6 - 688 + padR + 4
     assert "drawChart(s.chart); drawWeb(); plotBubbles(); }" in _function(APP, "render")
     assert re.search(r"\.bubbles \{ position: absolute; inset: 0;", STYLE)            # its right edge: plotBubbles'
+
+
+def test_the_readme_says_what_the_marker_is():
+    readme = (ROOT / "README.md").read_text()
+    assert "cyan `LIVE` line" not in readme
+    assert "a solid gold line ending in one `● LIVE 82,290` tag on the price at the right edge" in readme
 
 
 # ---------------------------------------------------------------- the beat

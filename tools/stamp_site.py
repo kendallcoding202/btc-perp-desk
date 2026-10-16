@@ -4,10 +4,11 @@ _site once dashboard/ is copied in (.github/workflows/paper.yml), and nothing it
 
     python3 -m tools.stamp_site <site-dir> <commit>
 
-Each <site-dir>/*.html gets <meta name="desk-build" content="<commit>"> in its head, and every one of the site's own
-.js and .css files it loads (a relative src or href on a script or link tag; never Google Fonts or any other absolute
-URL) a ?v=<short commit>, so a browser that kept app.js from an earlier deploy (GitHub Pages sends max-age=600) fetches
-the new one. Then version.json, {"build": "<commit>"}, last: when it's there, every page carries that build.
+Each <site-dir>/*.html gets <meta name="desk-build" content="<commit>"> at the start of its head (after the charset:
+every script on the page finds it, wherever it is loaded), and every one of the site's own .js and .css files it loads
+(a relative src or href on a script or link tag; never Google Fonts or any other absolute URL) a ?v=<short commit>, so
+a browser that kept app.js from an earlier deploy (GitHub Pages sends max-age=600) fetches the new one. Then
+version.json, {"build": "<commit>"}, last: when it's there, every page carries that build.
 The same commit stamps the same bytes (every run on one commit: a run that only brings new boards changes nothing a
 page compares), and stamping again changes nothing; another commit's stamp is replaced. Every page is stamped in memory
 first, then each file is replaced whole (written beside it, renamed over it), so a failure leaves each file either as
@@ -27,7 +28,7 @@ COMMIT = re.compile(r"[0-9a-f]{7,64}")
 ASSET = re.compile(r"""(<(?:script|link)\b[^>]*?\s(?:src|href)=)(["'])([^"'>]*)\2""", re.I)
 ABSOLUTE = re.compile(r"[a-z][a-z0-9+.-]*:|[/#?]", re.I)     # https:, data:, //host, /path, #, ?: not one of the site's files
 META = re.compile(r'<meta name="desk-build" content="[^"]*">\n?')
-HEAD_END = re.compile(r"</head>", re.I)
+HEAD = re.compile(r"<head\b[^>]*>\s*(?:<meta\s+charset=[^>]*>\n?)?", re.I)   # the head's start tag, and the charset after it
 
 
 def versioned(url: str, short: str) -> str:
@@ -46,10 +47,10 @@ def stamp_page(html: str, commit: str) -> str:
     """One page, stamped: its own assets versioned and the build in its head, any earlier stamp replaced."""
     html = ASSET.sub(lambda m: m[1] + m[2] + versioned(m[3], commit[:7]) + m[2], html)
     html = META.sub("", html)
-    end = HEAD_END.search(html)
-    if not end:
-        raise ValueError("a page has no </head> to put the build in")
-    return f'{html[:end.start()]}<meta name="desk-build" content="{commit}">\n{html[end.start():]}'
+    head = HEAD.search(html)
+    if not head:
+        raise ValueError("a page has no <head> to put the build in")
+    return f'{html[:head.end()]}<meta name="desk-build" content="{commit}">\n{html[head.end():]}'
 
 
 def _replace(path: Path, data: bytes) -> None:

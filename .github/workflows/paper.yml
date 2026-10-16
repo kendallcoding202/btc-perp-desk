@@ -145,13 +145,14 @@ jobs:
       # (dashboard/version.js). Every run on one commit stamps the same: new boards alone never reload a page. It can't
       # stop the deploy: a stamp that fails or is stopped part way leaves each page whole, as built or stamped; its temp
       # copies and version.json are taken out, so the site goes up without version.json (an open page then just
-      # doesn't update itself), with a warning.
+      # doesn't update itself), with a warning. Stopped at 60 s, and killed 5 s after if it won't stop, so the
+      # clean-up always runs well inside the step's 2 minutes.
       - name: Stamp the site with its build
         if: ${{ !cancelled() && steps.load.outcome == 'success' }}
         continue-on-error: true
         timeout-minutes: 2
         run: |
-          timeout 60 python3 -m tools.stamp_site _site "$GITHUB_SHA" || {
+          timeout -k 5 60 python3 -m tools.stamp_site _site "$GITHUB_SHA" || {
             rm -f _site/*.tmp _site/version.json || true
             echo "::warning::the site goes up without version.json this run (why: above), so an open page won't update itself to it"
           }
