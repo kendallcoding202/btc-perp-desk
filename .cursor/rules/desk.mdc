@@ -26,7 +26,7 @@ A GitHub Actions job (`.github/workflows/paper.yml`) runs `python -m desk step` 
 
 - **The desk does not learn or adapt.** Its rules are fixed on purpose. Never describe it as learning, training, self-improving, adaptive, "AI-optimized" or "thinking", in UI copy, tooltips, comments or docs.
 - **True words are fine where they're true:** scanning, checking, analyzing, computing, watching, deciding. "Researching" refers only to the real research: the October 2026 edge hunt (`reports/edge-hunt-2026-10.md`, `research/edge-hunt-2026-10/`) and the quarterly re-audit.
-- **Everything shown must come from real data:** the board JSON of the last desk run, live Hyperliquid data fetched in the browser, or the repo's research files. No made-up activity, counters or numbers. If you replay what a run did, label it with that run's time.
+- **Everything shown must come from real data:** the board JSON of the last desk run, live Hyperliquid data fetched in the browser (and, for BTC, Coinbase's own market-data feed), or the repo's research files. No made-up activity, counters or numbers. If you replay what a run did, label it with that run's time.
 - **Keep the PAPER label prominent.** Label backtest figures as backtests, and never promise or imply profits.
 
 # Before opening a PR
