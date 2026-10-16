@@ -172,6 +172,11 @@ def _usd(x: float | None, dp: int = 2) -> str:
     return "—" if x is None else f"${x:,.{dp}f}"
 
 
+def _bps(rate: float | None) -> str:
+    """A fee rate as the SHADOW page says it: 0.0005 is "5bps", 0.00025 "2.5bps"."""
+    return "—" if rate is None else f"{round(rate * 1e4, 2):g}bps"
+
+
 # What a push may not say without NTFY_TOKEN: dollar amounts, and signed or currency-tagged two-decimal figures (a
 # balance move, a P&L). Prices without a $ (a stop level, BTC's price) and contract counts stay.
 _MONEY = re.compile(r"[-+]?\$\s?-?[\d,]+(?:\.\d+)?|(?<![\w.])[-+][\d,]*\d\.\d{2}\b|\b\d[\d,]*\.\d{2}\s?USDC?\b")
@@ -637,6 +642,10 @@ CHECKS = {
 }
 
 
+# Coinbase's portfolio types (PortfolioType) in the words the SHADOW board and the phone say them
+PORTFOLIO_WORDS = {"CONSUMER": "Consumer", "INTX": "International (INTX)", "UNDEFINED": "unnamed"}
+
+
 def _optional(fn, log, what: str):
     from .brokers.coinbase_rest import CoinbaseError
 
@@ -1041,8 +1050,9 @@ class Run:
         self.checks.add("view_only", CHECKS["view_only"], True)
         kind = perms.get("portfolio_type")
         if kind != "DEFAULT":
-            self.checks.add("portfolio", CHECKS["portfolio"], False, f"{kind or 'not said'}")
-            raise Stop("permissions", f"this key is on the {kind or 'unnamed'} portfolio, not Default: US futures live "
+            said = PORTFOLIO_WORDS.get(kind, kind) if isinstance(kind, str) else kind     # the words only, not the check
+            self.checks.add("portfolio", CHECKS["portfolio"], False, f"{said or 'not said'}")
+            raise Stop("permissions", f"this key is on the {said or 'unnamed'} portfolio, not Default: US futures live "
                                       f"in the Default (Primary) portfolio, and SHADOW would read this one's money as "
                                       f"the account's. Create the View key on the Default portfolio and put it in "
                                       f"COINBASE_CDP_KEY", public="the key isn't on the Default portfolio")
@@ -1718,7 +1728,8 @@ class Run:
                         "" if self.extras.get("fills_err") is None else self.extras["fills_err"])
         fees = self.extras.get("fees")
         self.checks.add("fees", CHECKS["fees"], fees is not None, "" if fees is None else
-                        f"{fees.get('tier') or 'tier not named'}, taker {fees.get('taker')}, maker {fees.get('maker')}")
+                        f"{fees.get('tier') or 'tier not named'}, taker {_bps(fees.get('taker'))}, maker "
+                        f"{_bps(fees.get('maker'))}")
         self.step = "reading the price, the positions, the orders and the deposits"
         mid = self.mark(ctx)
         self.mid = mid

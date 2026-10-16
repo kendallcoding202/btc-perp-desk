@@ -459,7 +459,9 @@
       const el = $(`card-${a.key}`);
       el.className = `card ${a.state || ""}`;
       el.style.setProperty("--card", `var(${COLORS[a.key]})`);
-      el.querySelector(".detail").textContent = a.detail || "";
+      // a phone wraps the line: a number keeps the word before it ("oi $2.69B", "slip 3bps"), but not a · or a comma
+      el.querySelector(".detail").textContent = (a.detail || "").replace(/([^\s·,]) (?=[$+\-~≤≥]?\d)/g, "$1\u00a0");
+      el.querySelector(".detail").title = a.detail || "";   // a desktop card cuts it to one line: the whole of it on hover
       el.querySelector(".value").textContent = a.value ?? "";
       const bar = el.querySelector(".bar i");
       bar.style.width = `${Math.round((a.score ?? (a.state === "active" ? 1 : 0.25)) * 100)}%`;

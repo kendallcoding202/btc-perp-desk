@@ -357,6 +357,12 @@ body.has-live .big { text-shadow: 0 0 16px color-mix(in srgb, currentColor 50%, 
   .stats { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .h-row { grid-template-columns: 64px repeat(6, minmax(0, 1fr)); }
   .h-row b { white-space: normal; }
+  /* two cards a row: a card's detail line (funding and open interest, risk, the fee) wraps, never cut off */
+  .card .detail { white-space: normal; text-overflow: clip; overflow-wrap: anywhere; line-height: 1.35; }
+}
+/* a phone held sideways: the title a size down, so BTC's long one keeps the ring beside it (at 28 px it fits from 598) */
+@media (min-width: 561px) and (max-width: 600px) {
+  .brand h1 { font-size: 25px; }
 }
 @media (max-width: 560px) {
   body { padding: 4px; }
@@ -392,6 +398,10 @@ body.has-live .big { text-shadow: 0 0 16px color-mix(in srgb, currentColor 50%, 
   .card .quote { grid-column: 1 / span 2; white-space: normal; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }
   #equity { height: 100px; }
   .brand h1 { font-size: 20px; }
+  /* a title that wraps (BTC's) keeps the ring on its last line, after the last word, never on a line of its own */
+  .brand { display: block; white-space: nowrap; line-height: 0; }   /* 0: its own font adds no height to the line */
+  .brand h1 { display: inline; white-space: normal; line-height: 1.05; }
+  .ring { display: inline-block; vertical-align: -5px; margin-left: 4px; }   /* the space before it and 4 px: the 14 px gap */
   .tagline { display: none; }
   .big { font-size: 30px; }
   #chart { height: 260px; }
