@@ -150,7 +150,7 @@ def _utc(ms: int) -> str:
 
 
 def process_closed_bars(desk: Desk, broker, f, new: list[int], *, ctx, now: int, mid: float, meta: dict,
-                        log=print, fresh_ms: int = FRESH_MS) -> None:
+                        log=print, fresh_ms: int = FRESH_MS, when=None) -> None:
     """Every bar that closed since the last one processed, oldest first, through paper.step's steps (desk/paper.py):
     fill what the previous close decided, check the stop against the bar, charge funding, let the desk decide.
 
@@ -166,7 +166,9 @@ def process_closed_bars(desk: Desk, broker, f, new: list[int], *, ctx, now: int,
     The newest close is fresh only if it closed less than `fresh_ms` ago (FRESH_MS, 5 minutes, for this loop; the
     Coinbase one-shot runs on Actions pass 30: they land 7-9 minutes after a close): then its orders go to the exchange
     now, as when no bar was missed. If it closed longer ago (waking from a gap late in the bar, a restart), it is
-    handled like a missed bar: its exits and trail go, its entry is not taken."""
+    handled like a missed bar: its exits and trail go, its entry is not taken. `when`: how a time is written (this
+    loop's: UTC; Coinbase's SHADOW and LIVE pass Mountain Time's, desk/mountain.py)."""
+    at = when or _utc
     newest = new[-1]
     age_ms = now - (f.bars[newest].ts + f.bar_ms)
     fresh = age_ms <= fresh_ms
@@ -180,16 +182,16 @@ def process_closed_bars(desk: Desk, broker, f, new: list[int], *, ctx, now: int,
             for o in pending:
                 if o.action == "close" and broker.position is not None:
                     t = broker.close_now(mid, now, o.reason)
-                    desk.say(now, "fills", f"caught up: {o.reason.replace('_', ' ')} exit from the {_utc(bar.ts)} "
+                    desk.say(now, "fills", f"caught up: {o.reason.replace('_', ' ')} exit from the {at(bar.ts)} "
                                            f"close sent now" + (f" @ {t.exit_price:,.2f}, net {t.net_pnl:+,.2f}" if t else ""))
                 elif o.action == "open":
-                    desk.say(now, "chief", f"caught up: the {o.side.value} entry decided at the {_utc(bar.ts)} close "
+                    desk.say(now, "chief", f"caught up: the {o.side.value} entry decided at the {at(bar.ts)} close "
                                            f"was not taken. Paper filled it at that bar's open, which has passed.")
-                    log(f"stale entry not taken: {o.side.value} {o.qty:.5f} from the {_utc(bar.ts)} close")
+                    log(f"stale entry not taken: {o.side.value} {o.qty:.5f} from the {at(bar.ts)} close")
             # 2. the stop paper holds, against this bar's range
             if broker.missed_stop(bar):
                 t = broker.close_now(mid, now, "stop")
-                desk.say(now, "risk", f"caught up: the bar that opened {_utc(bar.ts)} went through the trailing stop "
+                desk.say(now, "risk", f"caught up: the bar that opened {at(bar.ts)} went through the trailing stop "
                                       f"the desk moved while away; out now" + (f" @ {t.exit_price:,.2f}" if t else ""))
             # 3. funding (the exchange charges the real thing; this is the board's estimate)
             broker.apply_funding(f.funding_bar[i], bar.close)
@@ -197,7 +199,7 @@ def process_closed_bars(desk: Desk, broker, f, new: list[int], *, ctx, now: int,
             orders = desk.on_bar_close(f, i, ctx=None if stale else ctx, now_ms=bar.ts + f.bar_ms if stale else now)
             broker.bar_ts = meta["last_bar_ts"] = bar.ts
             blocked = desk.last_decision.blocked_by if desk.last_decision else None
-            log(f"[{_utc(bar.ts + f.bar_ms)}] close {bar.close:,.2f} eq ${broker.equity(mid):,.2f} "
+            log(f"[{at(bar.ts + f.bar_ms)}] close {bar.close:,.2f} eq ${broker.equity(mid):,.2f} "
                 + (("(missed bar) " if i != newest else f"(closed {age_ms / 60_000:.0f} min ago) ") if stale else "")
                 + (f"orders {[o.action + ' ' + o.side.value for o in orders]}" if orders else
                    f"no trade ({blocked.name if blocked else 'holding'})"))
@@ -206,7 +208,7 @@ def process_closed_bars(desk: Desk, broker, f, new: list[int], *, ctx, now: int,
     if not fresh:
         for o in [o for o in broker.pending if o.action == "open"]:
             broker.pending.remove(o)
-            desk.say(now, "chief", f"the {o.side.value} entry decided at the {_utc(f.bars[newest].ts + f.bar_ms)} close "
+            desk.say(now, "chief", f"the {o.side.value} entry decided at the {at(f.bars[newest].ts + f.bar_ms)} close "
                                    f"was not taken: that close was {age_ms / 60_000:.0f} min ago, too late to act on at "
                                    f"today's price. Paper filled it at the next bar's open.")
             log(f"late entry not taken: {o.side.value} {o.qty:.5f} from the close {age_ms / 60_000:.0f} min ago")

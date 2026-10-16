@@ -67,6 +67,8 @@ class Branch:
         if got.returncode == 0:
             cs.load(state_dir, REF)             # as the load step does
             self.loaded = got.stdout.strip()
+        # and its marker beside the state dir ($RUNNER_TEMP/cb.loaded: the commit loaded, empty with no branch yet)
+        state_dir.with_name(state_dir.name + ".loaded").write_text((self.loaded or "") + "\n")
 
     def commit(self, work: Path) -> None:
         idx = self.tmp / f"idx{self.n}"

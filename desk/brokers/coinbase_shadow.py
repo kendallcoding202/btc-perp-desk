@@ -28,8 +28,8 @@ and only coinbase_live.arm() makes one. Even a bug in this overlay that called t
 from __future__ import annotations
 
 import math
-import time
 
+from ..mountain import clock as _mt_clock
 from ..thresholds import COINBASE
 from . import coinbase_orders as co
 from .coinbase import (V3, CancelFailed, OrderRefused, StaleClientOrderId, StopAlreadyFilled, StopThroughMarket,
@@ -53,7 +53,8 @@ def _new_book() -> dict:
 
 
 def _utc(ms: int) -> str:
-    return time.strftime("%H:%M UTC", time.gmtime(ms / 1000))
+    """A would-send record's time, as shown (the page, the pushes): Mountain Time (desk/mountain.py)."""
+    return _mt_clock(ms)
 
 
 def _usd(x: float, dp: int = 2) -> str:
@@ -600,8 +601,8 @@ class ShadowCoinbase:
                 self._play(o, c)
                 if o["filled"] > before:
                     said.append(("stop_filled", f"the simulated stop at {_usd(o['stop'], 0)} filled at "
-                                                f"{_usd(o['avg'])} ({time.strftime('%H:%M', time.gmtime(c['start']))} "
-                                                f"UTC 5-minute candle)"))
+                                                f"{_usd(o['avg'])} ({_utc(int(c['start'] * 1000))} 5-minute "
+                                                f"candle)"))
                 elif o.get("trigger") == "STOP_TRIGGERED" and not o.get("said_unfilled"):
                     o["said_unfilled"] = True
                     said.append(("stop_unfilled", f"the simulated stop at {_usd(o['stop'], 0)} triggered but its "

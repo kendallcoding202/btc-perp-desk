@@ -198,7 +198,7 @@ def test_the_guide_and_readme_say_what_the_code_does():
     readme = (ROOT / "README.md").read_text()
     assert '"I can publish and subscribe, everyone can publish"' in guide and "log in to your ntfy.sh account" in guide
     assert "paper's pushes never use `NTFY_TOKEN`" in guide and "Paper's pushes never use `NTFY_TOKEN`" in readme
-    assert "a run that's refused or stops part way saves only its status, never a state" in guide
+    assert "a run that's refused or stops part way saves its status, never a state" in guide
     assert "the next run that opens the saved state writes it back" in guide
     assert '"the balance found" if the first runs were refused' not in guide
     assert "**COINBASE_CDP_KEY and DESK_STATE_KEY hold the same text:**" in guide

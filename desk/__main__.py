@@ -5,7 +5,7 @@
     replay       watch the desk trade history on the board (http://127.0.0.1:8787)
     paper        one coin's paper account on live prices (BTC: Coinbase's rules and prices), with a live local board
     step         process newly closed bars for every paper account (BTC, ETH, SOL, VT) once, then exit (cron / Actions)
-    live         trade real money — refuses unless the backtest AND paper record pass (BTC on Coinbase: --once, LOCKED)
+    live         trade real money — refuses unless the backtest AND paper record pass (BTC on Coinbase: LOCKED in code)
     shadow       BTC on Coinbase: the REAL account, read only with a View-only key; orders simulated, none sent
     reset-halt   clear a drawdown halt after you've looked at what happened
     jev-test     check that JEV_API_KEY works
@@ -430,20 +430,25 @@ COINBASE_LOOP = ("  Coinbase LIVE runs one check per call (--once), the way GitH
 
 
 def cmd_live_coinbase(args, p) -> int:
-    """LIVE on Coinbase: LOCKED behind coinbase_live.arm() (README: Going live on Coinbase). One check per call. The
+    """LIVE on Coinbase: LOCKED in code (coinbase_live.LIVE_REVIEWED) and behind coinbase_live.arm() (README: Going
+    live on Coinbase). One check per call. The
     go-live gate is read inside the run (captured), and only at a first start: an unreadable report or ledger is a
     gate that doesn't pass, never a traceback before the run's safety pass."""
+    from . import coinbase_live
     from . import coinbase_run as cr
 
-    if not args.once:
-        print(COINBASE_LOOP)
-        return 2
     on_actions = os.environ.get("GITHUB_ACTIONS") == "true"
-    if not on_actions and not args.local:
-        print("  Coinbase LIVE runs on GitHub Actions, where its state is saved (the coinbase-state branch). Two "
-              "machines with separate states would manage one position twice: run it here only with --local, and only "
-              "with the Actions job stopped.")
-        return 2
+    # LIVE is locked in code (coinbase_live.LIVE_REVIEWED): the run refuses it first of all, before anything is read,
+    # sent or saved, whatever the flags (docs/coinbase-live-status.md)
+    if not coinbase_live.locked():
+        if not args.once:
+            print(COINBASE_LOOP)
+            return 2
+        if not on_actions and not args.local:
+            print("  Coinbase LIVE runs on GitHub Actions, where its state is saved (the coinbase-state branch). Two "
+                  "machines with separate states would manage one position twice: run it here only with --local, and "
+                  "only with the Actions job stopped.")
+            return 2
     env = dict(os.environ)
 
     def go(mask_emit, buf):

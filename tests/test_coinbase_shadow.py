@@ -563,7 +563,8 @@ def test_the_cli_prints_only_the_masks_and_one_line_with_no_amounts(realtime_fak
     assert cli.main(["shadow", "--coin", "BTC", "--state-dir", str(sh.dir)]) == 1
     out, err = capsys.readouterr()
     public = [ln for ln in out.splitlines() if ln and not ln.startswith("::add-mask::")]
-    assert err == "" and public == ["SHADOW BTC: stopped: read (details on your phone and in the encrypted board)"]
+    assert err == "" and public == ["SHADOW BTC: stopped (error): SHADOW hit an error of its own, not Coinbase's (the "
+                                    "reason is on your phone and the SHADOW page; the next run tries again)"]
     log = "\n".join(sh.board()["shadow"]["log"])
     assert "RuntimeError" in log                                             # private, encrypted: for the owner
 

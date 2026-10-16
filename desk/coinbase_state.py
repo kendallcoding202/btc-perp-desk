@@ -79,9 +79,11 @@ STATUS_KEYS = {"v": int, "mode": str, "coin": str, "product": str, "updated": in
                "decision": (str, type(None)), "would_send_last_24h": (int, type(None)), "alerts_open": int,
                "checks_passed": (int, type(None)), "checks_total": (int, type(None)), "opened": bool,
                "note": (str, type(None)), "armed": (bool, type(None))}
-PROBLEMS = {None, "auth", "permissions", "clock", "read", "state", "refused", "key"}
-# the note of the status a run writes back from the state it opened, BTC/status.json having gone from beside it
-STATUS_BACK = f"{COIN}/status.json was missing on the coinbase-state branch: this run wrote it back, the next run saves"
+PROBLEMS = {None, "auth", "permissions", "clock", "read", "state", "refused", "key", "error"}
+# the note of the status a run writes back from the state it opened, BTC/status.json having gone from beside it, or
+# been edited into one the save check refuses
+STATUS_BACK = (f"{COIN}/status.json on the coinbase-state branch was missing or edited: this run wrote it back, the next "
+               f"run saves")
 LINK = "120000"                         # git's mode for a symlink (its blob is the link's target)
 KILLS = f"{COIN}/kills.json"
 DESK_KILLS = f"{COIN}/kills.desk.json"
@@ -189,6 +191,9 @@ class Loaded:
 def _desks(path: str) -> bool:
     """One of the desk's own paths on the branch (kills.json, yours, apart)."""
     return path == "README.md" or (path.startswith(COIN + "/") and path[len(COIN) + 1:] in ALLOWED - {"kills.json"})
+
+
+desks_own = _desks
 
 
 def yours(tree: dict[str, str]) -> list[str]:
@@ -554,25 +559,45 @@ def check(state_dir: str | Path, remote_ref: str | None = None, branch=None, loa
                                   f"a state it didn't load")
         raise StateCheckError(f"{COIN}/{state} is missing next to a {new['mode']} status")
     old_raw = b.show(f"{COIN}/status.json")
-    if old_raw is None:
-        if b.show(f"{COIN}/{state}") is not None and status_only and files[state] == b.show(f"{COIN}/{state}"):
-            # you deleted the status: the run that found it gone wrote it back from the state it opened, and saved
-            # that state as it is (nothing replaced: the state on the branch stays exactly as it was). Only that run's
-            # status: one written by a run that couldn't open the state (refused over a secret) has none of the
-            # state's counts, and would leave every later run's save refused as another account
-            if new.get("problem") != "state" or new.get("note") != STATUS_BACK or new["runs"] < 1:
+    old, unreadable = None, False
+    if old_raw is not None:
+        try:
+            if b.tree().get(f"{COIN}/status.json") == LINK:
+                raise StateCheckError("a symlink")
+            old = check_status(_json(old_raw, f"saved {COIN}/status.json"), f"saved {COIN}/status.json")
+        except StateCheckError:
+            unreadable = True           # edited: read as no status (it never decides whose the state is)
+    written_back = status_only and new.get("problem") == "state" and new.get("note") == STATUS_BACK and new["runs"] >= 1
+    on_branch = b.show(f"{COIN}/{state}")
+    if on_branch is not None and written_back and files[state] == on_branch and \
+            (old is None or old["mode"] == new["mode"]):
+        # the status was deleted, edited into something the desk didn't write, or edited so it doesn't match the
+        # state: the run that found it so wrote it back from the state it opened, and saved that state as it is
+        # (nothing replaced: the state on the branch stays exactly as it was)
+        said.append(f"{COIN}/status.json written back beside the branch's {COIN}/{state}, which is unchanged")
+        return said
+    if old is None:
+        if on_branch is not None:
+            if old_raw is None and status_only and files[state] == on_branch:
+                # a status written by a run that couldn't open the state (refused over a secret) has none of the
+                # state's counts, and would leave every later run's save refused as another account
                 raise StateCheckError(f"{COIN}/status.json isn't on the branch beside {COIN}/{state}, and this one "
                                       f"isn't written back from that state (the run couldn't open it): not saving it. "
                                       f"The next run that opens the state writes it back")
-            said.append(f"{COIN}/status.json written back beside the branch's {COIN}/{state}, which is unchanged")
-            return said
-        if b.show(f"{COIN}/{state}") is not None:
-            raise StateCheckError(f"the branch has {COIN}/{state} but no status.json (deleted?): not replacing the "
-                                  f"state blind. Put {COIN}/status.json back as it was (revert the commit that deleted "
-                                  f"it), or delete the coinbase-state branch to start over")
-        said.append("no saved state on the branch: a first save")
+            raise StateCheckError(f"the branch has {COIN}/{state} but " + (
+                "a status.json the desk didn't write (edited?)" if unreadable else "no status.json (deleted?)") +
+                f": not replacing the state blind. The next run that opens the state writes the status back; or put "
+                f"{COIN}/status.json back as it was (revert the commit that changed it), or delete the coinbase-state "
+                f"branch to start over")
+        prev = f"{COIN}/state-{mode}.prev.enc.json"
+        if b.show(prev) is not None:
+            raise StateCheckError(f"the branch has {prev} but neither {COIN}/{state} nor a status.json the desk can "
+                                  f"read (deleted?): not starting a new state over the record. Put them back as they "
+                                  f"were (revert the commit that deleted them), or delete the coinbase-state branch to "
+                                  f"start over")
+        said.append("no saved state on the branch: a first save" + (
+            " (its status.json wasn't one the desk wrote)" if unreadable else ""))
         return said
-    old = check_status(_json(old_raw, f"saved {COIN}/status.json"), f"saved {COIN}/status.json")
     if old["mode"] == new["mode"] and old["runs"] == 0 and b.show(f"{COIN}/{state}") is None:
         # the status-only save of a run refused before it ever had a state: no account yet, so the first run that has
         # one (its secrets fixed) is the first save, whatever start it gives

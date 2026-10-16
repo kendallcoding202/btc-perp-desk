@@ -12,7 +12,14 @@
   const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const usd = (x, dp = 2) => x == null || isNaN(x) ? "—" : (x < 0 ? "-$" : "$") + Math.abs(x).toLocaleString("en-US", { minimumFractionDigits: dp, maximumFractionDigits: dp });
   const signed = (x) => x == null || isNaN(x) ? "—" : (x >= 0 ? "+" : "-") + usd(Math.abs(x)).slice(0);
-  const when = (ms) => ms ? new Date(ms).toISOString().replace("T", " ").slice(0, 16) + " UTC" : "—";
+  // Every time on this page is Mountain Time, America/Denver's (MDT in summer, MST in winter: the zone, never a fixed
+  // offset), like "Oct 15, 10:08 am MT". What's stored stays UTC epoch ms.
+  const MT = new Intl.DateTimeFormat("en-US", { timeZone: "America/Denver", month: "short", day: "numeric",
+    hour: "numeric", minute: "2-digit", hour12: true });
+  const mt = (ms) => { const p = {}; for (const x of MT.formatToParts(new Date(ms))) p[x.type] = x.value; return p; };
+  const day = (ms) => { if (!ms) return "—"; const p = mt(ms); return `${p.month} ${p.day}`; };
+  const clock = (ms) => { const p = mt(ms); return `${p.hour}:${p.minute} ${String(p.dayPeriod || "").toLowerCase()} MT`; };
+  const when = (ms) => ms ? `${day(ms)}, ${clock(ms)}` : "—";
   const ago = (ms, now) => ms ? `${Math.max(0, Math.round((now - ms) / 60000))} min ago` : "never";
 
   function b64(s) {
@@ -38,7 +45,7 @@
   // ---- the public status: no amounts, no key needed
   // board: whether the encrypted board is published (a board with no status: BTC/status.json is gone from the branch)
   function statusHtml(st, now, board) {
-    if (!st && board) return `<b class="bad">NOT SAVED: the SHADOW status is missing from the coinbase-state branch</b> (BTC/status.json deleted, say), so this page stops moving. The next SHADOW run that opens the saved state writes it back from it (your phone gets BTC SHADOW: NOT SAVED, then working again); a run refused over a secret first writes nothing, so fix the secret and wait for the next run. If it doesn't come back, put BTC/status.json back as it was (revert the commit that deleted it), or delete the coinbase-state branch to start over (docs/coinbase-setup.md, step 25).`;
+    if (!st && board) return `<b class="bad">NOT SAVED: the SHADOW status is missing from the coinbase-state branch</b> (BTC/status.json deleted or edited, say), so this page stops moving. The next SHADOW run that opens the saved state writes it back from it (your phone gets BTC SHADOW: NOT SAVED, then working again); a run refused over a secret first writes nothing, so fix the secret and wait for the next run. If the saved state was deleted too, every run is refused (BTC SHADOW: not working) until you put both back as they were (revert the commit that deleted them), or delete the coinbase-state branch to start over (docs/coinbase-setup.md, step 22).`;
     if (!st) return "No SHADOW status yet: SHADOW starts once the COINBASE_CDP_KEY and DESK_STATE_KEY secrets are set (docs/coinbase-setup.md).";
     const stale = now - st.updated > STALE_MS;
     const state = !st.ok ? `<b class="bad">NOT WORKING (${esc(st.problem || "error")})</b>` + (st.note ? `: ${esc(st.note)}` : "") : stale ? `<b class="bad">NOT UPDATED for ${ago(st.updated, now)}</b>` : `<b class="ok">OK</b>` + (st.note ? ` · <b class="bad">${esc(st.note)}</b>` : "");
@@ -50,7 +57,8 @@
       (st.decision ? ` · desk: ${esc(st.decision)}` : "") +
       (st.would_send_last_24h != null ? ` · ${esc(st.would_send_last_24h)} order(s) it would have sent in 24h (none sent)` : "") +
       (st.alerts_open ? ` · <b class="bad">${esc(st.alerts_open)} alert(s)</b>` : "") +
-      (st.opened ? "" : " · the account isn't open yet (no money in it)") +
+      (st.opened ? "" : (st.runs || 0) > (st.failed_runs || 0) ? " · the account isn't open yet (no money in it)" :
+        " · the balance hasn't been read yet") +
       (stale ? ` · GitHub runs this about every 15 minutes, best effort: check the Actions tab` : "");
   }
 
@@ -59,9 +67,24 @@
     return pairs.filter(Boolean).map(([k, v, cls]) => `<div class="${cls || ""}"><span>${esc(k)}</span><b>${v}</b></div>`).join("");
   }
 
+  // what every board shows, a SHADOW that never worked included: this run's checks, its alerts, its own log
+  const checksHtml = (sh) => `<section class="panel sh-checks"><div class="panel-head"><span>EVERY READ, THIS RUN</span><span class="muted">a View-only key: it can't trade or move money</span></div><ul>` +
+    (sh.checks || []).map((c) => `<li class="${c.ok === true ? "ok" : c.ok === false ? "bad" : "muted"}"><b>${c.ok === true ? "OK" : c.ok === false ? "FAIL" : "—"}</b> ${esc(c.label)}${c.note ? `<i>${esc(c.note)}</i>` : ""}</li>`).join("") + `</ul></section>`;
+  const alertsHtml = (sh) => (sh.alerts || []).length ? `<div class="panel-head"><span>ALERTS THIS RUN</span></div><ul>${sh.alerts.map((x) => `<li class="bad">${esc(x)}</li>`).join("")}</ul>` : "";
+  const logHtml = (sh, open) => `<details${open ? " open" : ""}><summary>this run's log (private)</summary><pre>${esc((sh.log || []).join("\n"))}</pre></details>`;
+
   function boardHtml(s, now) {
     const sh = s.shadow || {}, a = s.account || {}, t = s.ticker || {}, st = s.status || {};
     const out = [];
+    if (!s.updated) {
+      // no full board: no run has worked yet (or the last board was deleted), so only the last run's checks, alerts
+      // and log (what stopped it)
+      return `<section class="panel sh-warn"><b>${st.runs > 0 ? "This run didn't finish, and there's no earlier board to show" : "No SHADOW run has worked yet"}</b>` +
+        (st.problem ? ` (${esc(st.problem)})` : "") +
+        `, so there are no numbers to show. Below: what the last run, ${when(st.checked)}, checked, and its log.` +
+        (st.why ? `<br><span class="muted">${esc(st.why)}</span>` : "") + `</section>` + checksHtml(sh) +
+        `<section class="panel sh-events">${alertsHtml(sh)}${logHtml(sh, true)}</section>`;
+    }
     const stale = s.updated && now - s.updated > STALE_MS;
     if (!st.ok || stale) {
       out.push(`<section class="panel sh-warn"><b>${!st.ok ? "This run didn't finish" : "Not updated for " + ago(s.updated, now)}</b>` +
@@ -84,7 +107,7 @@
       `<div><div class="label muted">SHADOW (EST.)</div><div class="big">${usd(sim)}</div><div class="stats">${rows([
         ["simulated P&L (est.)", signed(sh.simulated_pnl)], ["position", esc(t.position || "—") + (t.position_detail ? " " + esc(t.position_detail) : "")],
         ["record", esc(t.record || "—")], ["fees (est.)", usd(t.fees)], ["funding (est.)", usd(t.funding)],
-        sh.opened ? ["opened", `${usd(sh.opened.amount)} on ${esc(sh.opened.date)} (${esc(sh.opened.what)}): money in, not profit`] : ["opened", "not yet: no money in the account"],
+        sh.opened ? ["opened", `${usd(sh.opened.amount)} on ${esc(sh.opened.ts ? day(sh.opened.ts) : sh.opened.date)} (${esc(sh.opened.what)}): money in, not profit`] : ["opened", "not yet: no money in the account"],
       ])}</div></div></div></section>`);
     // what the desk thinks
     const dec = (s.agents || []).find((g) => g.key === "chief");
@@ -98,12 +121,11 @@
       (sh.entry_kill_reason ? `<p class="bad">${esc(sh.entry_kill_reason)}</p>` : "") +
       `</div></section>`);
     // the checklist
-    out.push(`<section class="panel sh-checks"><div class="panel-head"><span>EVERY READ, THIS RUN</span><span class="muted">a View-only key: it can't trade or move money</span></div><ul>` +
-      (sh.checks || []).map((c) => `<li class="${c.ok === true ? "ok" : c.ok === false ? "bad" : "muted"}"><b>${c.ok === true ? "OK" : c.ok === false ? "FAIL" : "—"}</b> ${esc(c.label)}${c.note ? `<i>${esc(c.note)}</i>` : ""}</li>`).join("") + `</ul></section>`);
+    out.push(checksHtml(sh));
     // what it would have sent: LIVE's exact requests, none sent
     const ws = (sh.would_send || []).slice().reverse();
     out.push(`<section class="panel sh-sends"><div class="panel-head"><span>ORDERS IT WOULD SEND</span><span class="muted">LIVE's exact requests · NONE SENT · fills simulated</span></div><ul>` +
-      (ws.length ? ws.map((r) => `<li>${esc(when(r.ts).slice(0, 10))} ${esc(r.text)}<details><summary>request body</summary><pre>${esc(JSON.stringify(r.body, null, 1))}</pre></details></li>`).join("") : "<li class='muted'>none yet</li>") + `</ul></section>`);
+      (ws.length ? ws.map((r) => `<li>${esc(day(r.ts))} ${esc(r.text)}<details><summary>request body</summary><pre>${esc(JSON.stringify(r.body, null, 1))}</pre></details></li>`).join("") : "<li class='muted'>none yet</li>") + `</ul></section>`);
     // the virtual book, and what the real account holds besides
     const book = sh.book || {};
     out.push(`<section class="panel sh-book"><div class="panel-head"><span>SIMULATED BOOK</span><span class="muted">what LIVE would hold on Coinbase now</span></div><div class="stats">${rows([
@@ -121,11 +143,10 @@
     // events and alerts, then the honest small print and the run's own log
     const ev = (s.events || []).slice().reverse().slice(0, 30);
     out.push(`<section class="panel sh-events"><div class="panel-head"><span>EVENTS</span><span class="muted">${esc(s.header && s.header.tagline || "")}</span></div><ul class="events">` +
-      ev.map((e) => `<li><b>${esc(when(e.ts).slice(5))}</b> ${esc(e.agent.toUpperCase())}: ${esc(e.text)}</li>`).join("") + `</ul>` +
-      ((sh.alerts || []).length ? `<div class="panel-head"><span>ALERTS THIS RUN</span></div><ul>${sh.alerts.map((x) => `<li class="bad">${esc(x)}</li>`).join("")}</ul>` : "") +
-      `</section>`);
+      ev.map((e) => `<li><b>${esc(when(e.ts))}</b> ${esc(e.agent.toUpperCase())}: ${esc(e.text)}</li>`).join("") + `</ul>` +
+      alertsHtml(sh) + `</section>`);
     out.push(`<section class="panel sh-notes"><ul>${(sh.notes || []).map((n) => `<li>${esc(n)}</li>`).join("")}</ul>` +
-      `<details><summary>this run's log (private)</summary><pre>${esc((sh.log || []).join("\n"))}</pre></details></section>`);
+      logHtml(sh, false) + `</section>`);
     return out.join("");
   }
 
@@ -177,5 +198,5 @@
     load(store.get());
     setInterval(() => load(store.get()), 5 * 60 * 1000);
   }
-  if (typeof module !== "undefined") module.exports = { decrypt, statusHtml, boardHtml, BOARD_AAD };
+  if (typeof module !== "undefined") module.exports = { decrypt, statusHtml, boardHtml, BOARD_AAD, when, day, clock };
 })();

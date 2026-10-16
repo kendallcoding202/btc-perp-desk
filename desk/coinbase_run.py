@@ -1,7 +1,8 @@
 """BTC on Coinbase (BIP-20DEC30-CDE), one check per call: the way GitHub Actions runs it, every 15 minutes.
 
     python -m desk shadow --coin BTC --state-dir DIR            SHADOW: the REAL account, read only, orders simulated
-    python -m desk live --coin BTC --once --state-dir DIR ...   LIVE: real orders, LOCKED (coinbase_live.arm())
+    python -m desk live --coin BTC --once --state-dir DIR ...   LIVE: real orders, LOCKED in code (coinbase_live:
+                                                                LIVE_REVIEWED is False, so every attempt refuses first)
 
 SHADOW reads the real Coinbase account with a View-only key (COINBASE_CDP_KEY), runs the desk's own decisions on
 Coinbase's candles exactly as LIVE would (LiveBroker, desk/brokers/live.py, over ShadowCoinbase: the real balance and
@@ -15,8 +16,10 @@ One run (run_shadow):
      it); a LIVE state that never armed is no LIVE start;
   2. from here every run saves (changed=true is written first): the state, the board and a public status (LIVE: only
      once it has armed; a LIVE run that stops before it ever armed saves nothing, so it changes nothing for SHADOW).
-     A SHADOW that has never had a working run, refused at step 3, saves its status alone: never a state that a later,
-     corrected DESK_STATE_KEY would have to open;
+     A SHADOW that has never had a working run, stopped at step 3 or later, saves its status (and, once the key passed
+     or for an error, its board: the run's log), never a state that a later, corrected DESK_STATE_KEY would have to
+     open. What stopped a run is said as it happened (failure): Coinbase not answering, an answer it can't read, an
+     error of its own, and where (the step, the desk's function);
   3. the key, its masks on Actions, the clock against Coinbase's, and the key's permissions (View only, or refuse);
   4. the real account: balance, positions, open orders, fills, the fee tier, sweeps, the margin window, the USD wallet
      and its deposits and withdrawals; each read is one line of the checklist on the board;
@@ -62,6 +65,7 @@ from . import board as board_mod
 from . import coinbase_state, statebox
 from . import flows as flows_mod
 from . import indicators as ind
+from . import mountain
 from . import venue as venue_mod
 from .engine import Desk, Kills
 from .filter import evaluate_entry
@@ -107,8 +111,50 @@ class Stop(Exception):
         self.public = public            # a fixed phrase for the public log and status.json (no amount, no digit)
 
 
-def _utc(ms: int, fmt: str = "%Y-%m-%d %H:%M UTC") -> str:
-    return time.strftime(fmt, time.gmtime(ms / 1000))
+def failure(exc, mode: str) -> tuple[str, str, str]:
+    """What stopped a run, said as it happened: (the problem for status.json, the public status's fixed phrase, the
+    private words for the log and the phone). Coinbase "didn't answer" only when it didn't (no usable answer in time);
+    an answer the desk can't read, a refusal and an error of the desk's own are each said as that. The public phrase
+    has no digit and no amount (coinbase_state.check_status)."""
+    from .brokers.coinbase_rest import (ClockSkewError, CoinbaseAuthError, CoinbaseDataError, CoinbaseError,
+                                        CoinbasePermissionError, CoinbaseRejected, CoinbaseUnavailable)
+    from .feeds.coinbase import FeedError
+
+    name = type(exc).__name__
+    where = "your phone and the SHADOW page" if mode == "shadow" else "your phone"
+    if isinstance(exc, CoinbaseUnavailable):
+        return "read", "Coinbase didn't answer part of the run (the next run tries again)", \
+            f"Coinbase didn't answer ({name})"
+    if isinstance(exc, (CoinbaseDataError, FeedError)):
+        return "read", f"Coinbase's answer couldn't be read (the reason is on {where}; the next run tries again)", \
+            f"Coinbase answered, but in a shape the desk can't read ({name})"
+    if isinstance(exc, CoinbaseRejected):
+        return "read", f"Coinbase refused a read (the reason is on {where}; the next run tries again)", \
+            f"Coinbase refused a read ({name}: {', '.join(exc.codes) or f'HTTP {exc.status}'})"
+    if isinstance(exc, CoinbaseAuthError):
+        return "auth", "Coinbase refused the key (unauthorized)", f"Coinbase refused the key ({name})"
+    if isinstance(exc, CoinbasePermissionError):
+        return "permissions", f"Coinbase refused a read the key isn't allowed to make (the reason is on {where})", \
+            f"Coinbase refused a read the key isn't allowed to make ({name})"
+    if isinstance(exc, ClockSkewError):
+        return "clock", "the machine's clock is too far off Coinbase's (the next run tries again)", \
+            f"the machine's clock is too far off Coinbase's ({name})"
+    if isinstance(exc, CoinbaseError):
+        return "error", f"{mode.upper()} stopped on a check of its own (the reason is on {where})", \
+            f"{mode.upper()} stopped on a check of its own ({name})"
+    return "error", f"{mode.upper()} hit an error of its own, not Coinbase's (the reason is on {where}; the next run " \
+                    f"tries again)", f"an error in the desk's own code ({name})"
+
+
+def _origin(exc) -> str | None:
+    """The function in the desk's own code an error came from (its innermost frame under desk/), or None."""
+    import traceback
+
+    name = None
+    for fr in traceback.extract_tb(exc.__traceback__):
+        if f"{os.sep}desk{os.sep}" in fr.filename:
+            name = fr.name
+    return name
 
 
 def _day(ms: int) -> str:
@@ -131,10 +177,17 @@ KILLS_STRAY = ("a file on the coinbase-state branch looks like a kill switch but
                "entry_kill on, no new entries")
 # the public status's note of a run that wrote BTC/status.json back beside the state (status_written_back)
 STATUS_BACK = coinbase_state.STATUS_BACK
-# the public status's note for a SHADOW that never worked and stopped after the key passed, by problem (no digit)
-UNWORKED_PUBLIC = {"read": "Coinbase didn't answer part of the run (the next run tries again)",
-                   "refused": "SHADOW refused to go on (the reason is on your phone; the next run tries again)",
-                   "state": "SHADOW couldn't go on (the reason is on your phone; the next run tries again)"}
+# the public status's note for a SHADOW that never worked and stopped with no phrase of its own, by problem (no digit).
+# Only "key" is ever "a secret isn't set right"
+UNWORKED_PUBLIC = {"read": "a read from Coinbase failed (the reason is on your phone and the SHADOW page; the next run "
+                           "tries again)",
+                   "refused": "SHADOW refused to go on (the reason is on your phone and the SHADOW page; the next run "
+                              "tries again)",
+                   "state": "SHADOW couldn't go on (the reason is on your phone and the SHADOW page; the next run "
+                            "tries again)",
+                   "error": "SHADOW hit an error of its own, not Coinbase's (the reason is on your phone and the "
+                            "SHADOW page; the next run tries again)",
+                   "key": "a secret isn't set right"}
 # DESK_COINBASE_KILL (a repository variable) reads kills.json's switch words (coinbase_state.named_switches): flat,
 # close or flatten anywhere in it is flat_kill, entry (entries, no_entries) entry_kill, both can be set together; a
 # value with neither is entry_kill, alerted (failing closed)
@@ -313,13 +366,13 @@ def compare_with_paper(paper_board: dict | None, decisions: dict) -> dict | None
         return {"ok": None, "note": "the paper board handed over isn't readable"}
     mine = decisions.get(str(bar_ts)) or decisions.get(bar_ts)
     if mine is None:
-        return {"ok": None, "bar_ts": bar_ts, "note": f"SHADOW didn't decide the {_utc(bar_ts + 7200_000, '%H:%M')} "
-                                                       f"UTC close paper's board shows (not processed yet)"}
+        return {"ok": None, "bar_ts": bar_ts, "note": f"SHADOW didn't decide the {mountain.clock(bar_ts + 7200_000)} "
+                                                       f"close paper's board shows (not processed yet)"}
     differs = [g for g in SIGNAL_GATES if g in gates and g in mine["gates"] and gates[g] != mine["gates"][g]]
     if direction is not None and mine.get("direction") is not None and direction != mine["direction"]:
         differs.insert(0, "direction")
     own = sorted({OWN_GATES[g] for g in OWN_GATES if g in gates and g in mine["gates"] and gates[g] != mine["gates"][g]})
-    close = _utc(bar_ts + 7200_000, "%H:%M UTC")
+    close = mountain.clock(bar_ts + 7200_000)
     if differs:
         note = (f"SHADOW and paper decided the {close} close differently on the candles alone ({', '.join(differs)}): "
                 f"their candles from Coinbase differ")
@@ -409,12 +462,13 @@ class OneShot:
         else:
             new = [k for k, bar in enumerate(bars) if bar.ts > self.meta["last_bar_ts"] and (cut is None or bar.ts < cut)]
             if new and bars[0].ts > self.meta["last_bar_ts"]:
-                raise Stop("state", f"the last 2h close processed was {_utc(self.meta['last_bar_ts'] + 7200_000)}, "
+                last = mountain.when(self.meta["last_bar_ts"] + 7200_000)
+                raise Stop("state", f"the last 2h close processed was {last}, "
                                     f"older than the {len(bars)}-candle history: not trading on a stale view. Check the "
                                     f"account by hand", code=2)
             if new:
                 runner.process_closed_bars(desk, b, f, new, ctx=ctx, now=now, mid=mid, meta=self.meta, log=self.log,
-                                           fresh_ms=self.fresh_ms)
+                                           fresh_ms=self.fresh_ms, when=mountain.when)
         self.take_broker_flags()
         if desk.last_decision is None:
             # nothing decided this run (no new close): the newest close, judged again for the board, as paper does
@@ -458,8 +512,8 @@ def make_on_flow(desk, broker, meta: dict, recorded: list, account: dict, say_ba
         r = desk.risk
         r.peak_equity, r.day_start_equity, r.day = amount, amount, _day(ts)
         r.halted, r.halt_reason, r.day_locked = False, "", ""
-        text = (f"ACCOUNT OPENED with {_usd(amount)} ({what}, {_day(ts)}) — money in, not profit. {mode.upper()} "
-                f"measures performance from here.")
+        text = (f"ACCOUNT OPENED with {_usd(amount)} ({what}, {mountain.day(ts)}) — money in, not profit. "
+                f"{mode.upper()} measures performance from here.")
         say_bank(text)
         push(f"{title}: account opened", text, "high", "moneybag")
 
@@ -511,7 +565,7 @@ def make_on_flow(desk, broker, meta: dict, recorded: list, account: dict, say_ba
                                    [{"id": fl["id"], "ts": fl["ts"], "amount": fl["amount"],
                                      "text": "booked as money in or out, not profit or loss: nothing the desk can read "
                                              "explains it"}])[-50:]
-        text = flows_mod.describe(rec)
+        text = flows_mod.describe({**rec, "date": mountain.day(fl["ts"])})     # shown in Mountain Time; kept UTC
         say_bank(text)
         push(f"{title}: {'DEPOSIT' if fl['amount'] > 0 else 'WITHDRAWAL'}", text, "default", "moneybag")
         log(f"flow recorded: {fl['id']}")
@@ -667,11 +721,21 @@ class Run:
         self.safety_state = ""              # LIVE: what the safety pass found when it had nothing to do
         self.safety_end: str | None = None  # LIVE: the position after it: flat, protected, unprotected, unknown
         self._urgent_kinds: set[str] = set()
+        self.step = "starting"              # what the run is doing, in plain words: where an error stopped it
+        self.status_wrote = False           # a refusal wrote the public status (refused_early)
+        self.started_over = False           # SHADOW: the branch had files of the desk's, but no state or status
+        self.password: str | None = None
         self.now = int(clock() * 1000)
 
     # ---- small things
+    def at(self, exc=None) -> str:
+        """Where the run was when it stopped, for the log and the phone: its step, and the desk's own function the
+        error came from (never an amount)."""
+        fn = _origin(exc) if exc is not None else None
+        return f"while {self.step}" + (f" (in {fn})" if fn else "")
+
     def log(self, text: str) -> None:
-        self.lines.append(f"{_utc(int(self.clock() * 1000), '%H:%M:%S')} {text}")
+        self.lines.append(f"{mountain.clock(int(self.clock() * 1000), seconds=True, label=False)} {text}")
 
     def push(self, title: str, body: str, priority: str = "default", tags: str = "robot") -> None:
         """To the phone. Without NTFY_TOKEN the topic is readable by anyone who knows its name: no amounts. A push
@@ -779,15 +843,21 @@ class Run:
 
     def state_key_trouble(self, password: str) -> tuple[str, str] | None:
         """(why, its public phrase) when DESK_STATE_KEY, long enough, still can't be the password it must be: the key
-        file (the two secrets swapped, or the file pasted into both), or a password with a line break (the SHADOW
-        page's password field drops line breaks, so the board would never open). Refused as it is, never stripped: a
-        state already sealed with it keeps its key. None: fine."""
+        file (the two secrets swapped, or the key file in both: said as which), or a password with a line break (the
+        SHADOW page's password field drops line breaks, so the board would never open). Refused as it is, never
+        stripped: a state already sealed with it keeps its key. None: fine."""
         cdp = (self.env.get("COINBASE_CDP_KEY") or "").strip()
         low = password.lower()
         if "privatekey" in low or "-----begin" in low:
-            return ("DESK_STATE_KEY looks like the key file: the two secrets are swapped (or the file was pasted into "
-                    "both). Put the whole downloaded key file in COINBASE_CDP_KEY and a random password of 32 "
-                    "characters or more in DESK_STATE_KEY (docs/coinbase-setup.md, steps 12 and 13)",
+            both = cdp == password.strip() or "privatekey" in cdp.lower() or "-----begin" in cdp.lower()
+            if both:
+                return ("DESK_STATE_KEY looks like the key file, and so does COINBASE_CDP_KEY: the key file is in both "
+                        "secrets. Keep the whole downloaded key file in COINBASE_CDP_KEY and put a random password of "
+                        "32 characters or more in DESK_STATE_KEY (docs/coinbase-setup.md, steps 12 and 13)",
+                        "DESK_STATE_KEY looks like the key file (the key file is in both secrets)")
+            return ("DESK_STATE_KEY looks like the key file: the two secrets are swapped. Put the whole downloaded key "
+                    "file in COINBASE_CDP_KEY and a random password of 32 characters or more in DESK_STATE_KEY "
+                    "(docs/coinbase-setup.md, steps 12 and 13)",
                     "DESK_STATE_KEY looks like the key file (the two secrets are swapped)")
         if cdp and password.strip() == cdp:
             # the same text in both, and it isn't the key file (the password pasted into both, say)
@@ -857,8 +927,10 @@ class Run:
     def connect(self):
         from .brokers.coinbase import CoinbaseExchange
         from .brokers.coinbase_auth import CdpKeyError, load_cdp_key, mask_for_actions
-        from .brokers.coinbase_rest import ClockSkewError, CoinbaseAuthError, CoinbaseError, CoinbasePermissionError
+        from .brokers.coinbase_rest import (ClockSkewError, CoinbaseAuthError, CoinbaseError, CoinbasePermissionError,
+                                            CoinbaseUnavailable)
 
+        self.step = "loading the key"
         try:
             key = load_cdp_key(self.env.get("COINBASE_CDP_KEY"))
         except CdpKeyError as exc:
@@ -883,6 +955,7 @@ class Run:
             self.real.permissions = dict(perms)
             self.checks.add("key", CHECKS["key"], True, f"…{key.tail}")
             return key, dict(perms)
+        self.step = "reading Coinbase's clock"
         try:
             skew = self.rest.server_skew()
             self.checks.add("answered", CHECKS["answered"], True)
@@ -893,12 +966,19 @@ class Run:
             raise Stop("clock", f"{exc}. That's GitHub's machine, not yours: the next run tries again",
                        public="the machine's clock is too far off Coinbase's (the next run tries again)") from None
         except CoinbaseError as exc:
-            self.checks.add("answered", CHECKS["answered"], False, type(exc).__name__)
-            self.checks.add("clock", CHECKS["clock"], None, "not checked: Coinbase didn't answer")
-            raise Stop("read", f"Coinbase didn't answer ({type(exc).__name__})", code=1,
-                       public="Coinbase didn't answer (the next run tries again)") from None
+            if isinstance(exc, CoinbaseUnavailable):
+                self.checks.add("answered", CHECKS["answered"], False, type(exc).__name__)
+                self.checks.add("clock", CHECKS["clock"], None, "not checked: Coinbase didn't answer")
+                raise Stop("read", f"Coinbase didn't answer ({type(exc).__name__})", code=1,
+                           public="Coinbase didn't answer (the next run tries again)") from None
+            problem, public, what = failure(exc, self.mode)
+            self.log(f"Coinbase's clock: {type(exc).__name__}: {exc}")
+            self.checks.add("answered", CHECKS["answered"], True, "but its answer couldn't be used")
+            self.checks.add("clock", CHECKS["clock"], None, f"not checked: {what}")
+            raise Stop(problem, f"{what} {self.at(exc)}", code=1, public=public) from None
         self.now = int(self.rest.now_s() * 1000)
         self.real = CoinbaseExchange(self.rest, memo=self.account.setdefault("adapter", {}), on_alert=self.on_alert)
+        self.step = "reading the key's permissions"
         try:
             perms = self.real.key_permissions()
         except CoinbaseAuthError as exc:
@@ -910,9 +990,11 @@ class Run:
             raise Stop("permissions", f"{exc}: the key needs the View permission", code=2,
                        public="the key lacks the View permission") from None
         except CoinbaseError as exc:
-            raise Stop("read", f"the key's permissions couldn't be read ({type(exc).__name__})", code=1,
-                       public="the key's permissions couldn't be read (the next run tries again)") from None
+            problem, public, what = failure(exc, self.mode)
+            self.log(f"the key's permissions: {type(exc).__name__}: {exc}")
+            raise Stop(problem, f"the key's permissions couldn't be read: {what}", code=1, public=public) from None
         self.checks.add("key", CHECKS["key"], True, f"…{key.tail}")
+        self.step = "checking the key's permissions"
         return key, perms
 
     def read_by_arm(self):
@@ -931,7 +1013,7 @@ class Run:
             what = " and ".join(w for w, on in (("trade", perms["can_trade"]), ("move money", perms["can_transfer"]))
                                 if on)
             self.checks.add("view_only", CHECKS["view_only"], False, f"it can {what}")
-            raise Stop("permissions", f"SHADOW only runs with a View-only key: this one can {what}. Create a key with "
+            raise Stop("permissions", f"this key can {what}: SHADOW only runs with a View-only key. Create a key with "
                                       f"View only and put it in COINBASE_CDP_KEY",
                        public="the key can trade or move money (SHADOW needs a View-only key)")
         self.checks.add("view_only", CHECKS["view_only"], True)
@@ -1014,18 +1096,22 @@ class Run:
         real.feed.clock = self.rest.now_s
         saved_v = _read(work, "venue.json")
         last0 = (self.meta or {}).get("last_bar_ts") or 0
+        self.step = "reading the product"
         try:
             real.load_markets()
         except LiveSetupError as exc:
             raise Stop("refused", str(exc)) from None
         except (CoinbaseError, FeedError) as exc:
-            raise Stop("read", f"Coinbase's product couldn't be read ({type(exc).__name__})", code=1) from None
+            problem, public, what = failure(exc, self.mode)
+            self.log(f"the product: {type(exc).__name__}: {exc}")
+            raise Stop(problem, f"Coinbase's product couldn't be read: {what}", code=1, public=public) from None
         vstate = venue_mod.remember(saved_v, real.details, self.now, COINBASE,
                                     keep_from_ms=min(last0, self.now) - FUNDING_WINDOW_MS if last0 else None)
-        rules = venue_mod.Rules(COINBASE, vstate["windows"], vstate["margin"])
+        rules = venue_mod.Rules(COINBASE, vstate["windows"], vstate["margin"], clock=mountain.clock)
         feed = real.feed
         feed.log = venue_mod.FundingLog(vstate["funding_log"], COINBASE.funding_log_days)
         feed.sessions, feed.gaps = rules.sessions, list((vstate.get("holes") or {}).get("accepted") or [])
+        self.step = "reading the candles and the book"
         try:
             raw = feed.candles(start_ms=self.now - (LOOKBACK_BARS + LOOKBACK_SPARE) * feed.bar_ms, closed_only=False)
             raw = raw[-(LOOKBACK_BARS + 1):]
@@ -1040,7 +1126,10 @@ class Run:
             ctx = feed.context()
         except (CoinbaseError, FeedError) as exc:
             self.checks.add("decided", CHECKS["decided"], False, f"candles: {type(exc).__name__}")
-            raise Stop("read", f"Coinbase's candles or book couldn't be read ({type(exc).__name__})", code=1) from None
+            problem, public, what = failure(exc, self.mode)
+            self.log(f"the candles or the book: {type(exc).__name__}: {exc}")
+            raise Stop(problem, f"Coinbase's candles or book couldn't be read: {what}", code=1, public=public) \
+                from None
         return vstate, rules, feed, bars, funding, ctx
 
     def mark(self, ctx) -> float:
@@ -1069,6 +1158,12 @@ class Run:
         except statebox.BoxError as exc:
             return self.refused_early(Stop("state", f"the saved {self.mode.upper()} state can't be opened: {exc}"))
         bundle = self.counted(bundle)
+        self.password = password
+        if self.mode == "shadow" and bundle is None:
+            gone = self.record_deleted()
+            if gone:
+                return self.refused_early(gone, status=False)
+            self.started_over = self.branch_emptied()
         work = Path(tempfile.mkdtemp(prefix=f"desk-{self.mode}-"))
         try:
             unpack(bundle, work)
@@ -1078,8 +1173,10 @@ class Run:
             self.meta = {"started_ts": self.now, "start_equity": 0.0, "last_bar_ts": 0, "runs": 0, "failed_runs": 0,
                          "mode": self.mode, "product": PRODUCT, "opened": None, **(saved_desk.get("meta") or {})}
             self.recorded = list(saved_desk.get("flows") or [])
-            if self.mode == "shadow" and bundle is not None and self.status_gone():
-                return self.status_written_back()
+            if self.mode == "shadow" and bundle is not None:
+                trouble = self.status_trouble(saved_desk.get("meta"))
+                if trouble:
+                    return self.status_written_back(trouble)
             if self.saves_from_the_start():
                 self.begin_saving()             # written ahead: from here this run is saved, whatever happens
             # A SHADOW that has never had a working run (no state, or one whose every run failed before any money was
@@ -1110,19 +1207,22 @@ class Run:
             except Exception as exc:     # anything else, mid-run: LIVE would be in entry_kill now; so is SHADOW
                 from .brokers.coinbase_rest import CoinbaseError, CoinbaseUncertain
 
+                # said as it happened (failure): Coinbase not answering, an answer it can't read, an error of its own;
+                # where it was (the step, the desk's function) beside the type, the error's own text in the log only
+                problem, public, what = failure(exc, self.mode)
+                said = f"{what} {self.at(exc)}"
+                self.log(f"error {self.at(exc)}: {type(exc).__name__}: {exc}")
                 if self.never_worked:
-                    self.log(f"error: {type(exc).__name__}: {exc}")
-                    return self.refused_unworked(Stop("read", f"{type(exc).__name__} while it ran", code=1))
-                self.problem, self.code = "read", 1
+                    return self.refused_unworked(Stop(problem, said, code=1, public=public))
+                self.problem, self.code = problem, 1
+                self.public_why = public
                 transient = isinstance(exc, CoinbaseError) and exc.transient and not isinstance(exc, CoinbaseUncertain)
-                self.log(f"error: {type(exc).__name__}: {exc}")
                 if not transient and self.broker is not None:
                     self.kills_set["entry_kill"] = True
                     self.account["entry_kill_reason"] = {"ts": self.now, "why": f"{type(exc).__name__}: {exc}"}
                 self.broker_flags()
                 self.after_failure()
-                self.stopped(f"{type(exc).__name__} while it ran" + (
-                    "; entry_kill is on" if self.kills_set.get("entry_kill") else ""))
+                self.stopped(said + ("; entry_kill is on" if self.kills_set.get("entry_kill") else ""))
             if self.changed:
                 self.finish(work, password, ok)
             else:
@@ -1148,12 +1248,13 @@ class Run:
         """Refused before the state was opened: the saved state stays exactly as it was. A setup slip with the secrets
         (problem "key") still writes the public status (no amount, no digit), so the dashboard says what's wrong
         instead of nothing: the save step then saves the status alone, the state file as loaded. `status`: write it
-        whatever the problem (refused_unworked)."""
+        whatever the problem (refused_unworked), or never (False)."""
         self.refused_before_state = True
         self.problem, self.code = s.problem, s.code
         self.public_why = s.public
         self.log(f"refused: {s.text}")
         wrote = (s.problem == "key" if status is None else status) and self.status_only(s)
+        self.status_wrote = bool(wrote)
         github_output(wrote, self.env)
         self.changed = False
         self.public_note = s.text
@@ -1163,36 +1264,98 @@ class Run:
     def refused_unworked(self, s: Stop) -> int:
         """A SHADOW that has never had a working run, stopped, over the key itself (connect, check_permissions: the
         key file, a 401, its permissions, its portfolio, the clock, Coinbase not answering) or after it (Coinbase not
-        answering for the candles or the balance, say): its status alone, the state as loaded (none, on a first run).
-        Nothing it read is worth keeping, and a state saved now would be sealed with whatever DESK_STATE_KEY holds now
-        (the key file, if the two secrets are swapped; a password you change before SHADOW has worked), so a corrected
-        or changed one couldn't open it. The next run that works is a first save (coinbase_state.check)."""
-        self.log("SHADOW hasn't had a working run yet: this run saves only the status, no state")
+        answering for the candles or the balance, an answer it can't read, an error of its own, say): its status,
+        never a state (the state as loaded: none, on a first run). Nothing it read is worth keeping as state, and a
+        state saved now would be sealed with whatever DESK_STATE_KEY holds now (a password you change before SHADOW
+        has worked), so a corrected or changed one couldn't open it. Once the key passed, or for an error or an answer
+        it couldn't use, its board too: only for you, it holds this run's checks and its log (the error's own text, on
+        the SHADOW page); the runs never open it, so a changed DESK_STATE_KEY just replaces it at the next run that
+        saves. The next run that works is a first save
+        (coinbase_state.check). The public note says what happened, by its cause (failure): never "a secret isn't set
+        right" unless a secret is the problem."""
+        self.log("SHADOW hasn't had a working run yet: this run saves only its status and its board (this log), no "
+                 "state")
+        public = s.public or UNWORKED_PUBLIC.get(s.problem) or UNWORKED_PUBLIC["error"]
+        text = s.text
         if self.key_passed:
-            s = Stop(s.problem, f"{s.text.rstrip('. ')}. SHADOW hasn't had a run that works yet, so this run saved "
-                                f"only its status, no state (DESK_STATE_KEY can still change); the next run tries "
-                                f"again", code=s.code,
-                     public=s.public or UNWORKED_PUBLIC.get(s.problem, UNWORKED_PUBLIC["read"]))
-        return self.refused_early(s, status=True)
+            text = (f"{s.text.rstrip('. ')}. SHADOW hasn't had a run that works yet, so this run saved only its status "
+                    f"and its board, no state (DESK_STATE_KEY can still change); the next run tries again")
+        code = self.refused_early(Stop(s.problem, text, code=s.code, public=public), status=True)
+        # the log is kept (the board) once the key passed, or for an error or an answer the run couldn't use (its
+        # public phrase sends you to the SHADOW page); a refusal over the key itself says all of it in the status
+        keep = self.key_passed or s.problem == "error" or "the SHADOW page" in public
+        if keep and self.status_wrote and self.password:
+            try:
+                self.seal_board(self.password, False)
+            except (OSError, statebox.BoxError) as exc:
+                self.log(f"the board couldn't be written ({type(exc).__name__})")
+        return code
+
+    def status_trouble(self, saved_meta: dict | None = None) -> str | None:
+        """Why BTC/status.json, as loaded, can't stand beside this mode's state on the branch (the save step would
+        refuse every save from here): "missing" (deleted), "unreadable" (not JSON, a key the desk doesn't write, a
+        symlink: edited), "edited" (with `saved_meta`, the state's own: its start isn't the state's, or it counts more
+        runs than the state has). None: fine, no state on the branch, or a state dir that isn't the branch as the load
+        step extracted it (a state dir of your own: from_load_step)."""
+        b = self.branch_loaded()
+        tree = b.tree()
+        name = f"{COIN}/status.json"
+        if f"{COIN}/state-{self.mode}.enc.json" not in tree or not self.from_load_step():
+            return None
+        raw = b.show(name)
+        if raw is None:
+            return "missing"
+        try:
+            if tree.get(name) == coinbase_state.LINK:
+                raise ValueError("a symlink")
+            st = coinbase_state.check_status(json.loads(raw))
+        except Exception:           # noqa: BLE001 (any file the desk didn't write: read as unreadable)
+            return "unreadable"
+        m = saved_meta or {}
+        if st["mode"] == self.mode.upper() and m.get("started_ts") is not None:
+            try:
+                if int(st["started_ts"]) != int(m["started_ts"]) or int(st["runs"]) > int(m.get("runs") or 0):
+                    return "edited"
+            except (TypeError, ValueError):
+                return "unreadable"
+        return None
+
+    def load_marker(self) -> str | None:
+        """The load step's marker beside the state dir (the workflow's $RUNNER_TEMP/cb.loaded: the commit of the
+        coinbase-state branch it extracted, empty when there was no branch yet), or None when there's none (a state dir
+        of your own)."""
+        state_dir = self.dir.parent
+        try:
+            return state_dir.with_name(state_dir.name + ".loaded").read_text().strip()
+        except OSError:
+            return None
+
+    def from_load_step(self) -> bool:
+        """The state dir is the coinbase-state branch as the load step extracted it: its marker is there (whatever
+        you deleted from the branch: README.md included), or, without one, the branch's README.md, which every save
+        writes."""
+        return self.load_marker() is not None or "README.md" in self.branch_loaded().tree()
 
     def status_gone(self) -> bool:
-        """BTC/status.json isn't on the branch as loaded, but this mode's state is (you deleted the status, say): the
-        save step refuses any new state beside a state with no status ("not replacing it blind"). Only in a state dir
-        that is the coinbase-state branch as the load step extracted it (its README.md, which every save writes, is
-        there): a state dir of your own isn't one."""
-        tree = self.branch_loaded().tree()
-        return "README.md" in tree and f"{COIN}/state-{self.mode}.enc.json" in tree and \
-            f"{COIN}/status.json" not in tree
+        """BTC/status.json isn't on the branch as loaded beside this mode's state, or can't be read there (you deleted
+        or edited it, say): the save step refuses any new state beside it ("not replacing it blind"). Whatever else
+        was deleted with it (README.md, say): the status is the branch's own record of the state."""
+        return self.status_trouble() in ("missing", "unreadable")
 
-    def status_written_back(self) -> int:
-        """SHADOW, BTC/status.json gone beside the state it just opened: this run writes the status back from that
-        state's own counts (its start, its runs) and saves nothing else (the save step takes a status written next to
-        the branch's state, unchanged: coinbase_state.check), so the next run saves as usual. Pushed at once (NOT
-        SAVED: this run's own reads aren't saved); nothing is read or sent."""
-        s = Stop("state", f"{COIN}/status.json isn't on the coinbase-state branch (deleted?), beside the saved "
-                          f"state, so the save step would refuse any state saved now. This run wrote the status back "
-                          f"from the state it opened and saved nothing else; the next run saves as usual",
-                 code=1, public=STATUS_BACK)
+    STATUS_TROUBLE = {"missing": "isn't on the coinbase-state branch (deleted?)",
+                      "unreadable": "on the coinbase-state branch isn't one the desk wrote (edited, or not JSON)",
+                      "edited": "on the coinbase-state branch doesn't match the saved state (edited? its start or its "
+                                "runs differ)"}
+
+    def status_written_back(self, why: str = "missing") -> int:
+        """SHADOW, BTC/status.json missing, unreadable or edited beside the state it just opened: this run writes the
+        status back from that state's own counts (its start, its runs) and saves nothing else (the save step takes a
+        status written next to the branch's state, unchanged: coinbase_state.check), so the next run saves as usual.
+        Pushed at once (NOT SAVED: this run's own reads aren't saved); nothing is read or sent."""
+        trouble = self.STATUS_TROUBLE.get(why, self.STATUS_TROUBLE["missing"])
+        s = Stop("state", f"{COIN}/status.json {trouble}, beside the saved state, so the save step would refuse any "
+                          f"state saved now. This run wrote the status back from the state it opened and saved "
+                          f"nothing else; the next run saves as usual", code=1, public=STATUS_BACK)
         self.refused_before_state = True
         self.problem, self.code, self.public_why = s.problem, s.code, s.public
         self.log(f"refused: {s.text}")
@@ -1201,31 +1364,73 @@ class Run:
         self.changed = False
         self.public_note = s.text
         self.push(f"{COIN} SHADOW: NOT SAVED",
-                  f"SHADOW didn't save this run: {COIN}/status.json was missing on the coinbase-state branch "
-                  f"(deleted?), beside the saved state. This run wrote it back from that state and saved nothing else, "
-                  f"so the next run saves as usual (BTC SHADOW: working again). If it doesn't, put {COIN}/status.json "
-                  f"back as it was (revert the commit that deleted it), or delete the coinbase-state branch to start "
-                  f"over. Nothing was sent. Paper is unaffected.", "high", "warning")
+                  f"SHADOW didn't save this run: {COIN}/status.json {trouble}, beside the saved state. This run wrote "
+                  f"it back from that state and saved nothing else, so the next run saves as usual (BTC SHADOW: "
+                  f"working again). If it doesn't, put {COIN}/status.json back as it was (revert your commit), or "
+                  f"delete the coinbase-state branch to start over. Nothing was sent. Paper is unaffected.", "high",
+                  "warning")
         return self.code
+
+    def record_deleted(self) -> Stop | None:
+        """SHADOW, no state on the branch as loaded: the refusal, when the state before the last
+        (BTC/state-shadow.prev.enc.json) is still there but neither the state nor a status.json the desk can read is.
+        They were deleted, and a new state saved now would replace SHADOW's record for good: each save replaces the
+        branch's one commit, so your commit and what it deleted would leave the branch's history with it. Nothing is
+        read or written; the first refusal is pushed at once (the branch's board says when the last save was), then
+        once every 6 hours. None: nothing deleted, or a status the save step guards the record with."""
+        b = self.branch_loaded()
+        tree = b.tree()
+        prev = f"{COIN}/state-{self.mode}.prev.enc.json"
+        if prev not in tree or f"{COIN}/state-{self.mode}.enc.json" in tree or not self.from_load_step():
+            return None
+        st = self.saved_status()
+        try:
+            if st is not None and coinbase_state.check_status(dict(st)) and st.get("mode") != "LIVE":
+                return None             # a status of SHADOW's: the save check refuses a new state beside it
+        except coinbase_state.StateCheckError:
+            pass
+        return Stop("state", f"{COIN}/state-{self.mode}.enc.json and {COIN}/status.json aren't on the coinbase-state "
+                             f"branch (deleted?), but the state before them is ({prev}): SHADOW doesn't start a new "
+                             f"state over its record. Put them back as they were (revert the commit that deleted them: "
+                             f"until a run saves, the branch's history has them), or delete the coinbase-state branch "
+                             f"to start over", code=2)
+
+    def branch_emptied(self) -> bool:
+        """SHADOW, no state on the branch as loaded and no status.json the desk can read (and nothing record_deleted
+        refuses over), but the branch is there (the load step's marker beside the state dir names the commit it
+        loaded) or holds files of the desk's: every SHADOW file on it was deleted. This run starts a new state, as it
+        does once the branch is deleted, and says so (started over)."""
+        b = self.branch_loaded()
+        tree = b.tree()
+        if f"{COIN}/state-{self.mode}.enc.json" in tree or self.saved_status() is not None:
+            return False
+        return bool(self.load_marker()) or any(coinbase_state.desks_own(p) for p in tree)
 
     def in_window(self) -> bool:
         return self.now % PUSH_EVERY_MS < PUSH_WINDOW_MS
 
+    @staticmethod
+    def note_for(s: Stop) -> str:
+        """The public status's note for a refusal that writes it: its own phrase, else its problem's (only "key" is
+        "a secret isn't set right")."""
+        return s.public or UNWORKED_PUBLIC.get(s.problem) or UNWORKED_PUBLIC["error"]
+
     def _shows(self, st: dict, s: Stop) -> bool:
         """Whether the status `st` is this refusal's own (status_only wrote it)."""
         return st.get("mode") == self.mode.upper() and st.get("ok") is False and st.get("problem") == s.problem and \
-            st.get("note") == (s.public or "a secret isn't set right")
+            st.get("note") == self.note_for(s)
 
     def first_refusal(self, s: Stop, wrote: bool | None = None) -> bool:
         """Whether this refusal is news, pushed now rather than only in the 6-hourly window: the public status as
         loaded (BTC/status.json, plain, readable without DESK_STATE_KEY) is the memo. A refusal that writes itself
         there (status_only: over a secret, or before SHADOW ever worked) is news when the loaded status doesn't show it
         yet (an OK one, another reason, or none). Any other refusal writes nothing: it's news when the loaded status
-        was saved by the run before."""
+        was saved by the run before. With no status at all, a refusal that writes nothing is news when the branch's
+        board (which DESK_STATE_KEY opens) says the last save was the run before's."""
         wrote = s.problem == "key" if wrote is None else wrote
         st = self.saved_status()
         if not st:
-            return wrote
+            return wrote or 0 < self.now - self.board_checked() < FRESH_STATUS_MS
         if st.get("mode") != self.mode.upper():
             return False
         if wrote:
@@ -1253,12 +1458,27 @@ class Run:
         wrote = s.problem == "key" if wrote is None else wrote
         if self.first_refusal(s, wrote) or (self.in_window() and not (wrote and self.pushed_this_window(s))):
             gone = "" if wrote or not self.status_gone() else (
-                f" {COIN}/status.json is missing on the coinbase-state branch too (deleted?): this run wrote nothing, "
-                f"and the first run that opens the saved state writes it back, so fix this and wait for the next run.")
+                f" {COIN}/status.json " + ("is missing on the coinbase-state branch too (deleted?)"
+                                          if self.status_trouble() == "missing" else
+                                          "on the coinbase-state branch can't be read either (edited?)") +
+                ": this run wrote nothing, and the first run that opens the saved state writes it back, so fix this "
+                "and wait for the next run.")
             lead = "stopped part way this run" if self.key_passed else "didn't run"
             self.push(f"{COIN} {self.mode.upper()}: not working",
                       f"{self.mode.upper()} {lead}: {s.text.rstrip('. ')}. Nothing was sent.{gone} Paper is "
                       f"unaffected.", "high", "warning")
+
+    def board_checked(self) -> int:
+        """When the branch's board (as loaded) says its run was saved, opened with this run's DESK_STATE_KEY: 0 when
+        there's none, or it doesn't open."""
+        raw = self.branch_loaded().show(f"{COIN}/board-{self.mode}.enc.json")
+        if raw is None or not self.password:
+            return 0
+        try:
+            board = statebox.open_json(raw.decode(), self.password, statebox.board_aad(self.mode))
+            return int(((board or {}).get("status") or {}).get("checked") or 0)
+        except (ValueError, TypeError, AttributeError):        # statebox.BoxError (a wrong key) included
+            return 0
 
     def saved_status(self) -> dict | None:
         """BTC/status.json as loaded (public, plain: readable without DESK_STATE_KEY), or None."""
@@ -1304,7 +1524,7 @@ class Run:
               "key_view_only": view if isinstance(view, bool) else None, "decision": None,
               "would_send_last_24h": None, "alerts_open": int(old.get("alerts_open") or 0),
               "checks_passed": self.checks.passed if rows else None, "checks_total": len(rows) if rows else None,
-              "opened": bool(old.get("opened")), "note": s.public or "a secret isn't set right",
+              "opened": bool(old.get("opened")), "note": self.note_for(s),
               **({"armed": True} if self.mode == "live" else {})}
         tmp = p.with_name(p.name + ".tmp")
         tmp.write_text(json.dumps(st, indent=1) + "\n")
@@ -1358,9 +1578,13 @@ class Run:
             self.alerts.append(text)
 
     def stopped(self, why: str) -> None:
+        """A run that stopped part way, once SHADOW (or LIVE) has worked: pushed at the first such run, and at once
+        whenever the reason changes (the problem, or its public phrase: a 401, then a key that can trade, say), then
+        once every 6 hours while it lasts."""
         memo = self.account.setdefault("pushed", {})
         first = self.account.get("problem") is None
-        if first or self.now - int(memo.get("not_working") or 0) >= PUSH_EVERY_MS:
+        news = (self.account.get("problem"), self.account.get("problem_note")) != (self.problem, self.public_why)
+        if first or news or self.now - int(memo.get("not_working") or 0) >= PUSH_EVERY_MS:
             memo["not_working"] = self.now
             self.push(f"{COIN} {self.mode.upper()}: not working",
                       f"{self.mode.upper()} stopped part way this run: {why.rstrip('. ')}. {self.sent_note()} Paper is "
@@ -1372,6 +1596,7 @@ class Run:
         self.check_permissions(perms)
         self.key_passed = True
         self.note_portfolio(perms, work)
+        self.step = "the safety pass"
         self.safety_pass(work)
         if self.protect_failed:
             # an armed LIVE whose new-risk check failed: the safety pass was all of it; nothing else is sent
@@ -1382,19 +1607,23 @@ class Run:
                        public=protect_note(self.protect_failed))
         vstate, rules, feed, bars, funding, ctx = self.market(work)
         self.read_account()
+        self.step = "reading the fee tier, sweeps and fills"
         self.extras = read_extras(self.real, self.account, self.now, self.log)
         self.checks.add("fills", CHECKS["fills"], self.extras.get("fills_err") is None,
                         "" if self.extras.get("fills_err") is None else self.extras["fills_err"])
         fees = self.extras.get("fees")
         self.checks.add("fees", CHECKS["fees"], fees is not None, "" if fees is None else
                         f"{fees.get('tier') or 'tier not named'}, taker {fees.get('taker')}, maker {fees.get('maker')}")
+        self.step = "reading the price, the positions, the orders and the deposits"
         mid = self.mark(ctx)
         self.mid = mid
         self.build_broker(work, vstate, rules, feed, mid, saved_desk)
+        self.step = "deciding on the candles"
         from .paper import _venue_context, _wait_for_holes
 
-        cut, _ = _wait_for_holes(self.desk, vstate, bars, feed.bar_ms, self.now, self.meta["last_bar_ts"], self.log)
-        ctx, _ = _venue_context(self.desk, vstate, ctx, self.now, COINBASE)
+        cut, _ = _wait_for_holes(self.desk, vstate, bars, feed.bar_ms, self.now, self.meta["last_bar_ts"], self.log,
+                                 when=mountain.when)
+        ctx, _ = _venue_context(self.desk, vstate, ctx, self.now, COINBASE, when=mountain.when)
         f = ind.compute(bars, funding, self.p)
         if f.atr and f.atr[-1]:
             self.meta["last_atr"] = float(f.atr[-1])      # the safety pass's level for a stop with no saved one
@@ -1416,8 +1645,9 @@ class Run:
                 self.would_send_now = list(self.shadow.sent_this_run)
             _write(work, "venue.json", vstate)
             self.save_desk(work)
+        self.step = "building the board"
         self.checks.add("decided", CHECKS["decided"], True,
-                        f"{len(bars)} 2h candles to the {_utc(bars[-1].ts + feed.bar_ms, '%H:%M UTC')} close, "
+                        f"{len(bars)} 2h candles to the {mountain.clock(bars[-1].ts + feed.bar_ms)} close, "
                         f"{shot.processed} close(s) decided this run")
         dec = self.desk.last_decision
         self.decision = dec
@@ -1482,6 +1712,7 @@ class Run:
         from .brokers.coinbase_rest import CoinbaseError
 
         real = self.real
+        self.step = "reading the balance"
         try:
             real.fetch_balance()
             b = real.balance
@@ -1490,7 +1721,10 @@ class Run:
                             f"P&L {_usd(b['upnl'])}")
         except CoinbaseError as exc:
             self.checks.add("balance", CHECKS["balance"], False, type(exc).__name__)
-            raise Stop("read", f"the futures balance couldn't be read ({type(exc).__name__})", code=1) from None
+            problem, public, what = failure(exc, self.mode)
+            self.log(f"the futures balance: {type(exc).__name__}: {exc}")
+            raise Stop(problem, f"the futures balance couldn't be read: {what}", code=1, public=public) from None
+        self.step = "reading the USD wallet"
         if real.balance_block:
             self.checks.add("adds_up", CHECKS["adds_up"], False, real.balance_block)
             health(self.account, self.now, equity_mismatch=1)
@@ -1732,10 +1966,10 @@ class Run:
                 self.shadow.book["would_send"][-20:] if self.shadow is not None else []),
             "would_send_now": self.would_send_now, "min_equity_for_one": self.min_equity, "what_if": self.what_if,
             "entry_kill_reason": None if not reason else (
-                f"LIVE would be in entry_kill now (set {_utc(reason['ts'], '%H:%M UTC')}: {reason['why']}). SHADOW "
+                f"LIVE would be in entry_kill now (set {mountain.when(reason['ts'])}: {reason['why']}). SHADOW "
                 f"mirrors it: set entry_kill to false in BTC/kills.json on the coinbase-state branch once you've "
                 f"looked." if self.mode == "shadow" else
-                f"entry_kill is on (set {_utc(reason['ts'], '%H:%M UTC')}: {reason['why']}): set it to false in "
+                f"entry_kill is on (set {mountain.when(reason['ts'])}: {reason['why']}): set it to false in "
                 f"BTC/kills.json on the coinbase-state branch once you've looked."),
             "opened": self.meta.get("opened"), "paper_check": self.paper_check, "risk": risk,
             "unexplained": list(self.meta.get("unexplained") or []),
@@ -1774,6 +2008,7 @@ class Run:
                                                    and (before.get("problem") or before.get("note")))
         self.account["last_run_ts"] = now
         self.account["problem"] = self.problem
+        self.account["problem_note"] = None if ok else self.public_why     # the reason as said: a new one is news
         if ok:
             self.account["first_ok_ts"] = self.account.get("first_ok_ts") or now
         printed = [ln for ln in (self.stray.getvalue().splitlines() if self.stray is not None else []) if ln.strip()]
@@ -1803,11 +2038,16 @@ class Run:
         if first_ok and not self.save_refused_why:
             # (a first run whose save will be refused, a state deleted on the branch say, is no start: NOT SAVED says
             # why, and its "connected" would come again at every run, none of them saved)
-            self.push(f"{COIN} {self.mode.upper()}: connected (read only)" if self.mode == "shadow" else
+            over = (f"SHADOW found no state and no status on the coinbase-state branch, though the branch is there "
+                    f"(were its files deleted?), so it started a new state, as it does once the branch is deleted: its "
+                    f"record for LIVE (14 days of SHADOW) starts again from this run.\n\n") if self.started_over else ""
+            self.push(f"{COIN} SHADOW: connected, started over (read only)" if self.started_over else
+                      f"{COIN} {self.mode.upper()}: connected (read only)" if self.mode == "shadow" else
                       f"{COIN} LIVE: armed and connected",
-                      "\n".join(self.checks.lines()) + ("\n\nNo orders were sent; none can be with this key. Paper is "
-                                                        "unaffected." if self.mode == "shadow" else ""),
-                      "default", "white_check_mark")
+                      over + "\n".join(self.checks.lines()) + (
+                          "\n\nNo orders were sent; none can be with this key. Paper is unaffected."
+                          if self.mode == "shadow" else ""), "high" if self.started_over else "default",
+                      "white_check_mark")
         self.push_trades()
         if len(self.push_failures) > failed0:
             self.seal(work, password, ok)       # a push that didn't go out after the seal: in the log and board too
@@ -1816,15 +2056,23 @@ class Run:
     def seal(self, work: Path, password: str, ok: bool) -> None:
         """This run's state and board, encrypted (statebox), with its log as it stands."""
         paths, now, it = self.paths, self.now, self.iterations
-        self.account["log"] = (self._log_before + [f"--- run {self.meta['runs']} {_utc(now)}"] + self.lines)[-LOG_KEEP:]
+        self.account["log"] = (self._log_before + [f"--- run {self.meta['runs']} {mountain.when(now)}"] +
+                               self.lines)[-LOG_KEEP:]
         _write(work, "account.json", self.account)
         self.dir.mkdir(parents=True, exist_ok=True)
         tmp = paths["state"].with_name(paths["state"].name + ".tmp")
         tmp.write_text(statebox.seal_json(pack(work), password, statebox.state_aad(self.mode), iterations=it))
         tmp.replace(paths["state"])
+        self.seal_board(password, ok)
+
+    def seal_board(self, password: str, ok: bool) -> None:
+        """This run's board, encrypted (statebox): the board it built, or, stopped before one, the last board (its own
+        "updated" says how old it is) with this run's checks, alerts and log (a SHADOW that never worked: a board of
+        those alone, for the SHADOW page)."""
+        paths, now, it = self.paths, self.now, self.iterations
+        self.dir.mkdir(parents=True, exist_ok=True)
         board = self.board_state
         if board is None:
-            # stopped before a board: the last one stays (its own "updated" says how old it is), with this run's checks
             if self._board_base is None:
                 try:
                     if self.replaces_leftover:
@@ -1842,7 +2090,7 @@ class Run:
             board.setdefault(self.mode, {}).update({"alerts": self.alerts[-20:], "log": self.lines[-120:]})
         board.setdefault(self.mode, {})["problem"] = self.problem
         board[self.mode]["push_failed"] = list(self.push_failures[-20:])
-        board["status"] = {"ok": ok, "problem": self.problem, "runs": self.meta["runs"], "checked": now,
+        board["status"] = {"ok": ok, "problem": self.problem, "runs": int(self.meta.get("runs") or 0), "checked": now,
                            "why": None if ok else (self.lines[-1] if self.lines else None)}
         tmp = paths["board"].with_name(paths["board"].name + ".tmp")
         tmp.write_text(statebox.seal_json(board, password, statebox.board_aad(self.mode), compress=False,
@@ -1967,8 +2215,9 @@ class Run:
             return (f"{m} BTC: refused{what} before reading the account: {why} (nothing read or sent; the state is "
                     f"unchanged)")
         if self.public_why and self.problem:
-            return (f"{m} BTC: stopped ({self.problem}): {self.public_why} (details on your phone and in the encrypted "
-                    f"board)")
+            return (f"{m} BTC: stopped ({self.problem}): {self.public_why}" + (
+                "" if "(the reason is on" in self.public_why else
+                " (details on your phone and in the encrypted board)"))
         return f"{m} BTC: stopped: {self.problem or 'error'} (details on your phone and in the encrypted board)"
 
 
@@ -1999,6 +2248,33 @@ class LiveRun(Run):
 
     def max_notional(self):
         return self.cap
+
+    def execute(self) -> int:
+        """LIVE is locked in code (coinbase_live.LIVE_REVIEWED): refused first of all, before anything is loaded,
+        read or sent (locked_refusal). Otherwise the run (Run.execute), which arms through coinbase_live.arm()."""
+        from . import coinbase_live
+
+        if coinbase_live.locked():
+            return self.locked_refusal()
+        return super().execute()
+
+    def locked_refusal(self) -> int:
+        """LIVE isn't finished (coinbase_live.LOCKED): refused as a LIVE attempt that never armed is, with that
+        reason. No key is loaded and no request made, nothing is written (no state, board, status or kill: the
+        coinbase-state branch and SHADOW's state stay byte for byte as they were), and the phone gets BTC LIVE: not
+        armed as any never-armed refusal does. Nothing you set gets past it: only a code change does."""
+        from . import coinbase_live
+
+        self.branch_loaded()
+        self.arm_lines = ["  FAIL  LIVE is finished and reviewed (LIVE_REVIEWED in desk/coinbase_live.py) — not yet",
+                          f"\n  Not going live on Coinbase: {coinbase_live.LOCKED}"]
+        self.problem, self.code, self.public_why = "refused", 2, coinbase_live.LOCKED
+        self.log(f"refused: not armed: {coinbase_live.LOCKED}")
+        github_output(False, self.env)
+        self.changed = False
+        self.public_note = coinbase_live.LOCKED
+        self.not_armed_push(coinbase_live.LOCKED, locked=True)
+        return self.code
 
     def preflight(self) -> tuple[str, str]:
         password, raw = super().preflight()
@@ -2157,14 +2433,23 @@ class LiveRun(Run):
         except (TypeError, ValueError):
             return 0
 
-    def not_armed_push(self, why: str) -> None:
+    def not_armed_push(self, why: str, locked: bool = False) -> None:
         """With no state to remember a push in: at every never-armed refusal while SHADOW's last run is fresh enough
-        to arm on (under 2 hours), then once every 6 hours by the clock."""
+        to arm on (under 2 hours), then once every 6 hours by the clock. `locked`: LIVE is locked in code
+        (coinbase_live.LOCKED), whatever SHADOW's record says."""
         from .coinbase_live import SHADOW_FRESH_MS
 
         last = self.shadow_last_run()
         fresh = last > 0 and 0 <= self.now - last < SHADOW_FRESH_MS
         if not fresh and self.now % PUSH_EVERY_MS >= 15 * 60_000:
+            return
+        if locked:
+            self.push(f"{COIN} LIVE: not armed",
+                      f"LIVE didn't arm: {why}. It's locked in code until a review of its stop handling comes back "
+                      f"clean, so no setting of yours can arm it. No order was sent and nothing was read or saved: the "
+                      f"coinbase-state branch and SHADOW's state are as they were. If the workflow runs the LIVE step "
+                      f"instead of SHADOW's, put the SHADOW run step back (docs/coinbase-setup.md, Part 2). Paper is "
+                      f"unaffected.", "high", "warning")
             return
         stale = "" if fresh else (
             " SHADOW's last run is over 2 hours old, so LIVE can't arm until SHADOW has run again: put the SHADOW run "

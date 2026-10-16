@@ -120,10 +120,12 @@ class Sessions:
 
 class Rules:
     """One venue's rules as they stand for a run: the spec (thresholds.ContractVenue), the closures known, and the
-    margin rates (paper passes what Coinbase answered this run; the backtest the spec's)."""
+    margin rates (paper passes what Coinbase answered this run; the backtest the spec's). `clock`: how a gate's note
+    writes a time of day (paper's and the backtest's: UTC; Coinbase's SHADOW and LIVE pass Mountain Time's)."""
 
-    def __init__(self, venue: ContractVenue, windows=(), margin: dict | None = None):
+    def __init__(self, venue: ContractVenue, windows=(), margin: dict | None = None, clock=None):
         self.spec = venue
+        self.clock = clock or (lambda ms: f"{_hhmm(ms)} UTC")
         self.sessions = Sessions(venue, windows)
         m = margin or {}
         self.margin = {"overnight_long": m.get("overnight_long") or venue.overnight_long_margin,
@@ -164,7 +166,7 @@ class Rules:
         if c:
             a, b, why = c
             return GateResult("session", Verdict.DROP, owner="fills",
-                              note=f"Coinbase closed at the fill ({why}, reopens {_hhmm(b)} UTC)")
+                              note=f"Coinbase closed at the fill ({why}, reopens {self.clock(b)})")
         if ctx is not None and getattr(ctx, "session_open", None) is False:
             return GateResult("session", Verdict.DROP, owner="fills",
                               note=getattr(ctx, "session_note", None) or "Coinbase reports its session closed")

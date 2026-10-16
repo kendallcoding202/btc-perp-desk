@@ -1,4 +1,11 @@
-"""The lock on Coinbase LIVE: the Armed token, and arm(), the one function that makes one.
+"""The lock on Coinbase LIVE: LIVE_REVIEWED, the Armed token, and arm(), the one function that makes one.
+
+LIVE_REVIEWED is False: LIVE isn't finished. Its last review found open safety problems in how it handles its stops
+(docs/coinbase-live-status.md lists them), so LIVE is locked in code. arm() checks this first, before any other check,
+read or request: while it's False every LIVE attempt is refused with that reason, no POST is sent and nothing is saved,
+and no Armed token can be made or pass the order client's check (Armed.valid). Nothing you can set (a secret, a
+variable, a flag, kills.json, a saved state) gets past it; only a code change does, once a review comes back clean.
+SHADOW never calls arm(): it's unaffected.
 
 CoinbaseREST (desk/brokers/coinbase_rest.py) refuses every POST, before a socket opens, unless it was built with a valid
 Armed token; this module is the only place one is made (tests/test_coinbase_lock.py scans desk/ for any other
@@ -43,7 +50,8 @@ rest every run. Once LIVE has armed, the checks split in two:
     position, set flat_kill. A read that fails while checking one (Coinbase didn't answer, or answered in a shape the
     desk doesn't know) is said as that, never as the check failing: "Coinbase's balance couldn't be read", not "the
     balance doesn't add up".
-Nothing in this repository calls arm() outside the tests' fake Coinbase: no workflow arms it.
+Nothing in this repository calls arm() outside the tests' fake Coinbase: no workflow arms it. While LIVE_REVIEWED is
+False, not even there: the tests that exercise LIVE set it True for themselves (tests/conftest.py).
 """
 
 from __future__ import annotations
@@ -56,6 +64,9 @@ from .brokers.coinbase_rest import DEFAULT_BASE, CoinbaseDataError, CoinbaseErro
 from .thresholds import COINBASE
 
 PRODUCT = COINBASE.product
+# LIVE is locked until a review of its stop handling comes back clean: only a code change sets this True
+LIVE_REVIEWED = False
+LOCKED = "LIVE isn't finished: its last review found open safety problems, see docs/coinbase-live-status.md"
 ARM_TTL_S = 15 * 60
 LIVE_CONFIRM_PHRASE = "I understand this trades real money and can lose all of it"    # = desk/__main__.py's
 SHADOW_DAYS = 14
@@ -94,6 +105,8 @@ class Armed:
                  floor: dict | None = None, failed: tuple = ()):
         if seal is not _SEAL:
             raise TypeError("an Armed token is made only by coinbase_live.arm(), after every arming check passes")
+        if locked():
+            raise TypeError(LOCKED)
         if scope not in SCOPES:
             raise ValueError(f"an Armed token's scope is trade or protect, not {scope!r}")
         self._seal, self.product, self.cap, self.checks = seal, product, float(cap), tuple(checks)
@@ -101,8 +114,8 @@ class Armed:
         self.scope, self.floor, self.failed = scope, dict(floor) if floor else None, tuple(failed)
 
     def valid(self, now_s: float) -> bool:
-        return self._seal is _SEAL and self.product == PRODUCT and self.made_s <= now_s < self.expires_s and \
-            self.scope in SCOPES
+        return not locked() and self._seal is _SEAL and self.product == PRODUCT and \
+            self.made_s <= now_s < self.expires_s and self.scope in SCOPES
 
     def __reduce__(self):
         raise TypeError("an Armed token can't be copied or saved")
@@ -112,6 +125,11 @@ class Armed:
 
     def __repr__(self) -> str:
         return f"Armed({self.product}, cap ${self.cap:,.0f}" + (", protect only)" if self.scope == "protect" else ")")
+
+
+def locked() -> bool:
+    """LIVE is locked in code (LIVE_REVIEWED isn't True): every LIVE attempt refuses, first of all, with LOCKED."""
+    return LIVE_REVIEWED is not True
 
 
 def shadow_checks(proof: dict | None, now_ms: int) -> list[tuple[str, bool, str]]:
@@ -154,7 +172,12 @@ def arm(key: CdpKey, *, env, max_notional: float | None, gate, force_unproven: b
     None, with every check printed and the first failure said; not one non-GET request was made. live_state: the
     saved LIVE state's armed_at, product, and its position's side and stop (a protect token's floor). gate: the go-live
     gate's checks, or a function that reads them (called at a first start only). max_notional_text: what
-    --max-notional said, when it wasn't a number."""
+    --max-notional said, when it wasn't a number. First of all, the lock (LIVE_REVIEWED): locked, None, with nothing
+    else checked, read or sent."""
+    if locked():
+        out("  FAIL  LIVE is finished and reviewed (LIVE_REVIEWED in desk/coinbase_live.py) — not yet")
+        out(f"\n  Not going live on Coinbase: {LOCKED}")
+        return None
     from .brokers.coinbase import CoinbaseExchange
 
     state = live_state or {}
