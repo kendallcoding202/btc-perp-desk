@@ -489,7 +489,7 @@
     put(chips, s.agents.map((a) => `<span class="chip ${a.state === "idle" ? "off" : ""}" title="${esc(a.name)}: ${esc(a.state)}"
       style="background:var(${COLORS[a.key]})">${esc(a.name[0])}</span>`).join(""));
     if (!$("chief-sprite").children.length) $("chief-sprite").append(sprite("chief", 4));
-    txt($("mini-time"), MT.clock(s.updated));
+    txt($("mini-time"), `${MT.clock(s.updated)} ${TZ}`);
     put($("kill-state"), [
       ["flat_kill", k.flat_kill], ["entry_kill", k.entry_kill], ["jev_kill", k.jev_kill],
       ["drawdown halt", k.halted], ["daily loss lock", k.daily_locked], ["cooldown", k.cooldown],

@@ -121,7 +121,7 @@
       </div>
       <div class="act-side">
         <div class="act-live" data-k="live"></div>
-        <div class="act-tape" data-k="tape" aria-live="off"><b>TAPE · this page's own requests, as they land</b><div></div><div></div><div></div><div></div><div></div><div></div></div>
+        <div class="act-tape" data-k="tape" aria-live="off"><b>TAPE · this page's own requests, as they land · times ${TZ}</b><div></div><div></div><div></div><div></div><div></div><div></div></div>
         <div class="act-beat" data-k="beat"></div>
         <div class="act-rsch" data-k="rsch"></div>
       </div>
