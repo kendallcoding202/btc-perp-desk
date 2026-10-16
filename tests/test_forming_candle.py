@@ -191,5 +191,6 @@ def test_a_provisional_candle_is_dashed_in_both_editions_and_said_in_the_legend_
     prov = _function(APP, "provCandle")
     assert "g.setLineDash([2, 2])" in prov and "strokeRect(" in prov and 'css("--ink")' in prov
     assert ".swatch.prov" in CSS and "dashed" in CSS.split(".swatch.prov", 1)[1].split("\n", 1)[0]
-    assert 'newest candle${s.chart.prov.length > 1 ? "s" : ""} <i class="swatch prov"></i> provisional' in APP
+    assert 'newest candle${ch.prov.length > 1 ? "s" : ""} <i class="swatch prov"></i> provisional' in _function(APP, "legend")
+    assert 'put($("chart-sub"), legend(s.chart, ' in APP
     assert "provNote(s.chart)" in _function(APP, "foot")

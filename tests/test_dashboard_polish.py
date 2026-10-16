@@ -152,22 +152,26 @@ console.log(JSON.stringify(out));"""
 @node
 def test_the_right_axis_has_room_for_its_widest_tag():
     """'STOP 77,970' was cut off at the canvas's edge on a 375 / 390 px phone: the axis was a fixed 64 px. Measured
-    with JetBrains Mono's advance (0.6 em, 6 px at 10 px), every tag now ends at least 2 px inside the edge."""
+    with JetBrains Mono's advance (0.6 em, 6 px at 10 px), every tag now ends at least 2 px inside the edge, the live
+    price's "● LIVE 82,020" too (liveW: its dot, its word and its price)."""
     nf = _line(APP, "const NF = new Map()")
-    js = nf + "\n" + _line(APP, "const pxAxis =") + "\n" + _function(APP, "rightPad") + """
+    js = nf + "\n" + _line(APP, "const pxAxis =") + "\n" + _block(APP, "const liveW =") + "\n" + _function(APP, "rightPad") + """
 const g = { font: "", measureText: (t) => ({ width: 6 * t.length }) };
 const out = [];
 for (const [close, stop, live, lo, hi] of [[78500, 77970, null, 76000, 80000], [104250, 101975.5, 104300, 99000, 106000],
-                                         [2425.5, 2441.86, null, 2300, 2500], [82015, null, 82020, 80000, 84000]]) {
+                                         [2425.5, 2441.86, null, 2300, 2500], [82015, null, 82020, 80000, 84000],
+                                         [82015, null, null, 80000, 84000]]) {
   const padR = rightPad(g, { stop, live }, pxAxis(close), lo, hi), w = 358;
-  const ends = [pxAxis(close), stop ? `STOP ${pxAxis(stop)}` : "", live ? pxAxis(live) : ""].map((t) => w - padR + 2 + 6 * t.length + 8);
+  const ends = [pxAxis(close), stop ? `STOP ${pxAxis(stop)}` : ""].map((t) => w - padR + 2 + 6 * t.length + 8);
+  if (live) ends.push(w - padR + 2 + liveW(g, live).tw);
   out.push({ padR, room: w - Math.max(...ends), old: w - 64 + 2 + Math.max(...[pxAxis(close), stop ? `STOP ${pxAxis(stop)}` : ""].map((t) => 6 * t.length + 8)) - w });
 }
 console.log(JSON.stringify(out));"""
     out = _node(js)
     assert all(o["room"] >= 2 and o["padR"] >= 64 for o in out), out
     assert out[0]["old"] > 0 and out[1]["old"] > 0          # the old 64 px ran 'STOP 77,970' past the edge
-    assert out[3]["padR"] == 64                               # no stop: as wide as before
+    assert out[3]["padR"] == 6 * 4 + 6 * 6 + 19 + 4          # a live price: room for its tag ("LIVE" + 82,020)
+    assert out[4]["padR"] == 64                               # no stop, no live price: as wide as before
     assert "ct = closeTag(chart), padR = rightPad(g, chart, ct.text, lo, hi)" in _function(APP, "drawChart")
 
 
@@ -214,7 +218,8 @@ console.log(JSON.stringify(out));"""
     assert out == {"ahead_fresh": False, "just_now_fresh": True, "old_beat_fresh": False, "paint_delay": 1000,
                    "dead_after_setback": True, "quiet_with_new_message": False}
     assert "Math.min(CB_GAP, cb.last + CB_GAP - Date.now())" in _function(APP, "cbConnect")
-    assert "near(now, live.at) > STALE" in _function(APP, "livePrice")
+    assert "stale: hlStale(now)" in _function(APP, "livePrice")
+    assert "const hlStale = (now) => !!live.at && near(now, live.at) > STALE;" in APP
 
 
 @node
