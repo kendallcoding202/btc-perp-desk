@@ -4,7 +4,8 @@
    Two editions from the same tokens: day (cream paper, ink lines) and night (dark ink-blue paper, light ink lines).
    Night follows prefers-color-scheme: dark unless the footer switch (edition.js) picks one: html[data-edition].
    Meaning colors: gains green, losses a magenta (never the decorative red), each with a triangle drawn in CSS
-   (a gain up, a loss down, nothing on zero); LONG / SHORT are words, never arrows. The decorative red is a thin
+   (a gain up, a loss down, nothing on zero); LONG / SHORT are words, never arrows: the chart's entries are ink pins
+   lettered L / S, and its up candles are hollow, the down ones filled. The decorative red is a thin
    notebook margin rule and the LIVE badge, never text next to numbers. app.js and spider.js read the :root tokens
    for the canvases (--ink is the paper the price tags and hollow candles are cut from). Every number is in
    JetBrains Mono: the two lettering fonts are subset to letters and punctuation, so digits fall through to it. */
@@ -30,7 +31,7 @@
   /* meaning: 4.5:1 as text on --panel, --panel-2 and --caption */
   --green: #0d7440;         /* a gain, PASS, scan */
   --red: #a0158a;           /* a loss, DROP, a kill or halt that is ON: magenta, never --brand-red */
-  --orange: #a84800;        /* risk, the stop, warnings */
+  --orange: #7e2400;        /* risk, the stop, warnings: a deep rust, apart from the gain green for a red-green-blind eye */
   --amber: #846000;         /* vet, MARK, an order waiting */
   --blue: #1c2a66;          /* crowd, the slow average, WAIT, deposits: navy */
   --cyan: #2348c8;          /* the crawler, live prices, the fast average: lab-ink blue */
@@ -52,7 +53,8 @@
   --spider-eye: #f2b705;
   --entry: #383b48;
   --channel: #6f6b63;
-  --candle-up: hollow;
+  --candle-up: hollow;      /* up candles hollow, down ones filled */
+  --entry-mark: pin;        /* entries as ink pins lettered L / S (no triangles: arrows mean money) */
   --web-silk: rgba(35, 72, 200, .7);
   --web-dot: #17161c;
   --web-glow: 0;
@@ -69,7 +71,7 @@
     --pen: #d6cfbb; --shadow: #04060a; --line: #36405a;
     --dots: rgba(241, 234, 216, .055); --head-dots: rgba(241, 234, 216, .06); --grid: rgba(126, 240, 250, .06);
     --text: #f1ead8; --muted: #c9c3b2; --dim: #aaa69a;
-    --green: #4fd68b; --red: #f08ad8; --orange: #ff9248; --amber: #f0c654; --blue: #7b8cff; --cyan: #7ef0fa;
+    --green: #4fd68b; --red: #f08ad8; --orange: #d58a00; --amber: #f0c654; --blue: #7b8cff; --cyan: #7ef0fa;
     --lime: #c6e86b; --ice: #b9c7da; --white: #f1ead8;
     --btc: #f7a53c; --eth: #8fa3ff; --sol: #b9a5ff; --vt: #4fd6dc;
     --brand-red: #ff5a4f; --on-red: #17161c; --sticker: #ffd23f; --letter-shadow: #04060a; --tab-on: var(--caption); --chip-closed: #2e3648;
@@ -83,7 +85,7 @@
   --pen: #d6cfbb; --shadow: #04060a; --line: #36405a;
   --dots: rgba(241, 234, 216, .055); --head-dots: rgba(241, 234, 216, .06); --grid: rgba(126, 240, 250, .06);
   --text: #f1ead8; --muted: #c9c3b2; --dim: #aaa69a;
-  --green: #4fd68b; --red: #f08ad8; --orange: #ff9248; --amber: #f0c654; --blue: #7b8cff; --cyan: #7ef0fa;
+  --green: #4fd68b; --red: #f08ad8; --orange: #d58a00; --amber: #f0c654; --blue: #7b8cff; --cyan: #7ef0fa;
   --lime: #c6e86b; --ice: #b9c7da; --white: #f1ead8;
   --btc: #f7a53c; --eth: #8fa3ff; --sol: #b9a5ff; --vt: #4fd6dc;
   --brand-red: #ff5a4f; --on-red: #17161c; --sticker: #ffd23f; --letter-shadow: #04060a; --tab-on: var(--caption); --chip-closed: #2e3648;
@@ -238,6 +240,16 @@ body.has-live .big { text-shadow: none; }
 /* ---- analysis, thresholds, kill switches ----------------------------------------------------------------------- */
 .stats { background: var(--pen); gap: 1.5px; border-bottom: 2.5px solid var(--pen); }
 .stats div { background: var(--panel-2); }
+/* its last cell runs to the row's end, so the ink behind the grid never shows as an empty cell (4 columns, then 2) */
+@media (max-width: 980px) {
+  .stats div:last-child:nth-child(4n+1) { grid-column: 1 / -1; }
+  .stats div:last-child:nth-child(4n+2) { grid-column: 2 / -1; }
+  .stats div:last-child:nth-child(4n+3) { grid-column: 3 / -1; }
+}
+@media (max-width: 560px) {
+  .stats div:last-child:nth-child(odd) { grid-column: 1 / -1; }
+  .stats div:last-child:nth-child(even) { grid-column: auto; }
+}
 .stats span { color: var(--dim); font-family: var(--pixel); font-weight: 600; font-size: 10.5px; }
 .stats .sym b { font-family: var(--display); font-weight: 700; font-size: 15px; letter-spacing: .05em; line-height: 1.05; white-space: normal; text-transform: uppercase; }
 .ol-head { font-family: var(--pixel); font-weight: 600; font-size: 11px; }
@@ -270,7 +282,8 @@ body.has-live .big { text-shadow: none; }
 
 /* ---- the desk monitor and the desk log (activity.css) ------------------------------------------------------------- */
 .act-pill { font-family: var(--pixel); font-weight: 600; font-size: 10.5px; color: #17161c; background: var(--sticker); border: 1.5px solid #17161c; }
-.act-pill.act-livemode { color: var(--on-red); background: var(--brand-red); border-color: var(--pen); }
+.act-pill.act-livemode { color: var(--blue); background: var(--panel); border-color: var(--blue); }   /* REPLAY, or any mode but PAPER: as the masthead's REPLAY */
+.act-pill[data-mode="live"] { color: var(--on-red); background: var(--brand-red); border-color: var(--pen); }   /* LIVE only: the red badge (activity.js: data-mode) */
 .act-st { font-family: var(--mono); font-size: 10.5px; }
 .act-st.act-warn { padding-left: 6px; border-left: 3px solid var(--orange); }
 .act-dot { box-shadow: 0 0 0 1.5px var(--pen); }
@@ -325,6 +338,7 @@ body.kind-basket .stage::after { content: none; }
   .balance::after { content: "fig. 1 · the bank"; content: "fig. 1 · the bank" / ""; }
   .stage::after { content: "fig. 2 · the tape"; content: "fig. 2 · the tape" / ""; }
   .edition { margin: 6px 0 0; }
+  .ticker .hl, .ticker .hl.long, .ticker .hl.short { display: inline-block; max-width: 100%; box-sizing: border-box; white-space: normal; line-height: 1.35; }   /* a long position wraps inside its box, never cut off */
 }
 @media (max-width: 420px) {
   .kind-basket .brand h1 { font-size: 19px; }
