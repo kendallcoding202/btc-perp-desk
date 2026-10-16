@@ -328,6 +328,8 @@ body.has-live .big { text-shadow: 0 0 16px color-mix(in srgb, currentColor 50%, 
 .spider-toggle { font: inherit; color: var(--muted); background: transparent; border: 1px solid var(--line); border-radius: 2px; padding: 2px 8px; margin-left: 8px; cursor: pointer; }
 .spider-toggle[aria-pressed="true"] { color: var(--cyan); border-color: var(--cyan); }
 .spider-toggle:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+.foot .build { display: block; }   /* version.js: the build this page runs, its own line (a deploy's stamp; none locally) */
+.foot .build[hidden] { display: none; }
 
 /* the walking crawler (spider.js): clipped to the frame so it can never move or widen the page, and it never
    takes a tap or a click */
