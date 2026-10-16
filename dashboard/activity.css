@@ -163,7 +163,7 @@
   .act-log { order: 3; }
   .act-lines li { padding-left: 9px; grid-template-columns: 46px minmax(0, 1fr) auto; }
   .act-st > span:first-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; }
-  .act-st.act-warn > span:first-child { white-space: normal; }     /* a warning wraps rather than lose its end */
+  .act-st > span.act-warn:first-child { white-space: normal; }     /* a warning wraps rather than lose its end */
 }
 /* a narrow phone: one status line, and the basket tab's title on one line, so the monitor's moving rows stay in the
    first screen; a short one (an iPhone SE in Safari shows ~548 px) drops the countdown's second, explaining line */
@@ -219,4 +219,6 @@
 @media (max-width: 420px) {
   .act-read, .act-vtl > div { white-space: normal; text-overflow: clip; }
   .act-tape > div { white-space: normal; height: auto; text-overflow: clip; }
+  .act-sh { flex-wrap: wrap; row-gap: 0; white-space: normal; }   /* the counts under "REPLAY · LAST RUN …" */
+  .act-sh > span:first-child { text-overflow: clip; }
 }

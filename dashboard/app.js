@@ -741,7 +741,8 @@
         const mark = r.verdict === "PASS" || r.verdict === "MARK" ? `<span class="ok">✓</span>` :
           r.verdict === "DROP" ? `<span class="bad">✗</span>` : r.verdict === "WAIT" ? `<span class="na">…</span>` : `<span class="na">–</span>`;
         const thr = r.threshold == null ? (r.verdict === "SKIP" && r.value != null ? "info" : "") : `${r.op || "vs"} ${fmt(r.threshold)}`;
-        return `<div class="thr-row"><span class="n">${esc(r.name)}</span><span class="t">${esc(thr)}</span><span class="c">${fmt(r.value)}</span>${mark}</div>`;
+        // a <wbr> after each underscore: a phone wraps a long name there, not mid-word (style.css)
+        return `<div class="thr-row"><span class="n">${esc(r.name).replace(/_/g, "_<wbr>")}</span><span class="t">${esc(thr)}</span><span class="c">${fmt(r.value)}</span>${mark}</div>`;
       }).join("")).join("");
   }
 
