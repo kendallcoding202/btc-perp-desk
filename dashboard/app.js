@@ -1314,7 +1314,7 @@
     } catch { /* the chart just shows closed candles */ }
   }
 
-  window.addEventListener("resize", render);   // render(event): a full redraw at the new size, once a frame (render)
+  window.addEventListener("resize", render);
   window.addEventListener("desk:theme", () => { $("agents").textContent = ""; $("chief-sprite").textContent = ""; render(); });
   (async function loop() {
     await tick();
