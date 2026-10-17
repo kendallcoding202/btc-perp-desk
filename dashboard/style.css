@@ -417,6 +417,12 @@ body.has-live .big { text-shadow: 0 0 16px color-mix(in srgb, currentColor 50%, 
   .thr-row { grid-template-columns: minmax(0, 1fr) 70px 70px 14px; padding-left: 0; }
   .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
+/* a narrow phone: a rule's name wraps at its underscores (app.js puts a <wbr> after each) in its own column, and a
+   tab's line shows whole */
+@media (max-width: 420px) {
+  .thr-row .n { white-space: normal; text-overflow: clip; overflow-wrap: anywhere; }
+  .coin .c-sub { display: block; -webkit-line-clamp: none; }
+}
 
 /* a 320 px phone: the header's row (PAPER, the day, "12:30 am MT") fits in one line whatever the run's hour */
 @media (max-width: 360px) {

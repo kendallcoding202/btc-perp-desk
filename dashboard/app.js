@@ -741,7 +741,8 @@
         const mark = r.verdict === "PASS" || r.verdict === "MARK" ? `<span class="ok">✓</span>` :
           r.verdict === "DROP" ? `<span class="bad">✗</span>` : r.verdict === "WAIT" ? `<span class="na">…</span>` : `<span class="na">–</span>`;
         const thr = r.threshold == null ? (r.verdict === "SKIP" && r.value != null ? "info" : "") : `${r.op || "vs"} ${fmt(r.threshold)}`;
-        return `<div class="thr-row"><span class="n">${esc(r.name)}</span><span class="t">${esc(thr)}</span><span class="c">${fmt(r.value)}</span>${mark}</div>`;
+        // a <wbr> after each underscore: a phone wraps a long name there, not mid-word (style.css)
+        return `<div class="thr-row"><span class="n">${esc(r.name).replace(/_/g, "_<wbr>")}</span><span class="t">${esc(thr)}</span><span class="c">${fmt(r.value)}</span>${mark}</div>`;
       }).join("")).join("");
   }
 
@@ -1206,7 +1207,7 @@
       return `<button class="coin ${c.coin === coin ? "on" : ""}" data-coin="${esc(c.coin)}" aria-pressed="${c.coin === coin}">` +
         `<span class="c-name">${esc(c.coin)}<i${src ? ` class="c-px" title="${esc(src[1])}"` : ""}>` +
         `${src ? `<b class="c-src ${src[2]}">${src[0]}</b>` : ""}${esc(label)}</i></span><span class="c-bank ${pnlCls}">${usd(b)}</span>` +
-        `<span class="c-sub">${c.units ? `${pct(b / c.units - 1)} perf · P&amp;L ${usd(b - c.start - c.net_flows, 0)}` : pct(b / c.start - 1)} · ${esc(c.position)} · ${esc(c.record)}${sub}</span></button>`;
+        `<span class="c-sub">${c.units ? `${pct(b / c.units - 1)} perf · P&amp;L ${usd(b - c.start - c.net_flows, 0)}` : pct(b / c.start - 1)} · ${esc(c.position)} · ${esc(c.record).replace(/ /g, "&nbsp;")}${sub}</span></button>`;
     });
     const left = index.coins.filter((c) => c.error).map((c) => c.coin);   // no bank this run: not in the total
     const putIn = start + net;   // with deposits: the P&L on everything put in, never counting the deposits as profit

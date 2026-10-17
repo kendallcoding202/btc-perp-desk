@@ -303,7 +303,7 @@
     M.mode.dataset.mode = L.lmode.dataset.mode = mode.toLowerCase();   // theme hook: which mode, not only "not PAPER"
     M.dot.classList.toggle("act-stale", old || lost);
     set(M.st, lost ? (narrow.matches ? `CAN'T READ THE BOARD SINCE ${HHMM(lastRead)}` : `CAN'T READ THE BOARD SINCE ${HHMM(lastRead)} ${TZ} · SHOWING THE ONE BUILT ${HHMM(b.updated)} ${TZ}`)
-      : old ? `STALE · NO NEW BOARD FOR ${age}`      // the run's time is in the REPLAY label
+      : old ? `STALE · NO NEW BOARD FOR ${age.replace(/ /g, "\u00a0")}`   // the age kept whole when it wraps; the run's time is in the REPLAY label
       : tight.matches ? `LAST RUN ${age} AGO`     // its time is in the REPLAY label, two rows down: one line here
       : `LAST RUN ${HHMM(b.updated)} ${TZ} · ${age} AGO`);
     M.st.classList.toggle("act-warn", old || lost);
