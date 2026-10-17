@@ -58,8 +58,10 @@
         <div class="chart-head"><span id="chart-title">BTC · 4h</span><span id="chart-sub"></span></div>
         <canvas id="chart"></canvas>
         <canvas id="web" class="web"></canvas>
-        <!-- an agent card pointing at what its note is about (app.js drawPoint): nothing over the chart otherwise -->
+        <!-- an agent card pointing at what its note is about (app.js drawPoint): empty otherwise -->
         <canvas id="point" class="point" aria-hidden="true"></canvas>
+        <!-- for an older app.js still cached (it fills #bubbles): it doesn't throw, and hidden shows nothing -->
+        <div class="bubbles" id="bubbles" hidden></div>
       </div>
       <aside class="stage-right">
         <div class="chips" id="chips"></div>
