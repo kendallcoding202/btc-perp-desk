@@ -65,8 +65,8 @@
   --on-live: #17161c;       /* the live tag's dot and lettering, ink on the gold (5.6:1) */
   --candle-up: hollow;      /* up candles hollow, down ones filled */
   --entry-mark: pin;        /* entries as ink pins lettered L / S (no triangles: arrows mean money) */
-  --web-silk: rgba(35, 72, 200, .7);
-  --web-dot: #17161c;
+  --web-silk: rgba(35, 72, 200, .3);   /* the web: faint silk under the chart's canvas (style.css .web) */
+  --web-dot: rgba(23, 22, 28, .4);
   --web-glow: 0;
   --web-hub: #fffaf0;
   /* type */
@@ -86,7 +86,7 @@
     --btc: #f7a53c; --eth: #8fa3ff; --sol: #b9a5ff; --vt: #4fd6dc;
     --brand-red: #ff5a4f; --on-red: #17161c; --sticker: #ffd23f; --letter-shadow: #04060a; --tab-on: var(--caption); --chip-closed: #2e3648;
     --spider-eye: #ffd23f; --entry: #e3dcc9; --channel: #8e97aa; --live: #ffd23f; --live-width: 1.5; --on-live: #17161c;
-    --web-silk: rgba(126, 240, 250, .5); --web-dot: #f1ead8; --web-glow: 3; --web-hub: #1a1d33;
+    --web-silk: rgba(126, 240, 250, .26); --web-dot: rgba(241, 234, 216, .45); --web-glow: 0; --web-hub: #1a1d33;
   }
 }
 :root[data-edition="night"] {
@@ -100,7 +100,7 @@
   --btc: #f7a53c; --eth: #8fa3ff; --sol: #b9a5ff; --vt: #4fd6dc;
   --brand-red: #ff5a4f; --on-red: #17161c; --sticker: #ffd23f; --letter-shadow: #04060a; --tab-on: var(--caption); --chip-closed: #2e3648;
   --spider-eye: #ffd23f; --entry: #e3dcc9; --channel: #8e97aa; --live: #ffd23f; --live-width: 1.5; --on-live: #17161c;
-  --web-silk: rgba(126, 240, 250, .5); --web-dot: #f1ead8; --web-glow: 3; --web-hub: #1a1d33;
+  --web-silk: rgba(126, 240, 250, .26); --web-dot: rgba(241, 234, 216, .45); --web-glow: 0; --web-hub: #1a1d33;
 }
 
 /* ---- paper, frame, panels ---------------------------------------------------------------------------------- */
@@ -119,7 +119,7 @@ html, body { background: var(--page); color: var(--text); }
 .label { font-family: var(--pixel); font-weight: 600; }
 /* lettering faces: Bangers has one weight, Comic Neue one (700): no faux bold, and the digits that fall through to
    the mono take its 700 (headings) or 600 (labels) */
-.brand h1, .coin .c-name, .card .name, .jev-badge, .chip, .stats .sym b, .h-row .h-coin b, .bubble b { font-synthesis: none; }
+.brand h1, .coin .c-name, .card .name, .jev-badge, .chip, .stats .sym b, .h-row .h-coin b { font-synthesis: none; }
 
 /* ---- the masthead: a notebook cover label, ink lettering on the paper, a red margin rule, an ink double rule -- */
 .header {
@@ -218,14 +218,11 @@ body.has-live .chart-wrap::before { opacity: .18; }
 .jev-box .q span { font-family: var(--pixel); font-weight: 600; font-size: 10.5px; color: var(--dim); }
 .floor-label { font-family: var(--pixel); font-weight: 600; color: var(--muted); }
 .mini-clock { border: 2px solid var(--pen); background: var(--panel); box-shadow: 2px 2px 0 var(--shadow); }
-.bubble, .bubble.static {
+.bubble.static {
   color: var(--text); background: var(--caption); border: 2px solid var(--pen); border-radius: 0;
   box-shadow: 3px 3px 0 var(--shadow); font-family: var(--pixel); font-weight: 600; font-size: 11px; line-height: 1.3;
   text-transform: uppercase; letter-spacing: .02em; padding: 4px 8px 5px;
 }
-.bubble { border-left-width: 6px; }   /* app.js colors the border with the speaker's color: the left edge keeps it */
-.bubble:not(.static) { border-top-color: var(--pen) !important; border-right-color: var(--pen) !important; border-bottom-color: var(--pen) !important; }
-.bubble b { font-family: var(--display); font-weight: 700; font-size: 13px; letter-spacing: .08em; margin-right: 6px; }
 .chip { font-family: var(--display); font-weight: 700; font-size: 15px; color: var(--panel); border: 2px solid var(--pen); }
 .chip.off { opacity: 1; background: var(--panel) !important; color: var(--dim); border: 2px dashed var(--muted); }   /* idle: hollow, not faded */
 .kill-state { font-family: var(--pixel); font-weight: 600; font-size: 11px; }

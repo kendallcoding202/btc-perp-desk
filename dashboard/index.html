@@ -58,7 +58,8 @@
         <div class="chart-head"><span id="chart-title">BTC · 4h</span><span id="chart-sub"></span></div>
         <canvas id="chart"></canvas>
         <canvas id="web" class="web"></canvas>
-        <div class="bubbles" id="bubbles"></div>
+        <!-- an agent card pointing at what its note is about (app.js drawPoint): nothing over the chart otherwise -->
+        <canvas id="point" class="point" aria-hidden="true"></canvas>
       </div>
       <aside class="stage-right">
         <div class="chips" id="chips"></div>

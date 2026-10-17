@@ -241,10 +241,10 @@ def test_the_tape_has_one_line_per_real_event():
 
 
 def test_a_price_redraw_leaves_the_boards_own_panels_alone():
-    """A Coinbase redraw (render(true)) skips the agents, bubbles, P&L bars, rules and switches; panels it does redraw
-    are rewritten only when their text changes."""
+    """A Coinbase redraw (render(true)) skips the agents' cards (and the chief's line), P&L bars, rules and switches;
+    panels it does redraw are rewritten only when their text changes."""
     render = _function(APP, "render")
-    for part in ("if (!light) renderAgents(s.agents);", "if (!light) renderBubbles(s.agents);", "if (!light) drawPnlBars(",
+    for part in ("if (!light) renderAgents(s.agents);", "if (!light) drawPnlBars(",
                  "if (!light) { if (basket) renderRules(s.basket.rules); else renderThresholds(s.thresholds); renderKills(s.kills); }"):
         assert part in render, part
     assert "render(true);" in _function(APP, "cbPaint")

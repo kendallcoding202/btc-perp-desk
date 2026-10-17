@@ -183,7 +183,11 @@ html[data-desk="up"] .card.active::after { animation: sheen 4.8s ease-in-out inf
 .card .detail { grid-column: 1 / span 2; font-family: var(--pixel); font-size: 10px; color: var(--dim); margin-top: 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .card .value { grid-column: 3; grid-row: 3; align-self: end; font-family: var(--mono); font-weight: 700; font-size: 18px; white-space: nowrap; color: var(--card, var(--text)); }
 .card .bar { grid-column: 1 / span 3; margin-top: 5px; }
-.card .quote { grid-column: 1 / span 3; font-size: 10.5px; color: var(--muted); margin-top: 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* the whole note, wrapped (a phone cuts it to a few lines below: overflow hidden is that cut's) */
+.card .quote { grid-column: 1 / span 3; font-size: 10.5px; color: var(--muted); margin-top: 5px; overflow: hidden; overflow-wrap: anywhere; }
+/* a card that points at something on the chart (app.js drawPoint gives it a tabindex): its outline while it does */
+.card[tabindex]:focus-visible { outline: 2px solid var(--card, var(--line)); outline-offset: 2px; }
+@media (hover: hover) { .card[tabindex]:hover { outline: 2px solid var(--card, var(--line)); outline-offset: 2px; } }
 .bar { height: 3px; background: var(--line); border-radius: 2px; overflow: hidden; }
 .bar i { display: block; height: 100%; width: 0; background: var(--green); transition: width .4s; }
 
@@ -207,7 +211,7 @@ html[data-desk="up"] .card.active::after { animation: sheen 4.8s ease-in-out inf
 .jev-box .q span { font-family: var(--pixel); font-size: 9px; color: var(--dim); }
 .floor-label { font-family: var(--pixel); font-size: 10px; color: var(--muted); letter-spacing: .18em; margin-top: auto; text-align: center; }
 
-.chart-wrap { position: relative; padding: 12px 6px 6px; min-width: 0; overflow: hidden; }
+.chart-wrap { position: relative; padding: 12px 6px 6px; min-width: 0; overflow: hidden; isolation: isolate; }   /* the floor .web sits on: over the stage's paper, under the chart */
 .chart-head { display: flex; gap: 12px; flex-wrap: wrap; font-family: var(--pixel); font-size: 11px; color: var(--muted); padding: 0 8px 4px; }
 #chart-title { color: var(--coin); }
 .chart-head #chart-sub { color: var(--dim); }
@@ -230,11 +234,13 @@ html[data-desk="up"] .card.active::after { animation: sheen 4.8s ease-in-out inf
 body.has-live .chart-wrap::before { opacity: .5; animation: scan 3.6s linear infinite; }
 @keyframes scan { from { transform: translate3d(0, 0, 0); } to { transform: translate3d(0, 300px, 0); } }
 #chart { width: 100%; height: 330px; display: block; }
-.web { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; }
-.bubbles { position: absolute; inset: 0; pointer-events: none; z-index: 2; }
-.bubble { position: absolute; font-size: 10.5px; color: var(--white); background: rgba(13,15,31,.92); border: 1px solid var(--dim); padding: 4px 7px; border-radius: 2px; max-width: 250px; line-height: 1.35; }
-.bubble.static { position: static; border-color: var(--line); }
-.bubble b { font-family: var(--pixel); font-size: 9px; letter-spacing: .1em; margin-right: 5px; }
+/* the crawler's web under the chart's canvas: the candles, lines and tags are drawn over its silk, never under it */
+.web { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; z-index: -1; }
+/* a card pointing at its thing (app.js drawPoint), over the chart only while a card is hovered, focused or tapped */
+.point { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; z-index: 1; opacity: 0; transition: opacity .2s; }
+.point.on { opacity: 1; }
+/* the chief's line, beside the chart */
+.bubble.static { font-size: 10.5px; color: var(--white); background: rgba(13,15,31,.92); border: 1px solid var(--line); padding: 4px 7px; border-radius: 2px; max-width: 250px; line-height: 1.35; }
 .sprite-slot canvas { width: 48px; height: 48px; image-rendering: pixelated; }
 
 .chips { display: flex; gap: 4px; flex-wrap: wrap; justify-content: center; }
@@ -360,7 +366,6 @@ body.has-live .big { text-shadow: 0 0 16px color-mix(in srgb, currentColor 50%, 
   .stage-left, .stage-right { flex-direction: row; flex-wrap: wrap; justify-content: center; }
   .stage-left .floor-label, .stage-right .floor-label, .sprite-slot, .bubble.static { display: none; }
   .jev-box { width: auto; flex: 1; min-width: 200px; }
-  .bubbles { display: none; }
   .bal-body, .bottom, .analysis-body { grid-template-columns: minmax(0, 1fr); }
   .bal-side { align-items: flex-start; order: -1; }
   .stats { grid-template-columns: repeat(4, minmax(0, 1fr)); }
@@ -448,4 +453,5 @@ body.has-live .big { text-shadow: 0 0 16px color-mix(in srgb, currentColor 50%, 
   body.has-live .chart-wrap::before { opacity: 0; }
   .spider { transition: none; }
   .live-beat { display: none; }
+  .point { transition: none; }
 }
