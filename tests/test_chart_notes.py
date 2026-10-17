@@ -4,10 +4,11 @@ The owner, on a laptop, read the agents' caption boxes on BTC's chart (SCAN, VET
 they sat at fixed spots over the plot (BUBBLE_SPOTS), unrelated to what they mentioned, covering candles, and said
 what the cards already said, cut to one line there. Now nothing sits over the plot at any width (the chief's line
 stays beside the chart), a card's whole note wraps on the card, and hovering a card, tabbing to it or tapping it marks
-on the chart the thing its note is about, only when the chart draws it: SCAN's 60-bar line with its price, VET's fast
-and slow averages, RISK's and SIZE's stop and entry (a position only), FILLS' fills; CROWD, CHIEF and CRAWLER point at
-nothing. The mark is drawn on a canvas of its own: the chart's own frame, its values, lines and tags, and the live
-marker are as they were. The spider's web is drawn under the chart's canvas, fainter, so the candles and lines are
+on the chart the thing its note is about, only when the chart draws it: SCAN's 60-bar line with the price its note
+gives (and the next close's, when the line steps at the candle still forming), VET's fast and slow averages, RISK's and
+SIZE's stop and entry (a position only), FILLS' fills; CROWD, CHIEF and CRAWLER point at nothing. The mark is drawn on
+a canvas of its own, clipped to the plot: the chart's own frame, its values, lines and tags, and the live marker are as
+they were. A phone's tap that brings the chart into view takes the page back to the card when the mark ends. The spider's web is drawn under the chart's canvas, fainter, so the candles and lines are
 always drawn over its silk. The page's own functions are run in node, drawing on a canvas that records what it is
 asked to draw (tests/test_live_marker.py's), with the comic theme's day and night tokens."""
 
@@ -42,8 +43,12 @@ const _stroke = g.stroke, _fill = g.fill;
 g.stroke = function () { _stroke.call(this); ops[ops.length - 1].gco = g.globalCompositeOperation; };
 g.fill = function () { _fill.call(this); ops[ops.length - 1].gco = g.globalCompositeOperation; };
 canvas.classList = { on: false, toggle(c, v) { this.on = !!v; } };
-canvas.rect = { top: 100, bottom: 360 }; canvas.getBoundingClientRect = () => canvas.rect;
+g.rect = function (x, y, w, h) { this._pts.push([x, y, w, h]); };
+g.clip = function () { ops.push({ k: "clip", rect: this._pts[0] }); };
+canvas.rect = { top: 100, bottom: 360, height: 260 }; canvas.getBoundingClientRect = () => canvas.rect;
 canvas.scrolled = []; canvas.scrollIntoView = (o) => canvas.scrolled.push(o);
+let scrollY = 2600; const scrolls = [], scrollTo = (o) => scrolls.push(o);
+document.documentElement = { scrollHeight: 4000 };
 const KEYS = ["chief", "scan", "vet", "crowd", "size", "fills", "risk", "crawler"];
 const CARDS = KEYS.map((key) => ({ id: `card-${key}`, attrs: {}, hasAttribute(a) { return a in this.attrs; },
   removeAttribute(a) { delete this.attrs[a]; }, set tabIndex(v) { this.attrs.tabindex = v; } }));
@@ -54,11 +59,15 @@ const desk = (ch, scan, tok) => { TOK = tok; drawChart(ch); state = { header: { 
 const refs = (ch, scan, tok = TOKS.day) => {
   desk(ch, scan, tok);
   return Object.fromEntries(KEYS.map((k) => { const r = referent(k, state);
-    return [k, r && r.map((x) => x.mark ? { mark: true, x: x.x, y: x.y, r: x.r } : { name: x.name, x: x.x, y: x.y, color: x.color, dash: x.dash.join(","), series: !!x.xs })]; }));
+    return [k, r && r.map((x) => x.mark ? { mark: true, x: x.x, y: x.y, r: x.r } : { name: x.name, x: x.x, y: x.y, color: x.color,
+      dash: (x.dash || []).join(","), series: !!x.xs, level: x.at != null })]; }));
 };
 const pos = (o = {}) => chartOf({ stop: 79000, entry: 81000, markers: [
   { ts: T0 + 2 * H * 10, price: 80200, kind: "entry", side: "long" }, { ts: T0 + 2 * H * 20 + 600000, price: 81000, kind: "exit", side: "long", pnl: 5 },
   { ts: T0 - 10 * H, price: 80000, kind: "entry", side: "long" }], ...o });
+// the board's chart (decided: its newest candle) with one candle still forming past it, on the next close's line
+const forming = (next, o = {}) => { const ch = chartOf({ decided: N - 1, ...o }); ch.candles.push([T0 + 2 * H * N, 80000, 80100, 79900, 80050]);
+  ch.ema_fast.push(null); ch.ema_slow.push(null); ch.don_lo.push(null); ch.don_hi.push(next); return ch; };
 """)
 
 
@@ -109,11 +118,12 @@ def test_a_cards_whole_note_wraps_on_the_card():
 
 @node
 def test_each_card_points_only_at_what_its_note_names_and_the_chart_draws():
-    """SCAN: the 60-bar line its note names (the high, or the low a short waits on), named with its price at its right
-    end; nothing while warming up or with shorts disabled. VET: the fast and slow averages, while drawn. RISK and SIZE:
-    the stop and the entry, with a position only, and an entry off the plot isn't pointed at. FILLS: each fill drawn
-    (one before the chart's first candle isn't), an entry's mark where its pin hangs, an exit's on its dot. CROWD,
-    CHIEF and CRAWLER: nothing, ever."""
+    """SCAN: the 60-bar line its note names (the high, or the low a short waits on), named with its price; nothing while
+    warming up or with shorts disabled. VET: the fast and slow averages, while drawn. RISK and SIZE: the stop and the
+    entry, with a position only, and an entry off the plot isn't pointed at; the stop is left unnamed (its own STOP tag
+    on the axis names it), the entry is named. FILLS: each fill drawn (one before the chart's first candle isn't), an
+    entry's mark where its pin hangs (the newest candle's pin box held clear of the axis, as entryPin draws it), an
+    exit's on its dot. CROWD, CHIEF and CRAWLER: nothing, ever."""
     o = _run(f"""
 out.flat = refs(chartOf(), {json.dumps(H1)}); out.yHi = lastGeom.Y(82500);
 out.low = refs(chartOf(), {json.dumps(L1)}); out.yLo = lastGeom.Y(78000);
@@ -125,7 +135,9 @@ out.y = {{ stop: lastGeom.Y(79000), entry: lastGeom.Y(81000), e10: lastGeom.Y(80
 out.far = refs(chartOf({{ stop: 79000, entry: 120000 }}), {json.dumps(H1)});
 const cold = chartOf(); ["ema_fast", "ema_slow", "don_hi"].forEach((k) => {{ cold[k] = cold[k].map(() => null); }});
 out.cold = refs(cold, {json.dumps(H1)});
-out.night = refs(pos(), {json.dumps(H1)}, TOKS.night);""")
+out.night = refs(pos(), {json.dumps(H1)}, TOKS.night);
+out.newest = refs(pos({{ markers: [{{ ts: T0 + 2 * H * (N - 1), price: 80000, kind: "entry", side: "long" }}] }}), {json.dumps(H1)});
+out.nx = {{ x: lastGeom.X(N - 1), edge: lastGeom.w - lastGeom.padR - 4 }};""")
     for case in ("flat", "low", "warm", "noshort", "pos", "far", "cold", "night"):
         for k in ("chief", "crowd", "crawler"):
             assert o[case][k] is None, (case, k)
@@ -141,16 +153,50 @@ out.night = refs(pos(), {json.dumps(H1)}, TOKS.night);""")
     y = o["y"]
     for k in ("risk", "size"):
         got = o["pos"][k]
-        assert [(x["name"], x["dash"], x["series"]) for x in got] == [("stop 79,000", "6,4", False), ("entry 81,000", "2,3", False)]
+        assert [(x["name"], x["dash"], x["level"]) for x in got] == [(None, "6,4", True), ("entry 81,000", "2,3", True)]
         assert abs(got[0]["y"] - y["stop"]) < 1e-6 and abs(got[1]["y"] - y["entry"]) < 1e-6
         assert got[0]["x"] == got[1]["x"] == y["edge"]                            # named at the plot's end, short of the axis
         assert got[0]["color"] == DAY["--orange"] and got[1]["color"] == DAY["--entry"]
-    assert [x["name"] for x in o["far"]["risk"]] == ["stop 79,000"]                 # the entry is off the plot: not it
+    assert [(x["dash"], abs(x["y"] - y["stop"]) < 1e-6) for x in o["far"]["risk"]] == [("6,4", True)]   # the entry is off the plot: not it
     fills = o["pos"]["fills"]
     assert [f["mark"] for f in fills] == [True, True]                             # the one before the window: not drawn
     assert abs(fills[0]["x"] - y["x10"]) < 1e-6 and abs(fills[0]["y"] - (y["e10"] + 9)) < 1e-6 and fills[0]["r"] == 12   # the L pin
     assert abs(fills[1]["x"] - y["x20"]) < 1e-6 and abs(fills[1]["y"] - y["x21"]) < 1e-6 and fills[1]["r"] == 8           # the dot
     assert o["night"]["risk"][1]["color"] == NIGHT["--entry"]
+    nx = o["nx"]
+    assert nx["x"] > nx["edge"] and [f["x"] for f in o["newest"]["fills"]] == [nx["edge"]]   # the newest pin's box, held clear
+
+
+@node
+def test_scans_price_is_the_decided_bars_and_a_stepped_next_close_is_named_too():
+    """SCAN's note gives the line at the bar the desk decided on (desk/filter.py: don_hi[i]); a candle still forming past
+    it (BTC's formingBars, ETH's and SOL's Hyperliquid candle) is drawn on the next close's line, analysis.outlook[0],
+    which steps when an old high ages out or the bar's wick went over it. SCAN's mark names the decided bar's price, the
+    one its note gives, at that bar, and when the forming candle's line has stepped, also "next close" with that price
+    at the line's end (the BUY LINE panel's words): the card and its mark never give two prices for one line unsaid.
+    One line is drawn either way. A board drawn before chart.decided (or without one) names the line's end, as before.
+    withLive marks chart.decided before it adds any forming candle."""
+    o = _run(f"""
+out.step = refs(forming(82100), {json.dumps(H1)});
+out.g = {{ hi: lastGeom.Y(82500), next: lastGeom.Y(82100), xd: lastGeom.X(N - 1), xn: lastGeom.X(N) }};
+out.same = refs(forming(82500), {json.dumps(H1)});
+out.none = refs(forming(null), {json.dumps(H1)});
+point.key = "scan"; desk(forming(82100), {json.dumps(H1)}, TOKS.night); drawPoint();
+out.ops = ops.filter((x) => (x.k === "stroke" && x.width === 2.5) || x.k === "text").map((x) => x.k === "text" ? x.t : "line");
+out.ys = [...new Set(ops.filter((x) => x.k === "fillRect" && x.h === 16).map((x) => x.y + 8))];""")
+    g = o["g"]
+    step = o["step"]["scan"]
+    assert [(x["name"], x["series"]) for x in step] == [("60-bar high 82,500", True), ("next close 82,100", False)]
+    assert abs(step[0]["x"] - (g["xd"] - 2)) < 1e-6 and abs(step[0]["y"] - g["hi"]) < 1e-6         # at the decided bar
+    assert abs(step[1]["x"] - (g["xn"] - 2)) < 1e-6 and abs(step[1]["y"] - g["next"]) < 1e-6       # at the line's end
+    for case in ("same", "none"):                                                   # not stepped, or not drawn past it
+        got = o[case]["scan"]
+        assert [x["name"] for x in got] == ["60-bar high 82,500"] and abs(got[0]["x"] - (g["xd"] - 2)) < 1e-6, case
+    assert o["ops"] == ["line", "60-bar high 82,500", "next close 82,100"]          # one line, two names
+    assert abs(o["ys"][0] - o["ys"][1]) >= 17                                       # stacked, not over each other
+    wl = _function(APP, "withLive")
+    mark = wl.index("s.chart.decided = s.chart.candles.length - 1;")
+    assert mark < wl.index("formingBars(s, Date.now())") < wl.index("ch.candles.push(c);")
 
 
 def test_scans_mark_follows_the_words_the_desk_writes():
@@ -166,11 +212,13 @@ def test_scans_mark_follows_the_words_the_desk_writes():
 @node
 def test_the_mark_is_drawn_on_its_own_canvas_and_leaves_the_chart_and_live_marker_as_drawn():
     """Pointing never redraws or changes the chart's own canvas: its frame is the same with a card pointing. On #point,
-    shifted to the chart's place: the plot washed pale (never the price axis's column, never the date axis), but for a
-    band along the live line, so the live line and its tag are exactly as drawn; the thing redrawn 2.5 px wide in its
-    own color and dashes over an 8 px halo in the pointing card's color; each line named in a caption box at its end,
-    inside the plot. A card that points at nothing draws nothing (what was drawn fades out as it was); nor does a card
-    on the VT basket's tab. The cards that point can be tabbed to, the others can't."""
+    shifted to the chart's place and clipped to the plot before anything is drawn (never the price axis's column, its
+    tags and the live one's beat, never the date axis): the plot washed pale but for the live line's own pixels (a cut
+    as wide as the line, so no candle shows through beside it), the line and its tag exactly as drawn; the thing redrawn
+    2.5 px wide in its own color and dashes over an 8 px halo in the pointing card's color; the entry named in a caption
+    box at its end (the stop has its own tag on the axis). A fill on the newest candle at the live price is ringed
+    inside the plot only. A card that points at nothing draws nothing (what was drawn fades out as it was); nor does a
+    card on the VT basket's tab. The cards that point can be tabbed to, the others can't."""
     o = _run("""
 const ch = pos(); ch.live = ch.candles[N - 1][4];
 desk(ch, %s, TOKS.night);
@@ -179,22 +227,27 @@ point.key = "risk"; drawPoint();
 out.risk = { on: canvas.classList.on, ops: ops.slice(), tab: tabbable() };
 drawChart(ch); out.same = before === JSON.stringify(ops);
 out.g = { pw: lastGeom.w - lastGeom.padR, bot: lastGeom.h - 18, yLive: lastGeom.Y(ch.live), yStop: lastGeom.Y(79000), yEntry: lastGeom.Y(81000) };
-point.key = "fills"; drawPoint(); out.fills = ops.slice();
+point.key = "fills"; drawPoint(); out.fills = ops.slice(); out.saved = st.length;
+const newFill = pos({ markers: [{ ts: T0 + 2 * H * (N - 1), price: ch.live, kind: "entry", side: "long" }] }); newFill.live = ch.live;
+desk(newFill, %s, TOKS.night); point.key = "fills"; drawPoint(); out.newest = ops.slice(); out.npw = lastGeom.w - lastGeom.padR;
+desk(ch, %s, TOKS.night);
 point.key = "crowd"; ops.length = 0; ops.push({ k: "kept" }); drawPoint(); out.crowd = { on: canvas.classList.on, kept: ops.length === 1 };
 state = { ...state, header: { kind: "basket" } }; point.key = "risk"; drawPoint(); out.basket = { on: canvas.classList.on, tab: tabbable() };
 desk(chartOf(), %s, TOKS.day); point.key = null; drawPoint(); out.flatTab = tabbable();
-out.tr = tr;""" % (json.dumps(H1), json.dumps(H1)))
+out.tr = tr;""" % ((json.dumps(H1),) * 4))
     g, ops = o["g"], o["risk"]["ops"]
     assert o["same"] and o["risk"]["on"] and o["tr"][0] == [6, 40]                  # the chart's place in its box
+    assert ops[0] == {"k": "clip", "rect": [0, 0, g["pw"], g["bot"]]}               # the plot, before anything is drawn
+    assert o["saved"] == 0                                                         # and let go of after (save / restore)
     wash = [x for x in ops if x["k"] == "fillRect" and x["x"] == 0 and x["y"] == 0]
     assert wash == [{"k": "fillRect", "color": "rgba(26,32,48,0.6)", "x": 0, "y": 0, "w": g["pw"], "h": g["bot"]}]   # night's --panel
     live = [x for x in ops if x["k"] == "stroke" and x["gco"] == "destination-out"]
-    assert [(x["pts"], x["width"]) for x in live] == [([[0, g["yLive"]], [g["pw"], g["yLive"]]], 5)]                 # its band spared
+    assert [(x["pts"], x["width"]) for x in live] == [([[0, g["yLive"]], [g["pw"], g["yLive"]]], float(NIGHT["--live-width"]))]   # its own pixels
     wide = [(x["pts"][0][1], x["color"], x["dash"]) for x in ops if x["k"] == "stroke" and x["width"] == 2.5]
     assert wide == [(g["yStop"], NIGHT["--orange"], "6,4"), (g["yEntry"], NIGHT["--entry"], "2,3")]
     halo = [x["color"] for x in ops if x["k"] == "stroke" and x["width"] == 8]
     assert halo == ["rgba(213,138,0,0.3)"] * 2                                     # RISK's own --orange
-    assert [x["t"] for x in ops if x["k"] == "text"] == ["stop 79,000", "entry 81,000"]
+    assert [x["t"] for x in ops if x["k"] == "text"] == ["entry 81,000"]            # the stop: its own STOP tag names it
     for x in ops:                                                                  # all of it inside the plot
         if x["k"] in ("fillRect", "strokeRect"):
             assert x["x"] >= 0 and x["x"] + x["w"] <= g["pw"] + 1e-6 and x["y"] + x["h"] <= g["bot"] + 1e-6, x
@@ -207,6 +260,10 @@ out.tr = tr;""" % (json.dumps(H1), json.dumps(H1)))
     rings = [x for x in o["fills"] if x["k"] == "stroke" and x["width"] == 2]
     assert [c["pts"][0][2] for c in cuts] == [12, 8] and [r["color"] for r in rings] == [NIGHT["--ice"]] * 2   # each fill unwashed, ringed
     assert not [x for x in o["fills"] if x["k"] == "text"]
+    nw = o["newest"]                                                               # the newest candle's fill at the live price
+    assert nw[0] == {"k": "clip", "rect": [0, 0, o["npw"], g["bot"]]}
+    ring = [x["pts"][0] for x in nw if x["k"] == "stroke" and x["width"] == 2]
+    assert len(ring) == 1 and ring[0][0] == o["npw"] - 4 and ring[0][0] + ring[0][2] > o["npw"]   # it reaches the axis: the clip stops it
     assert o["crowd"] == {"on": False, "kept": True}
     assert o["basket"] == {"on": False, "tab": []}
     assert sorted(o["flatTab"]) == ["scan", "vet"]                                 # flat, no fills: those three can't be tabbed to
@@ -216,9 +273,10 @@ out.tr = tr;""" % (json.dumps(H1), json.dumps(H1)))
 def test_hover_focus_and_tap_point_and_end_as_they_should():
     """A mouse over a card points until it leaves; keyboard focus (focus-visible) points until blur, a tap's focus
     doesn't; a tap points for 3 s, which neither a stray leave nor a blur cuts short. On a phone the cards are far
-    below the chart: a tap on a card that points, with none of the chart on screen, scrolls it into view (no smooth
-    scroll under reduced motion) and points for 4 s; one that points at nothing never scrolls. A touch never points by
-    hovering, and the card never cancels a touch, so a swipe on it scrolls the page as before."""
+    below the chart: a tap on a card that points, with none of the chart on screen, scrolls it into view and points
+    for 4 s, then takes the page back to where the reader was, unless they have scrolled it since; no smooth scroll
+    either way under reduced motion. One that points at nothing never scrolls. A touch never points by hovering, and
+    the card never cancels a touch, so a swipe on it scrolls the page as before."""
     o = _run("""
 desk(pos(), %s, TOKS.day);
 const el = () => { const h = {}; return { h, vis: false, addEventListener(t, f) { h[t] = f; }, matches(s) { return s === ":focus-visible" && this.vis; } }; };
@@ -231,22 +289,29 @@ e.h.focus(); step("a tap's focus");
 e.h.click(); step("tap");
 e.h.pointerleave({ pointerType: "mouse" }); e.h.blur(); step("leave, blur");
 timers[point.timer - 1][0](); step("3 s on");
-canvas.rect = { top: -1500, bottom: -1240 };
+canvas.rect = { top: -1500, bottom: -1240, height: 260 };   // the chart's middle 1,500 - 130 + 400 px up: the page at 830
+canvas.scrollIntoView = (o) => { canvas.scrolled.push(o); scrollY = 830; };
+const back = [];
 e.h.pointerdown({ pointerType: "touch" }); e.h.click(); step("tap, chart away");
-timers[point.timer - 1][0]();
-const c = el(); aim(c, "crowd"); c.h.pointerdown({ pointerType: "touch" }); c.h.click(); step("crowd tap, chart away");
-timers[point.timer - 1][0]();
+timers[point.timer - 1][0](); back.push(scrolls.splice(0));
+const c = el(); aim(c, "crowd"); scrollY = 2600; c.h.pointerdown({ pointerType: "touch" }); c.h.click(); step("crowd tap, chart away");
+timers[point.timer - 1][0](); back.push(scrolls.splice(0));
+scrollY = 2600; e.h.pointerdown({ pointerType: "touch" }); e.h.click(); scrollY = 1700;   // the reader scrolls on from the chart
+timers[point.timer - 1][0](); back.push(scrolls.splice(0));
+still.matches = true; scrollY = 2600; e.h.pointerdown({ pointerType: "touch" }); e.h.click();
+timers[point.timer - 1][0](); back.push(scrolls.splice(0)); still.matches = false;
 e.h.pointerdown({ pointerType: "mouse" }); e.h.click(); step("mouse click");
 e.vis = true; e.h.focus(); step("tab to it"); e.h.blur(); step("tab away");
-out.log = log; out.scrolled = canvas.scrolled; out.on = Object.keys(e.h).sort();""" % json.dumps(H1))
+out.log = log; out.scrolled = canvas.scrolled; out.back = back; out.on = Object.keys(e.h).sort();""" % json.dumps(H1))
     assert o["log"] == [["mouse in", "risk", 0], ["mouse out", None, 0], ["touch down", None, 0], ["a tap's focus", None, 0],
                         ["tap", "risk", 3000], ["leave, blur", "risk", 3000], ["3 s on", None, 0],
                         ["tap, chart away", "risk", 4000], ["crowd tap, chart away", "crowd", 3000],
                         ["mouse click", None, 0], ["tab to it", "risk", 0], ["tab away", None, 0]]
-    assert o["scrolled"] == [{"block": "center", "behavior": "smooth"}]
+    assert o["scrolled"] == [{"block": "center", "behavior": "smooth"}] * 2 + [{"block": "center", "behavior": "auto"}]
+    assert o["back"] == [[{"top": 2600, "behavior": "smooth"}], [], [], [{"top": 2600, "behavior": "auto"}]]   # back to the card
     assert o["on"] == ["blur", "click", "focus", "pointerdown", "pointerenter", "pointerleave"]   # no touchstart, no wheel
     aim = _function(APP, "aim") + _function(APP, "tapped")
-    assert "preventDefault" not in aim and 'behavior: still.matches ? "auto" : "smooth"' in aim
+    assert "preventDefault" not in aim and 'still.matches ? "auto" : "smooth"' in aim
     assert "aim(el, a.key);" in _function(APP, "renderAgents")                     # each card, once, as it is made
     render = _function(APP, "render")
     assert "drawChart(s.chart); drawWeb(); drawPoint(); }" in render                # in step with every redraw of the chart

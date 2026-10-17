@@ -444,40 +444,47 @@
 
   // ---- an agent card pointing at what its note is about ------------------------------------------------------------
   // Hovering a card, tabbing to it or tapping it (a phone: for 3 s) marks on the chart the thing its note is about, and
-  // only when the chart draws it: SCAN's 60-bar line (the high, or the low its note names) with its price at its right
-  // end, VET's fast and slow averages, RISK's and SIZE's stop and entry (a position only), FILLS' fills. CROWD, CHIEF
-  // and CRAWLER have nothing on the chart, nor has a card whose thing isn't drawn (flat, no fills on it, warming up):
-  // those point at nothing. key: (s, card) => what to mark, or null
+  // only when the chart draws it: SCAN's 60-bar line (the high, or the low its note names) with its price, VET's fast
+  // and slow averages, RISK's and SIZE's stop and entry (a position only), FILLS' fills. CROWD, CHIEF and CRAWLER have
+  // nothing on the chart, nor has a card whose thing isn't drawn (flat, no fills on it, warming up): those point at
+  // nothing. key: (s, card) => what to mark, or null
   const POINTS = {
     scan: (s, a) => {
       const m = /(\d+)-bar (high|low)/.exec(a.quote || "");
-      return m && pointLine(s.chart[m[2] === "high" ? "don_hi" : "don_lo"], (v) => `${m[1]}-bar ${m[2]} ${pxAxis(v)}`,
-        css("--channel") || rgba("--muted", .55), [3, 4]);
+      if (!m) return null;
+      const xs = s.chart[m[2] === "high" ? "don_hi" : "don_lo"], color = css("--channel") || rgba("--muted", .55);
+      // named at the bar the desk decided on (chart.decided), the price its note gives; the candle still forming past
+      // it is on the next close's line (the BUY LINE's "next close"), named too when that has stepped
+      const at = pointLine(xs, (v) => `${m[1]}-bar ${m[2]} ${pxAxis(v)}`, color, [3, 4], s.chart.decided ?? Infinity);
+      const next = at && pointLine(xs, (v) => `next close ${pxAxis(v)}`, color);
+      return next && pxAxis(next.v) !== pxAxis(at.v) ? [at, { x: next.x, y: next.y, name: next.name }] : at;
     },
     vet: (s) => [pointLine(s.chart.ema_fast, () => "fast", css("--cyan")), pointLine(s.chart.ema_slow, () => "slow", css("--blue"))],
-    risk: (s) => [pointLevel(s.chart.stop, "stop", css("--orange"), [6, 4]),
+    risk: (s) => [pointLevel(s.chart.stop, null, css("--orange"), [6, 4]),   // unnamed: its own STOP tag on the axis names it
       pointLevel(s.chart.entry, "entry", css("--entry") || "rgba(241,241,246,.6)", [2, 3])],
     fills: (s) => {   // each fill as drawn: an entry's pin (or triangle) hangs off its price, an exit's dot is on it
-      const ch = s.chart, idx = new Map(ch.candles.map((c, k) => [c[0], k])), pin = css("--entry-mark") === "pin", { X, Y } = lastGeom;
+      const ch = s.chart, idx = new Map(ch.candles.map((c, k) => [c[0], k])), pin = css("--entry-mark") === "pin", { X, Y, w, padR } = lastGeom;
       return (ch.markers || []).map((m) => {
         const k = nearest(idx, m.ts, ch.bar_ms, ch.candles), d = m.side === "short" ? -1 : 1;
-        return k == null || !onPlot(Y(m.price)) ? null : m.kind === "entry" ? { mark: true, x: X(k), y: Y(m.price) + d * 9, r: pin ? 12 : 9 }
+        return k == null || !onPlot(Y(m.price)) ? null : m.kind === "entry"   // a pin's box where entryPin puts it
+          ? { mark: true, x: pin ? Math.min(X(k), w - padR - 4) : X(k), y: Y(m.price) + d * 9, r: pin ? 12 : 9 }
           : { mark: true, x: X(k), y: Y(m.price), r: 8 };
       });
     },
   };
   POINTS.size = POINTS.risk;
   const onPlot = (y) => y >= 0 && y <= lastGeom.h - 18;   // above the date axis (drawChart's padB)
-  // a series as drawn (null where it has no value), named at its right end; a level across the plot, named at its end
-  function pointLine(xs, name, color, dash = []) {
-    let k = xs ? xs.length - 1 : -1;
+  // a series as drawn (null where it has no value), named at its last value up to end (its right end); a level across
+  // the plot, named at its end (name null: not named)
+  function pointLine(xs, name, color, dash = [], end = Infinity) {
+    let k = xs ? Math.min(end, xs.length - 1) : -1;
     while (k >= 0 && xs[k] == null) k--;
     const { X, Y } = lastGeom;
-    return k >= 0 && onPlot(Y(xs[k])) ? { xs, x: X(k) - 2, y: Y(xs[k]), name: name(xs[k]), color, dash } : null;
+    return k >= 0 && onPlot(Y(xs[k])) ? { xs, v: xs[k], x: X(k) - 2, y: Y(xs[k]), name: name(xs[k]), color, dash } : null;
   }
   function pointLevel(p, name, color, dash) {
     const { Y, w, padR } = lastGeom;
-    return p && onPlot(Y(p)) ? { at: p, x: w - padR - 4, y: Y(p), name: `${name} ${pxAxis(p)}`, color, dash } : null;
+    return p && onPlot(Y(p)) ? { at: p, x: w - padR - 4, y: Y(p), name: name && `${name} ${pxAxis(p)}`, color, dash } : null;
   }
   function referent(key, s) {
     const a = (s.agents || []).find((x) => x.key === key), f = POINTS[key];
@@ -486,11 +493,11 @@
     return out.length ? out : null;
   }
 
-  // On #point, a canvas over the chart's: the plot washed pale but for the live line (as drawn) and the fills marked,
-  // the thing redrawn wider over a halo in the card's color, a line named at its end. The chart's own canvas, its
-  // values, lines and tags, and the price axis's column (the live tag and its beat) aren't touched. It fades in and
-  // out (style.css .point; still under reduced motion). Each redraw of the chart redraws it, and says which cards can
-  // be tabbed to: the ones that point at something
+  // On #point, a canvas over the chart's: the plot washed pale but for the live line's own pixels (as drawn) and the
+  // fills marked, the thing redrawn wider over a halo in the card's color, a line named at its end. All of it inside
+  // the plot: the chart's own canvas, its values, lines and tags, and the price axis's column (the live tag and its
+  // beat) aren't touched. It fades in and out (style.css .point; still under reduced motion). Each redraw of the chart
+  // redraws it, and says which cards can be tabbed to: the ones that point at something
   const point = { key: null, timer: 0 };
   function drawPoint() {
     const cv = $("point"), s = state, desk = !!(s && s.chart && s.header.kind !== "basket");
@@ -503,11 +510,14 @@
     if (!ref) return;   // (what it drew fades out as it was)
     const { g } = fit(cv), { X, Y, w, h, padR } = lastGeom, pw = w - padR, ch = s.chart, tint = COLORS[point.key], c = $("chart");
     const out = (draw) => { g.save(); g.globalCompositeOperation = "destination-out"; g.fillStyle = "#000"; draw(); g.restore(); };
-    g.translate(c.offsetLeft, c.offsetTop);
+    g.save(); g.translate(c.offsetLeft, c.offsetTop);
+    g.beginPath(); g.rect(0, 0, pw, h - 18); g.clip();   // the plot: a ring at the newest candle stops at the axis line
     g.fillStyle = rgba("--panel", .6); g.fillRect(0, 0, pw, h - 18);
-    if (ch.live) out(() => line(g, [[0, Y(ch.live)], [pw, Y(ch.live)]], "#000", 5));
-    const lines = ref.filter((r) => !r.mark), at = stackTags(lines.map((l) => ({ y: l.y - 11, tie: 0 })), 0, 8, h - 26);
+    if (ch.live) out(() => line(g, [[0, Y(ch.live)], [pw, Y(ch.live)]], "#000", +(css("--live-width") || 1.5)));
+    const lines = ref.filter((r) => !r.mark), named = lines.filter((l) => l.name);
+    const at = stackTags(named.map((l) => ({ y: l.y - 11, tie: 0 })), 0, 8, h - 26);
     for (const l of lines) {
+      if (!l.xs && l.at == null) continue;   // a second name on a line drawn already
       const pts = l.xs ? l.xs.map((v, k) => [X(k), v == null ? null : Y(v)]) : [[0, Y(l.at)], [pw, Y(l.at)]];
       line(g, pts, rgba(tint, .3), 8);
       line(g, pts, l.color, 2.5, l.dash);
@@ -517,7 +527,8 @@
       g.save(); g.strokeStyle = rgba(tint, .3); g.lineWidth = 6; g.beginPath(); g.arc(m.x, m.y, m.r + 2, 0, Math.PI * 2); g.stroke();
       g.strokeStyle = css(tint); g.lineWidth = 2; g.beginPath(); g.arc(m.x, m.y, m.r, 0, Math.PI * 2); g.stroke(); g.restore();
     }
-    lines.forEach((l, k) => pointTag(g, l.x, at[k], l.name, css(tint)));
+    named.forEach((l, k) => pointTag(g, l.x, at[k], l.name, css(tint)));
+    g.restore();
   }
   // a line's name, right-aligned at x: a caption box with the pointing card's color down its left edge
   function pointTag(g, x, y, text, tint) {
@@ -528,19 +539,23 @@
     g.fillStyle = tint; g.fillRect(x0, y - 8, 4, 16);
     g.fillStyle = css("--text"); g.fillText(text, x0 + 9, y + 4); g.restore();
   }
-  function pointAt(key, ms = 0) {
+  function pointAt(key, ms = 0, then = null) {   // then: once the mark ends on its own (not cut short by another)
     clearTimeout(point.timer); point.timer = 0; point.key = key;
-    if (key && ms) point.timer = setTimeout(() => pointAt(null), ms);
+    if (key && ms) point.timer = setTimeout(() => { pointAt(null); if (then) then(); }, ms);
     drawPoint();
   }
   // A card's mouse (or pen) hover, its keyboard focus, and a tap: renderAgents, once as each card is made. The card
   // takes no touch for itself (no preventDefault), so a swipe on it scrolls the page as before. A tap points for 3 s;
-  // on a phone the cards are far below the chart, so a tap on one that points brings the chart into view first when
-  // none of it is on screen (and points a second longer for the scroll)
+  // on a phone the cards are far below the chart, so a tap on one that points, with none of the chart on screen,
+  // brings the chart into view (block center: the page then at `to`) and points a second longer for the scroll, and
+  // then takes the page back to where the reader was, unless they have scrolled it since
   function tapped(key) {
     const c = $("chart"), r = c.getBoundingClientRect(), go = (r.bottom < 0 || r.top > innerHeight) && !!state && !!referent(key, state);
-    if (go) c.scrollIntoView({ block: "center", behavior: still.matches ? "auto" : "smooth" });
-    pointAt(key, go ? 4000 : 3000);
+    if (!go) return pointAt(key, 3000);
+    const how = still.matches ? "auto" : "smooth", back = scrollY;
+    const to = Math.max(0, Math.min(document.documentElement.scrollHeight - innerHeight, back + r.top + r.height / 2 - innerHeight / 2));
+    c.scrollIntoView({ block: "center", behavior: how });
+    pointAt(key, 4000, () => { if (Math.abs(scrollY - to) < 40) scrollTo({ top: back, behavior: how }); });
   }
   function aim(el, key) {
     let touch = false;
@@ -1165,6 +1180,7 @@
     const s = JSON.parse(JSON.stringify(snap));
     if (s.header.kind === "basket") return withLiveBasket(s);
     const lp = s.livePx = livePrice(s);   // Coinbase closed: no price, so the board's own, nothing re-marked
+    s.chart.decided = s.chart.candles.length - 1;   // the board's newest candle, the bar the desk decided on (SCAN's note)
     if (s.venue) formingBars(s, Date.now());
     s.chart.side = s.ticker.pos ? s.ticker.pos.side : null;   // a stop's side of the price: below a long's, above a short's
     s.chart.canLive = !s.venue || s.venue.name === "coinbase";   // a chart that can have a live marker: its room is kept
