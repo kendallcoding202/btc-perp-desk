@@ -450,12 +450,16 @@
   // nothing. key: (s, card) => what to mark, or null
   const POINTS = {
     scan: (s, a) => {
-      const m = /(\d+)-bar (high|low)/.exec(a.quote || "");
+      // the line its note waits on, "a close above the 60-bar high $84,295" (or below the low), or has seen broken,
+      // "breakout: 60-bar high taken out". A bull trap's "broke the 60-bar high 3 bars ago" is an older bar's: nothing
+      const m = /(\d+)-bar (high|low) (?:\$([\d,]+(?:\.\d+)?)|taken out)/.exec(a.quote || "");
       if (!m) return null;
       const xs = s.chart[m[2] === "high" ? "don_hi" : "don_lo"], color = css("--channel") || rgba("--muted", .55);
-      // named at the bar the desk decided on (chart.decided), the price its note gives; the candle still forming past
-      // it is on the next close's line (the BUY LINE's "next close"), named too when that has stepped
-      const at = pointLine(xs, (v) => `${m[1]}-bar ${m[2]} ${pxAxis(v)}`, color, [3, 4], s.chart.decided ?? Infinity);
+      // named at the bar the desk decided on (chart.decided) with the price its note gives, in its words (whole dollars
+      // under $1,000 too), and nothing when that isn't the line's price there; the candle still forming past it is on
+      // the next close's line (the BUY LINE's "next close"), named too when that has stepped
+      const at = pointLine(xs, (v) => `${m[1]}-bar ${m[2]} ${m[3] || pxAxis(v)}`, color, [3, 4], s.chart.decided ?? Infinity);
+      if (at && m[3] && Math.abs(+m[3].replace(/,/g, "") - at.v) > 0.5) return null;
       const next = at && pointLine(xs, (v) => `next close ${pxAxis(v)}`, color);
       return next && pxAxis(next.v) !== pxAxis(at.v) ? [at, { x: next.x, y: next.y, name: next.name }] : at;
     },
@@ -493,11 +497,13 @@
     return out.length ? out : null;
   }
 
-  // On #point, a canvas over the chart's: the plot washed pale but for the live line's own pixels (as drawn) and the
-  // fills marked, the thing redrawn wider over a halo in the card's color, a line named at its end. All of it inside
-  // the plot: the chart's own canvas, its values, lines and tags, and the price axis's column (the live tag and its
-  // beat) aren't touched. It fades in and out (style.css .point; still under reduced motion). Each redraw of the chart
-  // redraws it, and says which cards can be tabbed to: the ones that point at something
+  // On #point, a canvas over the chart's: the plot washed pale but for the fills marked, the thing redrawn wider over a
+  // halo in the card's color, a line named at its end, never on the live line: above its line, or under it when the
+  // live line runs just above (no room under: past the live line). Last, the live line's own pixels (as drawn) are cut
+  // out of all of it, so the chart's gold line shows on top, as the chart draws it. All of it inside the plot: the
+  // chart's own canvas, its values, lines and tags, and the price axis's column (the live tag and its beat) aren't
+  // touched. It fades in and out (style.css .point; still under reduced motion). Each redraw of the chart redraws it,
+  // and says which cards can be tabbed to: the ones that point at something
   const point = { key: null, timer: 0 };
   function drawPoint() {
     const cv = $("point"), s = state, desk = !!(s && s.chart && s.header.kind !== "basket");
@@ -513,9 +519,12 @@
     g.save(); g.translate(c.offsetLeft, c.offsetTop);
     g.beginPath(); g.rect(0, 0, pw, h - 18); g.clip();   // the plot: a ring at the newest candle stops at the axis line
     g.fillStyle = rgba("--panel", .6); g.fillRect(0, 0, pw, h - 18);
-    if (ch.live) out(() => line(g, [[0, Y(ch.live)], [pw, Y(ch.live)]], "#000", +(css("--live-width") || 1.5)));
-    const lines = ref.filter((r) => !r.mark), named = lines.filter((l) => l.name);
-    const at = stackTags(named.map((l) => ({ y: l.y - 11, tie: 0 })), 0, 8, h - 26);
+    const lines = ref.filter((r) => !r.mark), named = lines.filter((l) => l.name), yl = ch.live ? Y(ch.live) : null;
+    // a name's box (16 tall) above its line; under it when the live line is less than 28 px above (the box would reach
+    // it), past the live line when there's no room under. Stacked with the live line as the anchor: 9 px clear of it
+    const byLive = (l) => yl != null && l.y > yl && l.y - yl < 28, room = (l) => l.y + 11 <= h - 26;
+    const want = named.map((l) => ({ y: !byLive(l) ? l.y - 11 : room(l) ? l.y + 11 : yl - 17, tie: 0 }));
+    const at = yl == null ? stackTags(want, 0, 8, h - 26) : stackTags([{ y: yl, tie: 0 }, ...want], 0, 8, h - 26).slice(1);
     for (const l of lines) {
       if (!l.xs && l.at == null) continue;   // a second name on a line drawn already
       const pts = l.xs ? l.xs.map((v, k) => [X(k), v == null ? null : Y(v)]) : [[0, Y(l.at)], [pw, Y(l.at)]];
@@ -528,6 +537,7 @@
       g.strokeStyle = css(tint); g.lineWidth = 2; g.beginPath(); g.arc(m.x, m.y, m.r, 0, Math.PI * 2); g.stroke(); g.restore();
     }
     named.forEach((l, k) => pointTag(g, l.x, at[k], l.name, css(tint)));
+    if (ch.live) out(() => line(g, [[0, yl], [pw, yl]], "#000", +(css("--live-width") || 1.5)));
     g.restore();
   }
   // a line's name, right-aligned at x: a caption box with the pointing card's color down its left edge
@@ -547,15 +557,16 @@
   // A card's mouse (or pen) hover, its keyboard focus, and a tap: renderAgents, once as each card is made. The card
   // takes no touch for itself (no preventDefault), so a swipe on it scrolls the page as before. A tap points for 3 s;
   // on a phone the cards are far below the chart, so a tap on one that points, with none of the chart on screen,
-  // brings the chart into view (block center: the page then at `to`) and points a second longer for the scroll, and
-  // then takes the page back to where the reader was, unless they have scrolled it since
+  // brings the chart into view (block center: the page then at about `to`) and points a second longer for the scroll,
+  // and then takes the page back to where the reader was, unless they have scrolled it since (more than a quarter of
+  // the window: a phone's toolbar going or coming back moves it a little) or gone to another tab
   function tapped(key) {
     const c = $("chart"), r = c.getBoundingClientRect(), go = (r.bottom < 0 || r.top > innerHeight) && !!state && !!referent(key, state);
     if (!go) return pointAt(key, 3000);
-    const how = still.matches ? "auto" : "smooth", back = scrollY;
+    const how = still.matches ? "auto" : "smooth", back = scrollY, tab = coin;
     const to = Math.max(0, Math.min(document.documentElement.scrollHeight - innerHeight, back + r.top + r.height / 2 - innerHeight / 2));
     c.scrollIntoView({ block: "center", behavior: how });
-    pointAt(key, 4000, () => { if (Math.abs(scrollY - to) < 40) scrollTo({ top: back, behavior: how }); });
+    pointAt(key, 4000, () => { if (coin === tab && Math.abs(scrollY - to) < innerHeight / 4) scrollTo({ top: back, behavior: how }); });
   }
   function aim(el, key) {
     let touch = false;

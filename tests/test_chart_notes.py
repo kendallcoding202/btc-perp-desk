@@ -8,9 +8,11 @@ on the chart the thing its note is about, only when the chart draws it: SCAN's 6
 gives (and the next close's, when the line steps at the candle still forming), VET's fast and slow averages, RISK's and
 SIZE's stop and entry (a position only), FILLS' fills; CROWD, CHIEF and CRAWLER point at nothing. The mark is drawn on
 a canvas of its own, clipped to the plot: the chart's own frame, its values, lines and tags, and the live marker are as
-they were. A phone's tap that brings the chart into view takes the page back to the card when the mark ends. The spider's web is drawn under the chart's canvas, fainter, so the candles and lines are
-always drawn over its silk. The page's own functions are run in node, drawing on a canvas that records what it is
-asked to draw (tests/test_live_marker.py's), with the comic theme's day and night tokens."""
+they were, and the gold live line shows on top of the mark, with no name on it. A phone's tap that brings the chart
+into view takes the page back to the card when the mark ends. The spider's web is drawn under the chart's canvas,
+fainter, so the candles and lines are always drawn over its silk. The page's own functions are run in node, drawing on
+a canvas that records what it is asked to draw (tests/test_live_marker.py's), with the comic theme's day and night
+tokens."""
 
 from __future__ import annotations
 
@@ -34,7 +36,7 @@ def _point_js() -> str:
             + _between(APP, "  const POINTS = {", "  function referent(") + _function(APP, "referent")
             + _between(APP, "  const point = { key", "  function drawPoint(") + _function(APP, "drawPoint")
             + _function(APP, "pointTag") + _function(APP, "pointAt") + _function(APP, "tapped") + _function(APP, "aim") + """
-let state = null;
+let state = null, coin = "BTC";
 const innerHeight = 800, tr = [], timers = [];
 const setTimeout = (f, ms) => { timers.push([f, ms]); return timers.length; }, clearTimeout = () => {};
 Object.defineProperty(g, "globalCompositeOperation", { get() { return cur.gco || "source-over"; }, set(v) { cur.gco = v; } });
@@ -200,11 +202,44 @@ out.ys = [...new Set(ops.filter((x) => x.k === "fillRect" && x.h === 16).map((x)
 
 
 def test_scans_mark_follows_the_words_the_desk_writes():
-    """SCAN's mark is the line its note names, read from the note desk/filter.py writes ("a close above the 60-bar
-    high $84,295", "... below the 60-bar low ..."): that wording is what the page reads."""
+    """SCAN's mark is the line its note names, read from the notes desk/filter.py writes: "a close above the 60-bar
+    high $84,295" (or below the low; whole dollars, ',.0f'), or "breakout: 60-bar high taken out". A bull trap's
+    "broke the 60-bar high 3 bars ago, now back below $X" names an older bar's line, not the one drawn at the bar the
+    desk decided on: that wording isn't read."""
     assert "f\"a close {'above' if d > 0 else 'below'} the {s.breakout_bars}-bar {hi_lo} ${level:,.0f}\"" in FILTER
+    assert 'f"breakout: {s.breakout_bars}-bar {hi_lo} taken out"' in FILTER
     assert 'hi_lo = "high" if d > 0 else "low"' in FILTER
-    assert r'/(\d+)-bar (high|low)/.exec(a.quote || "")' in APP
+    assert 'f"bull trap: broke the {s.breakout_bars}-bar high {i - j} bars ago, now back below ${lvl:,.0f}"' in FILTER
+    rx = r'/(\d+)-bar (high|low) (?:\$([\d,]+(?:\.\d+)?)|taken out)/'
+    assert rx + '.exec(a.quote || "")' in APP
+    py = re.compile(rx[1:-1])
+    assert py.search("nothing yet. waiting for a close above the 60-bar high $84,295.").groups() == ("60", "high", "84,295")
+    assert py.search("breakout: 60-bar low taken out. that's a setup.").groups() == ("60", "low", None)
+    assert not py.search("bull trap: broke the 60-bar high 3 bars ago, now back below $84,295. that's a setup.")
+
+
+@node
+def test_scans_name_says_the_price_as_its_note_does_and_a_note_about_another_line_points_at_nothing():
+    """The name gives the note's own figure: a coin under $1,000 has its line at 113.39 and its note says $113 (the
+    chart's axis would say 113.39), so the name says 113. A note that names no price ("taken out") is named with the
+    line's. A note whose price isn't the line's at the decided bar (more than the half dollar its rounding can be off
+    by, either way Python rounds a half) points at nothing, as does a bull trap's note."""
+    o = _run(f"""
+const small = (f, o = {{}}) => {{ const ch = chartOf(o); ch.candles = ch.candles.map(([t, ...p]) => [t, ...p.map((v) => v * f)]);
+  ["ema_fast", "ema_slow", "don_hi", "don_lo"].forEach((k) => {{ ch[k] = ch[k].map((v) => v * f); }}); return ch; }};
+out.sol = refs(small(113.39 / 82500), "nothing yet. waiting for a close above the 60-bar high $113.");
+out.solLo = refs(small(113.39 / 82500), "nothing yet. waiting for a close below the 60-bar low $107.");   // 78,000 scaled: 107.20
+out.taken = refs(chartOf(), "breakout: 60-bar high taken out. that's a setup.");
+out.half = refs(chartOf({{ don_hi: Array(N).fill(82500.5) }}), {json.dumps(H1)});
+out.off = refs(chartOf(), "nothing yet. waiting for a close above the 60-bar high $82,499.");
+out.trap = refs(chartOf(), "bull trap: broke the 60-bar high 3 bars ago, now back below $82,500. that's a setup.");
+out.axis = pxAxis(113.39);""")
+    assert o["axis"] == "113.39"
+    assert [x["name"] for x in o["sol"]["scan"]] == ["60-bar high 113"]
+    assert [x["name"] for x in o["solLo"]["scan"]] == ["60-bar low 107"]
+    assert [x["name"] for x in o["taken"]["scan"]] == ["60-bar high 82,500"]
+    assert [x["name"] for x in o["half"]["scan"]] == ["60-bar high 82,500"]       # 82,500.5: Python's ',.0f' says 82,500
+    assert o["off"]["scan"] is None and o["trap"]["scan"] is None
 
 
 # ---------------------------------------------------------------- how it is drawn
@@ -213,12 +248,12 @@ def test_scans_mark_follows_the_words_the_desk_writes():
 def test_the_mark_is_drawn_on_its_own_canvas_and_leaves_the_chart_and_live_marker_as_drawn():
     """Pointing never redraws or changes the chart's own canvas: its frame is the same with a card pointing. On #point,
     shifted to the chart's place and clipped to the plot before anything is drawn (never the price axis's column, its
-    tags and the live one's beat, never the date axis): the plot washed pale but for the live line's own pixels (a cut
-    as wide as the line, so no candle shows through beside it), the line and its tag exactly as drawn; the thing redrawn
-    2.5 px wide in its own color and dashes over an 8 px halo in the pointing card's color; the entry named in a caption
-    box at its end (the stop has its own tag on the axis). A fill on the newest candle at the live price is ringed
-    inside the plot only. A card that points at nothing draws nothing (what was drawn fades out as it was); nor does a
-    card on the VT basket's tab. The cards that point can be tabbed to, the others can't."""
+    tags and the live one's beat, never the date axis): the plot washed pale, and last the live line's own pixels cut out
+    of it all (a cut as wide as the line, so no candle shows through beside it), the line and its tag exactly as drawn;
+    the thing redrawn 2.5 px wide in its own color and dashes over an 8 px halo in the pointing card's color; the entry
+    named in a caption box at its end (the stop has its own tag on the axis). A fill on the newest candle at the live
+    price is ringed inside the plot only. A card that points at nothing draws nothing (what was drawn fades out as it
+    was); nor does a card on the VT basket's tab. The cards that point can be tabbed to, the others can't."""
     o = _run("""
 const ch = pos(); ch.live = ch.candles[N - 1][4];
 desk(ch, %s, TOKS.night);
@@ -270,12 +305,59 @@ out.tr = tr;""" % ((json.dumps(H1),) * 4))
 
 
 @node
+def test_the_live_line_shows_on_top_of_a_mark_and_no_name_sits_on_it():
+    """The chart draws its gold live line over everything, and a mark on #point over it hid it: an entry or a 60-bar
+    line at or near the price, just after an entry or with a breakout about to happen, is when it matters most. The
+    live line's own pixels are cut out of the mark last, after its lines, rings and names, so the chart's line shows
+    on top as drawn; and a name's box keeps 9 px clear of the live line: above its line as before, under it when the
+    live line runs just above (the box would reach it), past the live line when there's no room under at the plot's
+    foot. RISK with the entry just under, just over and at the live price, and under it at the plot's foot; SCAN with
+    the 60-bar high just under the price; VET with both averages under it; FILLS with a fill on the live line."""
+    o = _run("""
+const run = (key, ch, scan = %s) => {
+  point.key = key; desk(ch, scan, TOKS.day); drawPoint();
+  const cut = ops[ops.length - 1], yl = lastGeom.Y(ch.live);
+  return { yl, pw: lastGeom.w - lastGeom.padR, h: lastGeom.h, cut: { gco: cut.gco, k: cut.k, pts: cut.pts, width: cut.width },
+    cuts: ops.filter((x) => x.gco === "destination-out" && x.k === "stroke").length,
+    boxes: ops.filter((x) => x.k === "fillRect" && x.h === 16 && x.w > 4).map((x) => x.y + 8),
+    lines: referent(key, state).filter((r) => r.name).map((r) => r.y) };
+};
+const live = (p, o) => { const ch = pos(o); ch.live = p; return ch; };
+out.under = run("risk", live(81100));
+out.over = run("size", live(80900));
+out.at = run("risk", live(81000));
+out.foot = run("risk", live(78100, { stop: null, entry: 78060 }));
+const sc = chartOf(); sc.live = 82600; out.scan = run("scan", sc);
+const vt = chartOf(); vt.live = vt.ema_fast[N - 1] + 60; out.vet = run("vet", vt);
+const fl = pos(); fl.live = 81000; out.fills = run("fills", fl);""" % json.dumps(H1))
+    lw = float(DAY["--live-width"])
+    for case, r in o.items():
+        yl = r["yl"]
+        assert r["cut"] == {"gco": "destination-out", "k": "stroke", "pts": [[0, yl], [r["pw"], yl]], "width": lw}, case   # last
+        assert r["cuts"] == 1, case
+        assert all(abs(c - yl) >= 17 - 1e-6 for c in r["boxes"]), (case, yl, r["boxes"])   # the box 9 px clear of it
+        assert all(abs(a - b) >= 17 - 1e-6 for a in r["boxes"] for b in r["boxes"] if a != b), case
+    (b,), (e,) = o["under"]["boxes"], o["under"]["lines"]
+    assert e > o["under"]["yl"] and b - 8 > e                                     # the entry just under: its name under it
+    for case in ("over", "at"):
+        (b,), (e,) = o[case]["boxes"], o[case]["lines"]
+        assert e <= o[case]["yl"] and b + 8 < e, case                              # over or at it: above, as before
+    f = o["foot"]
+    (b,), (e,) = f["boxes"], f["lines"]
+    assert e > f["yl"] and e + 19 > f["h"] - 18 and b + 8 < f["yl"]              # no room under: past the live line
+    (b,), (e,) = o["scan"]["boxes"], o["scan"]["lines"]
+    assert e > o["scan"]["yl"] and b - 8 > e                                      # the 60-bar high just under the price
+    assert len(o["vet"]["boxes"]) == 2 and o["fills"]["boxes"] == []
+
+
+@node
 def test_hover_focus_and_tap_point_and_end_as_they_should():
     """A mouse over a card points until it leaves; keyboard focus (focus-visible) points until blur, a tap's focus
     doesn't; a tap points for 3 s, which neither a stray leave nor a blur cuts short. On a phone the cards are far
     below the chart: a tap on a card that points, with none of the chart on screen, scrolls it into view and points
-    for 4 s, then takes the page back to where the reader was, unless they have scrolled it since; no smooth scroll
-    either way under reduced motion. One that points at nothing never scrolls. A touch never points by hovering, and
+    for 4 s, then takes the page back to where the reader was, unless they have scrolled it since (a phone's toolbar
+    going or coming back moves the page a little: that isn't a scroll) or gone to another tab; no smooth scroll either
+    way under reduced motion. One that points at nothing never scrolls. A touch never points by hovering, and
     the card never cancels a touch, so a swipe on it scrolls the page as before."""
     o = _run("""
 desk(pos(), %s, TOKS.day);
@@ -300,6 +382,10 @@ scrollY = 2600; e.h.pointerdown({ pointerType: "touch" }); e.h.click(); scrollY 
 timers[point.timer - 1][0](); back.push(scrolls.splice(0));
 still.matches = true; scrollY = 2600; e.h.pointerdown({ pointerType: "touch" }); e.h.click();
 timers[point.timer - 1][0](); back.push(scrolls.splice(0)); still.matches = false;
+scrollY = 2600; e.h.pointerdown({ pointerType: "touch" }); e.h.click(); scrollY = 830 + 45;   // a phone's toolbar went
+timers[point.timer - 1][0](); back.push(scrolls.splice(0));
+scrollY = 2600; e.h.pointerdown({ pointerType: "touch" }); e.h.click(); coin = "ETH";          // the reader went to ETH
+timers[point.timer - 1][0](); back.push(scrolls.splice(0)); coin = "BTC";
 e.h.pointerdown({ pointerType: "mouse" }); e.h.click(); step("mouse click");
 e.vis = true; e.h.focus(); step("tab to it"); e.h.blur(); step("tab away");
 out.log = log; out.scrolled = canvas.scrolled; out.back = back; out.on = Object.keys(e.h).sort();""" % json.dumps(H1))
@@ -307,8 +393,9 @@ out.log = log; out.scrolled = canvas.scrolled; out.back = back; out.on = Object.
                         ["tap", "risk", 3000], ["leave, blur", "risk", 3000], ["3 s on", None, 0],
                         ["tap, chart away", "risk", 4000], ["crowd tap, chart away", "crowd", 3000],
                         ["mouse click", None, 0], ["tab to it", "risk", 0], ["tab away", None, 0]]
-    assert o["scrolled"] == [{"block": "center", "behavior": "smooth"}] * 2 + [{"block": "center", "behavior": "auto"}]
-    assert o["back"] == [[{"top": 2600, "behavior": "smooth"}], [], [], [{"top": 2600, "behavior": "auto"}]]   # back to the card
+    assert o["scrolled"] == [{"block": "center", "behavior": b} for b in ("smooth", "smooth", "auto", "smooth", "smooth")]
+    assert o["back"] == [[{"top": 2600, "behavior": "smooth"}], [], [], [{"top": 2600, "behavior": "auto"}],   # back to the card
+                         [{"top": 2600, "behavior": "smooth"}], []]                # the toolbar's 45 px: back; another tab: not
     assert o["on"] == ["blur", "click", "focus", "pointerdown", "pointerenter", "pointerleave"]   # no touchstart, no wheel
     aim = _function(APP, "aim") + _function(APP, "tapped")
     assert "preventDefault" not in aim and 'still.matches ? "auto" : "smooth"' in aim
