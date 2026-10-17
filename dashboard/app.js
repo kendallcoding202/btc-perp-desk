@@ -498,15 +498,18 @@
   }
 
   // On #point, a canvas over the chart's: the plot washed pale but for the fills marked, the thing redrawn wider over a
-  // halo in the card's color, a line named at its end, never on the live line: above its line, or under it when the
-  // live line runs just above (no room under: past the live line). Last, the live line's own pixels (as drawn) are cut
-  // out of all of it, so the chart's gold line shows on top, as the chart draws it. All of it inside the plot: the
-  // chart's own canvas, its values, lines and tags, and the price axis's column (the live tag and its beat) aren't
-  // touched. It fades in and out (style.css .point; still under reduced motion). Each redraw of the chart redraws it,
-  // and says which cards can be tabbed to: the ones that point at something
+  // halo in the card's color, a line named at its end, never on the live line nor on another line's end: above its
+  // line, or under it when the live line runs just above or another line does (no room under: past the live line).
+  // Last, the live line's own pixels (as drawn) are cut out of all of it, so the chart's gold line shows on top, as the
+  // chart draws it. All of it inside the plot: the chart's own canvas, its values, lines and tags, and the price axis's
+  // column (the live tag and its beat) aren't touched. It fades in and out (style.css .point; still under reduced
+  // motion). Each redraw of the chart redraws it, and says which cards can be tabbed to: the ones that point at
+  // something. A page whose HTML has no #point (an older page's, served with this script while a deploy spreads) draws
+  // everything else as before
   const point = { key: null, timer: 0 };
   function drawPoint() {
     const cv = $("point"), s = state, desk = !!(s && s.chart && s.header.kind !== "basket");
+    if (!cv) return;
     document.querySelectorAll("#agents .card").forEach((el) => {
       const on = desk && !!referent(el.id.slice(5), s);
       if (on !== el.hasAttribute("tabindex")) { if (on) el.tabIndex = 0; else el.removeAttribute("tabindex"); }
@@ -520,11 +523,23 @@
     g.beginPath(); g.rect(0, 0, pw, h - 18); g.clip();   // the plot: a ring at the newest candle stops at the axis line
     g.fillStyle = rgba("--panel", .6); g.fillRect(0, 0, pw, h - 18);
     const lines = ref.filter((r) => !r.mark), named = lines.filter((l) => l.name), yl = ch.live ? Y(ch.live) : null;
-    // a name's box (16 tall) above its line; under it when the live line is less than 28 px above (the box would reach
-    // it), past the live line when there's no room under. Stacked with the live line as the anchor: 9 px clear of it
-    const byLive = (l) => yl != null && l.y > yl && l.y - yl < 28, room = (l) => l.y + 11 <= h - 26;
-    const want = named.map((l) => ({ y: !byLive(l) ? l.y - 11 : room(l) ? l.y + 11 : yl - 17, tie: 0 }));
-    const at = yl == null ? stackTags(want, 0, 8, h - 26) : stackTags([{ y: yl, tie: 0 }, ...want], 0, 8, h - 26).slice(1);
+    // a name's box (16 tall) above its line, else under it, where it covers no other line marked (so two lines close
+    // together, SCAN's stepping at the candle still forming or VET's averages, are named on their outer sides); else
+    // as near its line as it can be, on its side of the live line first. A place is on the plot (over the date axis),
+    // 9 px clear of the live line and of the names before it, and 3 px clear of each line marked where that line is
+    // named (the next close's runs only past the decided bar: of its own name alone, then). None: above. Then stacked
+    // with the live line as the anchor
+    const want = [], clear = (y, l, all) => y >= 8 && y <= h - 26 && (yl == null || Math.abs(y - yl) >= 17 - 1e-6)
+      && want.every((b) => Math.abs(y - b) >= 17 - 1e-6)
+      && lines.every((m) => (!all && m !== l && !m.xs && m.at == null) || Math.abs(y - m.y) >= 11 - 1e-6);
+    for (const l of named) {
+      const own = [l.y - 11, l.y + 11], far = (y) => yl != null && (y - yl) * (l.y - yl) < 0;
+      const more = [8, h - 26, ...(yl == null ? [] : [yl - 17, yl + 17]), ...lines.flatMap((m) => [m.y - 11, m.y + 11]),
+        ...want.flatMap((b) => [b - 17, b + 17])].sort((a, b) => far(a) - far(b) || Math.abs(a - l.y) - Math.abs(b - l.y));
+      want.push(own.find((y) => clear(y, l, true)) ?? [...own, ...more].find((y) => clear(y, l, false)) ?? own[0]);
+    }
+    const tags = want.map((y) => ({ y, tie: 0 }));
+    const at = yl == null ? stackTags(tags, 0, 8, h - 26) : stackTags([{ y: yl, tie: 0 }, ...tags], 0, 8, h - 26).slice(1);
     for (const l of lines) {
       if (!l.xs && l.at == null) continue;   // a second name on a line drawn already
       const pts = l.xs ? l.xs.map((v, k) => [X(k), v == null ? null : Y(v)]) : [[0, Y(l.at)], [pw, Y(l.at)]];
@@ -1363,6 +1378,7 @@
   }
 
   function show(c) {
+    pointAt(null);   // a card's mark (a tap's, a resting mouse's) is its own tab's: the next tab's cards haven't pointed
     coin = c; storeSet("desk-coin", coin); history.replaceState(null, "", "#" + coin); missing = null;
     live.candle = null; src = `boards/${coin}.json`; tick().then(pollCandle);   // the candle for the new tab's board
   }
@@ -1404,7 +1420,7 @@
       : !!live.at && !hlStale(Date.now()));   // Coinbase closed, or Hyperliquid's price stale: nothing live
     renderCoins(); notice();
     if (s.venue) cb.mode = cbMode(lp);
-    if (basket) renderBasket(s);
+    if (basket) { renderBasket(s); drawPoint(); }   // (no desk cards on VT: none can be tabbed to, nothing marked)
     else { if (!light) renderAgents(s.agents); renderStage(s); drawChart(s.chart); drawWeb(); drawPoint(); }
     // a Hyperliquid price is LIVE (ETH's, SOL's, VT's) until it is STALE old: then a redraw takes LIVE off the chart's
     // marker, the ticker and the footer, unless a newer one has come (BTC's Coinbase price and the proxy: cbWatch

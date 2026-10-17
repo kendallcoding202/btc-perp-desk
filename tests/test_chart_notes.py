@@ -8,8 +8,8 @@ on the chart the thing its note is about, only when the chart draws it: SCAN's 6
 gives (and the next close's, when the line steps at the candle still forming), VET's fast and slow averages, RISK's and
 SIZE's stop and entry (a position only), FILLS' fills; CROWD, CHIEF and CRAWLER point at nothing. The mark is drawn on
 a canvas of its own, clipped to the plot: the chart's own frame, its values, lines and tags, and the live marker are as
-they were, and the gold live line shows on top of the mark, with no name on it. A phone's tap that brings the chart
-into view takes the page back to the card when the mark ends. The spider's web is drawn under the chart's canvas,
+they were, and the gold live line shows on top of the mark, with no name on it nor on another line marked. A phone's
+tap that brings the chart into view takes the page back to the card when the mark ends; switching accounts ends it. The spider's web is drawn under the chart's canvas,
 fainter, so the candles and lines are always drawn over its silk. The page's own functions are run in node, drawing on
 a canvas that records what it is asked to draw (tests/test_live_marker.py's), with the comic theme's day and night
 tokens."""
@@ -37,8 +37,8 @@ def _point_js() -> str:
             + _between(APP, "  const point = { key", "  function drawPoint(") + _function(APP, "drawPoint")
             + _function(APP, "pointTag") + _function(APP, "pointAt") + _function(APP, "tapped") + _function(APP, "aim") + """
 let state = null, coin = "BTC";
-const innerHeight = 800, tr = [], timers = [];
-const setTimeout = (f, ms) => { timers.push([f, ms]); return timers.length; }, clearTimeout = () => {};
+const innerHeight = 800, tr = [], timers = [], cleared = [];
+const setTimeout = (f, ms) => { timers.push([f, ms]); return timers.length; }, clearTimeout = (t) => { if (t) cleared.push(t); };
 Object.defineProperty(g, "globalCompositeOperation", { get() { return cur.gco || "source-over"; }, set(v) { cur.gco = v; } });
 g.translate = (x, y) => { tr.push([x, y]); };
 const _stroke = g.stroke, _fill = g.fill;
@@ -68,8 +68,10 @@ const pos = (o = {}) => chartOf({ stop: 79000, entry: 81000, markers: [
   { ts: T0 + 2 * H * 10, price: 80200, kind: "entry", side: "long" }, { ts: T0 + 2 * H * 20 + 600000, price: 81000, kind: "exit", side: "long", pnl: 5 },
   { ts: T0 - 10 * H, price: 80000, kind: "entry", side: "long" }], ...o });
 // the board's chart (decided: its newest candle) with one candle still forming past it, on the next close's line
-const forming = (next, o = {}) => { const ch = chartOf({ decided: N - 1, ...o }); ch.candles.push([T0 + 2 * H * N, 80000, 80100, 79900, 80050]);
-  ch.ema_fast.push(null); ch.ema_slow.push(null); ch.don_lo.push(null); ch.don_hi.push(next); return ch; };
+const forming = (next, o = {}, lo = false) => { const ch = chartOf({ decided: N - 1, ...o }); ch.candles.push([T0 + 2 * H * N, 80000, 80100, 79900, 80050]);
+  ch.ema_fast.push(null); ch.ema_slow.push(null); ch.don_lo.push(lo ? next : null); ch.don_hi.push(lo ? null : next); return ch; };
+// what #point drew: its name boxes' middles, in the order drawn, and the names
+const names = () => ({ boxes: ops.filter((x) => x.k === "fillRect" && x.h === 16 && x.w > 4).map((x) => x.y + 8), names: ops.filter((x) => x.k === "text").map((x) => x.t) });
 """)
 
 
@@ -351,6 +353,94 @@ const fl = pos(); fl.live = 81000; out.fills = run("fills", fl);""" % json.dumps
 
 
 @node
+def test_two_names_close_together_go_on_their_outer_sides_and_none_covers_a_line():
+    """SCAN's line can step at the candle still forming (an old high ages out of the 60 bars: about one run in ten),
+    often by only a few pixels. Its two names were stacked above their lines, so on a phone the "next close" box sat
+    on the decided bar's line, hiding the very plateau its note names. Now no name covers a line the card marks: two
+    lines close together are named on their outer sides (the upper one's above it, the lower one's under it), and with
+    the live line near, a name goes past it on its line's side, 9 px clear, never onto a marked line. For the 60-bar
+    high and low, a step of 1 to 25 px either way, with no live line or one anywhere 40 px either side of the line.
+    The same for VET's averages close together. Away from the plot's top and foot, where there's room, a name stays
+    on its line's side of the live line."""
+    o = _run(f"""
+const px = 100 / (forming(82500), desk(forming(82500), {json.dumps(H1)}, TOKS.day), lastGeom.Y(82400) - lastGeom.Y(82500));   // $ a px
+out.scan = []; out.vet = [];
+const M1 = "nothing yet. waiting for a close above the 60-bar high $80,800.", mid = {{ don_hi: Array(N).fill(80800) }};
+for (const [lo, D, note, o] of [[false, 82500, {json.dumps(H1)}, {{}}], [true, 78000, {json.dumps(L1)}, {{}}], [false, 80800, M1, mid]])
+  for (const d of [-25, -20, -16, -12, -8, -5, -3, -1, 1, 3, 5, 8, 12, 16, 20, 25])   // the next close's line, px under D's
+    for (const v of [null, ...Array.from({{ length: 21 }}, (_, k) => k * 4 - 40)]) {{    // the live line, px under D's
+      const next = D - d * px, ch = forming(next, o, lo);
+      if (v != null) ch.live = D - v * px;
+      point.key = "scan"; desk(ch, note, TOKS.day); drawPoint();
+      const Y = lastGeom.Y;
+      const both = Y(next) <= lastGeom.h - 18;   // (a low's next close under the plot isn't named)
+      out.scan.push({{ lo, d, v, lines: [Y(D), ...(both ? [Y(next)] : [])], keep: [[Y(D)], [Y(D), Y(next)]], yl: v == null ? null : Y(ch.live), h: lastGeom.h, ...names() }});
+    }}
+for (const d of [-21, -15, -10, -6, -3, -1, 1, 3, 6, 10, 15, 21])                      // the slow average, px under the fast
+  for (const v of [null, ...Array.from({{ length: 11 }}, (_, k) => k * 8 - 40)]) {{
+    const ch = chartOf(), f = ch.ema_fast[N - 1]; ch.ema_slow[N - 1] = f - d * px;
+    if (v != null) ch.live = f - v * px;
+    point.key = "vet"; desk(ch, {json.dumps(H1)}, TOKS.night); drawPoint();
+    const Y = lastGeom.Y;
+    out.vet.push({{ d, v, lines: [Y(f), Y(f - d * px)], keep: [[Y(f), Y(f - d * px)], [Y(f), Y(f - d * px)]], yl: v == null ? null : Y(ch.live), h: lastGeom.h, ...names() }});
+  }}""")
+    two = side = 0
+    for case in o["scan"] + o["vet"]:
+        boxes, lines, yl = case["boxes"], case["lines"], case["yl"]
+        assert len(boxes) == len(case["names"]) == len(lines), case
+        for c, keep in zip(boxes, case["keep"]):
+            # its 16 px clear of the lines under it: SCAN's decided name of its line (the next close's runs only past
+            # the decided bar), the next close's of both; VET's either of both averages
+            assert all(abs(c - y) >= 10 for y in keep), case
+            assert yl is None or abs(c - yl) >= 17 - 1e-6, case                  # 9 px clear of the live line
+            assert 8 - 1e-6 <= c <= case["h"] - 26 + 1e-6, case                  # on the plot, over the date axis
+        assert all(abs(a - b) >= 17 - 1e-6 for a in boxes for b in boxes if a is not b), case
+        if yl is not None and all(50 < y < case["h"] - 60 and (y - yl) * (lines[0] - yl) > 0 for y in lines):
+            assert all((c - yl) * (lines[0] - yl) > 0 for c in boxes), case        # on its line's side of the live
+            side += 1
+        (up, lo) = sorted(lines) if len(lines) == 2 else (0, 0)
+        if yl is None and len(boxes) == 2 and lo - up < 22 and up - 11 >= 8 and lo + 11 <= case["h"] - 26:
+            (bu, bl) = sorted(boxes)                                              # close together: on their outer sides
+            assert bu < up and bl > lo, case
+            two += 1
+    assert two >= 20 and side >= 50, (two, side)
+
+
+@node
+def test_a_mark_belongs_to_the_tab_it_was_made_on():
+    """A tap's mark (or a resting mouse's) was carried over a tab switch: tap BTC's SCAN, switch to ETH, and ETH's chart
+    marked ETH's 60-bar line for the rest of the 4 s, though nothing on ETH was tapped. Switching accounts (show: a tab,
+    or a #COIN typed or linked) ends the mark first, its timer with it, so neither it nor the tap's way back runs on the
+    new tab. On the VT basket's tab #point is worked out too: off, and no card can be tabbed to."""
+    o = _run(_function(APP, "show") + """
+let missing = null, src = "";
+const storeSet = () => {}, history = { replaceState() {} }, live = {}, tick = () => Promise.resolve(), pollCandle = () => {};
+desk(pos(), %s, TOKS.day);
+canvas.rect = { top: -1500, bottom: -1240, height: 260 }; canvas.scrollIntoView = (o) => { scrollY = 830; };
+tapped("scan"); const t = point.timer;
+out.before = { key: point.key, on: canvas.classList.on, ms: timers[t - 1][1] };
+show("ETH");
+out.after = { key: point.key, on: canvas.classList.on, timer: point.timer, cleared: cleared.includes(t), coin };""" % json.dumps(H1))
+    assert o["before"] == {"key": "scan", "on": True, "ms": 4000}
+    assert o["after"] == {"key": None, "on": False, "timer": 0, "cleared": True, "coin": "ETH"}
+    assert _function(APP, "show").split("{", 1)[1].lstrip().startswith("pointAt(null);")
+    assert "window.addEventListener(\"hashchange\"" in APP and "if (ACCOUNTS.includes(c) && c !== coin) show(c);" in APP
+    assert "if (basket) { renderBasket(s); drawPoint(); }" in _function(APP, "render")
+
+
+@node
+def test_a_page_without_a_point_canvas_still_draws():
+    """An older page's HTML served with this script (a CDN edge mixing builds while a deploy spreads) has no #point:
+    drawPoint threw on every render, so nothing after the chart was drawn. Now it does nothing there."""
+    o = _run("""
+const bare = new Function("$", "state", "point", "referent", "fit", "lastGeom", "COLORS", "rgba", "css", "line", "stackTags", "pointTag",
+  %s + "; return drawPoint;")((id) => id === "point" ? null : canvas, { header: { kind: "desk" }, chart: chartOf(), agents: [] }, { key: "vet" },
+  referent, fit, lastGeom, COLORS, rgba, css, line, stackTags, pointTag);
+try { bare(); out.ok = true; } catch (e) { out.ok = String(e); }""" % json.dumps(_function(APP, "drawPoint")))
+    assert o["ok"] is True
+
+
+@node
 def test_hover_focus_and_tap_point_and_end_as_they_should():
     """A mouse over a card points until it leaves; keyboard focus (focus-visible) points until blur, a tap's focus
     doesn't; a tap points for 3 s, which neither a stray leave nor a blur cuts short. On a phone the cards are far
@@ -405,6 +495,13 @@ out.log = log; out.scrolled = canvas.scrolled; out.back = back; out.on = Object.
 
 
 def test_the_point_fades_except_under_reduced_motion_and_a_pointing_card_shows_it():
+    """And a tap on a card gets no grey flash (iOS Safari's on anything clickable, and every card has a click listener):
+    a card that points answers with its mark on the chart, one that points at nothing (CROWD, CHIEF, CRAWLER) does
+    nothing it seems to. The README says how long a tap marks, a second longer when it scrolls to the chart."""
+    assert "-webkit-tap-highlight-color: transparent;" in _rule(_top(STYLE), ".card")
+    assert "-webkit-tap-highlight-color" not in THEME
+    readme = (ROOT / "README.md").read_text()
+    assert "On a phone a tap marks it for 3 s; when none of the chart is on screen, the tap brings the chart into view first, marks it a second longer, and then goes back to the card. A mark stays on its own tab: switching accounts ends it." in readme
     point = _rule(_top(STYLE), ".point")
     assert "position: absolute" in point and "pointer-events: none" in point and "opacity: 0" in point
     assert "transition: opacity .2s" in point and _rule(_top(STYLE), ".point.on").strip() == "opacity: 1;"
