@@ -6,11 +6,12 @@ what the cards already said, cut to one line there. Now nothing sits over the pl
 stays beside the chart), a card's whole note wraps on the card, and hovering a card, tabbing to it or tapping it marks
 on the chart the thing its note is about, only when the chart draws it: SCAN's 60-bar line with the price its note
 gives (and the next close's, when the line steps at the candle still forming), VET's fast and slow averages, RISK's and
-SIZE's stop and entry (a position only), FILLS' fills; CROWD, CHIEF and CRAWLER point at nothing. The mark is drawn on
+SIZE's stop and entry (a position only), FILLS' last fill; CROWD, CHIEF and CRAWLER point at nothing. The mark is drawn on
 a canvas of its own, clipped to the plot: the chart's own frame, its values, lines and tags, and the live marker are as
-they were, and the gold live line shows on top of the mark, with no name on it nor on another line marked. A phone's
-tap that brings the chart into view takes the page back to the card when the mark ends; switching accounts ends it. The spider's web is drawn under the chart's canvas,
-fainter, so the candles and lines are always drawn over its silk. The page's own functions are run in node, drawing on
+they were, and the gold live line shows on top of the mark, with no name on it nor on another line marked, the names in
+their lines' order. A phone's tap that brings the chart into view takes the page back to the card when the mark ends;
+switching accounts ends it. The spider's web is drawn under the chart's canvas, fainter, so the candles and lines are
+always drawn over its silk. The page's own functions are run in node, drawing on
 a canvas that records what it is asked to draw (tests/test_live_marker.py's), with the comic theme's day and night
 tokens."""
 
@@ -56,10 +57,12 @@ const CARDS = KEYS.map((key) => ({ id: `card-${key}`, attrs: {}, hasAttribute(a)
   removeAttribute(a) { delete this.attrs[a]; }, set tabIndex(v) { this.attrs.tabindex = v; } }));
 document.querySelectorAll = () => CARDS;
 const tabbable = () => CARDS.filter((c) => c.hasAttribute("tabindex")).map((c) => c.id.slice(5));
-const agents = (scan) => KEYS.map((key) => ({ key, name: key.toUpperCase(), quote: key === "scan" ? scan : "a note" }));
-const desk = (ch, scan, tok) => { TOK = tok; drawChart(ch); state = { header: { kind: "desk" }, agents: agents(scan), chart: ch }; };
-const refs = (ch, scan, tok = TOKS.day) => {
-  desk(ch, scan, tok);
+// FILLS' note names the broker's last fill (desk/board.py): by default pos()'s newest, its exit
+const F1 = "sold 0.0100 BTC @ $81,000, fee $0.32, net +5.00.";
+const agents = (scan, fills = F1) => KEYS.map((key) => ({ key, name: key.toUpperCase(), quote: key === "scan" ? scan : key === "fills" ? fills : "a note" }));
+const desk = (ch, scan, tok, fills) => { TOK = tok; drawChart(ch); state = { header: { kind: "desk" }, agents: agents(scan, fills), chart: ch }; };
+const refs = (ch, scan, tok = TOKS.day, fills) => {
+  desk(ch, scan, tok, fills);
   return Object.fromEntries(KEYS.map((k) => { const r = referent(k, state);
     return [k, r && r.map((x) => x.mark ? { mark: true, x: x.x, y: x.y, r: x.r } : { name: x.name, x: x.x, y: x.y, color: x.color,
       dash: (x.dash || []).join(","), series: !!x.xs, level: x.at != null })]; }));
@@ -85,7 +88,8 @@ def _run(cases: str) -> dict:
 def test_no_caption_box_over_the_chart_and_the_chiefs_line_stays_beside_it():
     """The six boxes are gone at every width: no #bubbles over the plot, no code that placed them, no CSS for them. The
     chart's box holds its head, its canvas, the web's (under it) and the point's (empty until a card points). The
-    chief's line is still the chief's quote, in the column beside the chart (narrow windows hide it, as before)."""
+    chief's line is still the chief's quote, in the column beside the chart (narrow windows hide it, as before), with
+    its thick left edge (the bubbles' CSS took it along: a 2 px edge on 6fdd716)."""
     wrap = _between(HTML, '<div class="chart-wrap">', '<aside class="stage-right">')
     assert re.findall(r'id="([\w-]+)"', wrap) == ["chart-title", "chart-sub", "chart", "web", "point"]
     assert "bubble" not in wrap
@@ -98,6 +102,7 @@ def test_no_caption_box_over_the_chart_and_the_chiefs_line_stays_beside_it():
         sels = re.findall(r"([^{}]+)\{", re.sub(r"/\*.*?\*/", "", css, flags=re.S))
         assert not [s for s in sels if re.search(r"\.bubbles?\b(?!\.static)", s)], css[:40]
     assert re.search(r"\.sprite-slot, \.bubble\.static \{ display: none; \}", _media(STYLE, "(max-width: 980px)"))
+    assert "border-left-width: 6px;" in _rule(_top(THEME), ".bubble.static")      # its thick left edge, as before
     assert "agent cards, bubbles" not in (ROOT / "README.md").read_text()
 
 
@@ -125,9 +130,9 @@ def test_each_card_points_only_at_what_its_note_names_and_the_chart_draws():
     """SCAN: the 60-bar line its note names (the high, or the low a short waits on), named with its price; nothing while
     warming up or with shorts disabled. VET: the fast and slow averages, while drawn. RISK and SIZE: the stop and the
     entry, with a position only, and an entry off the plot isn't pointed at; the stop is left unnamed (its own STOP tag
-    on the axis names it), the entry is named. FILLS: each fill drawn (one before the chart's first candle isn't), an
-    entry's mark where its pin hangs (the newest candle's pin box held clear of the axis, as entryPin draws it), an
-    exit's on its dot. CROWD, CHIEF and CRAWLER: nothing, ever."""
+    on the axis names it), the entry is named. FILLS: the fill its note names (the newest drawn), an entry's mark
+    where its pin hangs (the newest candle's pin box held clear of the axis, as entryPin draws it), an exit's on its
+    dot. CROWD, CHIEF and CRAWLER: nothing, ever."""
     o = _run(f"""
 out.flat = refs(chartOf(), {json.dumps(H1)}); out.yHi = lastGeom.Y(82500);
 out.low = refs(chartOf(), {json.dumps(L1)}); out.yLo = lastGeom.Y(78000);
@@ -140,7 +145,10 @@ out.far = refs(chartOf({{ stop: 79000, entry: 120000 }}), {json.dumps(H1)});
 const cold = chartOf(); ["ema_fast", "ema_slow", "don_hi"].forEach((k) => {{ cold[k] = cold[k].map(() => null); }});
 out.cold = refs(cold, {json.dumps(H1)});
 out.night = refs(pos(), {json.dumps(H1)}, TOKS.night);
-out.newest = refs(pos({{ markers: [{{ ts: T0 + 2 * H * (N - 1), price: 80000, kind: "entry", side: "long" }}] }}), {json.dumps(H1)});
+out.entry = refs(pos({{ markers: [{{ ts: T0 + 2 * H * 10, price: 80200, kind: "entry", side: "long" }}] }}), {json.dumps(H1)}, TOKS.day,
+  "bought 0.0100 BTC @ $80,200, fee $0.32.");
+out.newest = refs(pos({{ markers: [{{ ts: T0 + 2 * H * (N - 1), price: 80000, kind: "entry", side: "long" }}] }}), {json.dumps(H1)}, TOKS.day,
+  "bought 0.0100 BTC @ $80,000, fee $0.32.");
 out.nx = {{ x: lastGeom.X(N - 1), edge: lastGeom.w - lastGeom.padR - 4 }};""")
     for case in ("flat", "low", "warm", "noshort", "pos", "far", "cold", "night"):
         for k in ("chief", "crowd", "crawler"):
@@ -162,10 +170,10 @@ out.nx = {{ x: lastGeom.X(N - 1), edge: lastGeom.w - lastGeom.padR - 4 }};""")
         assert got[0]["x"] == got[1]["x"] == y["edge"]                            # named at the plot's end, short of the axis
         assert got[0]["color"] == DAY["--orange"] and got[1]["color"] == DAY["--entry"]
     assert [(x["dash"], abs(x["y"] - y["stop"]) < 1e-6) for x in o["far"]["risk"]] == [("6,4", True)]   # the entry is off the plot: not it
-    fills = o["pos"]["fills"]
-    assert [f["mark"] for f in fills] == [True, True]                             # the one before the window: not drawn
-    assert abs(fills[0]["x"] - y["x10"]) < 1e-6 and abs(fills[0]["y"] - (y["e10"] + 9)) < 1e-6 and fills[0]["r"] == 12   # the L pin
-    assert abs(fills[1]["x"] - y["x20"]) < 1e-6 and abs(fills[1]["y"] - y["x21"]) < 1e-6 and fills[1]["r"] == 8           # the dot
+    (dot,) = o["pos"]["fills"]                                                    # its note's fill, the exit: its dot
+    assert dot["mark"] and abs(dot["x"] - y["x20"]) < 1e-6 and abs(dot["y"] - y["x21"]) < 1e-6 and dot["r"] == 8
+    (pin,) = o["entry"]["fills"]                                                  # an entry: where its L pin hangs
+    assert abs(pin["x"] - y["x10"]) < 1e-6 and abs(pin["y"] - (y["e10"] + 9)) < 1e-6 and pin["r"] == 12
     assert o["night"]["risk"][1]["color"] == NIGHT["--entry"]
     nx = o["nx"]
     assert nx["x"] > nx["edge"] and [f["x"] for f in o["newest"]["fills"]] == [nx["edge"]]   # the newest pin's box, held clear
@@ -253,8 +261,8 @@ def test_the_mark_is_drawn_on_its_own_canvas_and_leaves_the_chart_and_live_marke
     tags and the live one's beat, never the date axis): the plot washed pale, and last the live line's own pixels cut out
     of it all (a cut as wide as the line, so no candle shows through beside it), the line and its tag exactly as drawn;
     the thing redrawn 2.5 px wide in its own color and dashes over an 8 px halo in the pointing card's color; the entry
-    named in a caption box at its end (the stop has its own tag on the axis). A fill on the newest candle at the live
-    price is ringed inside the plot only. A card that points at nothing draws nothing (what was drawn fades out as it
+    named in a caption box at its end (the stop has its own tag on the axis); FILLS' fill unwashed and ringed. A fill on
+    the newest candle at the live price is ringed inside the plot only. A card that points at nothing draws nothing (what was drawn fades out as it
     was); nor does a card on the VT basket's tab. The cards that point can be tabbed to, the others can't."""
     o = _run("""
 const ch = pos(); ch.live = ch.candles[N - 1][4];
@@ -266,7 +274,8 @@ drawChart(ch); out.same = before === JSON.stringify(ops);
 out.g = { pw: lastGeom.w - lastGeom.padR, bot: lastGeom.h - 18, yLive: lastGeom.Y(ch.live), yStop: lastGeom.Y(79000), yEntry: lastGeom.Y(81000) };
 point.key = "fills"; drawPoint(); out.fills = ops.slice(); out.saved = st.length;
 const newFill = pos({ markers: [{ ts: T0 + 2 * H * (N - 1), price: ch.live, kind: "entry", side: "long" }] }); newFill.live = ch.live;
-desk(newFill, %s, TOKS.night); point.key = "fills"; drawPoint(); out.newest = ops.slice(); out.npw = lastGeom.w - lastGeom.padR;
+desk(newFill, %s, TOKS.night, `bought 0.0100 BTC @ $${Math.round(ch.live).toLocaleString("en-US")}, fee $0.32.`);
+point.key = "fills"; drawPoint(); out.newest = ops.slice(); out.npw = lastGeom.w - lastGeom.padR;
 desk(ch, %s, TOKS.night);
 point.key = "crowd"; ops.length = 0; ops.push({ k: "kept" }); drawPoint(); out.crowd = { on: canvas.classList.on, kept: ops.length === 1 };
 state = { ...state, header: { kind: "basket" } }; point.key = "risk"; drawPoint(); out.basket = { on: canvas.classList.on, tab: tabbable() };
@@ -295,7 +304,7 @@ out.tr = tr;""" % ((json.dumps(H1),) * 4))
     assert sorted(o["risk"]["tab"]) == ["fills", "risk", "scan", "size", "vet"]
     cuts = [x for x in o["fills"] if x["k"] == "fill" and x["gco"] == "destination-out"]
     rings = [x for x in o["fills"] if x["k"] == "stroke" and x["width"] == 2]
-    assert [c["pts"][0][2] for c in cuts] == [12, 8] and [r["color"] for r in rings] == [NIGHT["--ice"]] * 2   # each fill unwashed, ringed
+    assert [c["pts"][0][2] for c in cuts] == [8] and [r["color"] for r in rings] == [NIGHT["--ice"]]   # the exit its note names
     assert not [x for x in o["fills"] if x["k"] == "text"]
     nw = o["newest"]                                                               # the newest candle's fill at the live price
     assert nw[0] == {"k": "clip", "rect": [0, 0, o["npw"], g["bot"]]}
@@ -353,15 +362,17 @@ const fl = pos(); fl.live = 81000; out.fills = run("fills", fl);""" % json.dumps
 
 
 @node
-def test_two_names_close_together_go_on_their_outer_sides_and_none_covers_a_line():
+def test_two_names_keep_their_lines_order_on_their_outer_sides_and_off_the_live_line():
     """SCAN's line can step at the candle still forming (an old high ages out of the 60 bars: about one run in ten),
-    often by only a few pixels. Its two names were stacked above their lines, so on a phone the "next close" box sat
-    on the decided bar's line, hiding the very plateau its note names. Now no name covers a line the card marks: two
-    lines close together are named on their outer sides (the upper one's above it, the lower one's under it), and with
-    the live line near, a name goes past it on its line's side, 9 px clear, never onto a marked line. For the 60-bar
-    high and low, a step of 1 to 25 px either way, with no live line or one anywhere 40 px either side of the line.
-    The same for VET's averages close together. Away from the plot's top and foot, where there's room, a name stays
-    on its line's side of the live line."""
+    often by only a few pixels, and VET's averages run close together. Two names were stacked above their lines, so on
+    a phone the "next close" box sat on the decided bar's line; then (6fdd716) a name with no room by its line jumped
+    past the other line and its name, out of the lines' order. Now each name goes on its line's outer side, 3 px clear
+    of the lines marked, so two lines close together are named on their outer sides; with no room there, as clear of
+    the other lines as it can be and then of its own, never past another line or its name. For the 60-bar high and low,
+    a step of 1 to 25 px either way, with no live line or one anywhere 40 px either side; VET's averages likewise.
+    Always: on the plot, 9 px clear of the live line, 17 px apart. Away from the plot's top and foot: in the lines'
+    order, each box off the strokes of the lines under it (1.5 px), and on its line's side of the live line wherever
+    that side has room for both. (Crowded by the live line at the top or foot, a name may sit on its own line.)"""
     o = _run(f"""
 const px = 100 / (forming(82500), desk(forming(82500), {json.dumps(H1)}, TOKS.day), lastGeom.Y(82400) - lastGeom.Y(82500));   // $ a px
 out.scan = []; out.vet = [];
@@ -384,26 +395,120 @@ for (const d of [-21, -15, -10, -6, -3, -1, 1, 3, 6, 10, 15, 21])               
     const Y = lastGeom.Y;
     out.vet.push({{ d, v, lines: [Y(f), Y(f - d * px)], keep: [[Y(f), Y(f - d * px)], [Y(f), Y(f - d * px)]], yl: v == null ? null : Y(ch.live), h: lastGeom.h, ...names() }});
   }}""")
-    two = side = 0
+    two = side = kept = 0
     for case in o["scan"] + o["vet"]:
-        boxes, lines, yl = case["boxes"], case["lines"], case["yl"]
+        boxes, lines, yl, h = case["boxes"], case["lines"], case["yl"], case["h"]
         assert len(boxes) == len(case["names"]) == len(lines), case
-        for c, keep in zip(boxes, case["keep"]):
-            # its 16 px clear of the lines under it: SCAN's decided name of its line (the next close's runs only past
-            # the decided bar), the next close's of both; VET's either of both averages
-            assert all(abs(c - y) >= 10 for y in keep), case
+        for c in boxes:
             assert yl is None or abs(c - yl) >= 17 - 1e-6, case                  # 9 px clear of the live line
-            assert 8 - 1e-6 <= c <= case["h"] - 26 + 1e-6, case                  # on the plot, over the date axis
+            assert 8 - 1e-6 <= c <= h - 26 + 1e-6, case                          # on the plot, over the date axis
         assert all(abs(a - b) >= 17 - 1e-6 for a in boxes for b in boxes if a is not b), case
-        if yl is not None and all(50 < y < case["h"] - 60 and (y - yl) * (lines[0] - yl) > 0 for y in lines):
-            assert all((c - yl) * (lines[0] - yl) > 0 for c in boxes), case        # on its line's side of the live
-            side += 1
         (up, lo) = sorted(lines) if len(lines) == 2 else (0, 0)
-        if yl is None and len(boxes) == 2 and lo - up < 22 and up - 11 >= 8 and lo + 11 <= case["h"] - 26:
+        if yl is None and len(boxes) == 2 and lo - up < 22 and up - 11 >= 8 and lo + 11 <= h - 26:
             (bu, bl) = sorted(boxes)                                              # close together: on their outer sides
             assert bu < up and bl > lo, case
             two += 1
-    assert two >= 20 and side >= 50, (two, side)
+        if not all(50 < y < h - 60 for y in lines):
+            continue                                                              # crowded at the plot's top or foot
+        for c, keep in zip(boxes, case["keep"]):
+            # its 16 px off the strokes of the lines under it: SCAN's decided name of its line (the next close's runs
+            # only past the decided bar), the next close's of both; VET's either of both averages
+            assert all(abs(c - y) >= 9.5 - 1e-6 for y in keep), case
+        if len(lines) == 2:
+            assert (boxes[0] - boxes[1]) * (lines[0] - lines[1]) > 0, case        # in the lines' order
+            kept += 1
+        if yl is not None and all((y - yl) * (lines[0] - yl) > 0 for y in lines):
+            # room on the lines' side of the live line: the nearer line's name between it and the live line, or
+            # between the two lines (the farther one's goes beyond it)
+            a, b = sorted(abs(y - yl) for y in lines) if len(lines) == 2 else (abs(lines[0] - yl), None)
+            if b is None or a >= 26.5 or max(17, a + 9.5) <= b - 9.5 + 1e-6:
+                assert all((c - yl) * (lines[0] - yl) > 0 for c in boxes), case    # on its line's side of the live
+                side += 1
+    assert two >= 30 and side >= 200 and kept >= 500, (two, side, kept)
+
+
+@node
+def test_vets_names_stay_by_their_own_lines_on_bitcoins_real_geometry():
+    """BTC's real board, with Coinbase's price just under the slow average: on a 390-440 px phone the fast average ends
+    at y 145.2, the slow 20.6 px under it and the live line 15.6 px under that (a 260 px chart); on a laptop, a fresh
+    board: fast 198, slow 16 px under it, live 20 px under that (330 px). 6fdd716 put "slow" over "fast", on the fast
+    line, 44 to 49 px from its own, and named the slow line nowhere near. Now each name is nearer its own line than the
+    other, fast's over slow's as the lines are, none on a line or the live line: on the phone "slow" sits just over its
+    own line, under the fast line; on the laptop, with no room between the averages, just under the live line."""
+    o = _run("""
+const geo = (hgt, yf, ys, yl, tok) => {
+  canvas.clientHeight = hgt; const ch = chartOf(); desk(ch, %s, tok);
+  const Y = lastGeom.Y, at = (y) => 82500 - (y - Y(82500)) * 100 / (Y(82400) - Y(82500));   // the price drawn at y
+  ch.ema_fast[N - 1] = at(yf); ch.ema_slow[N - 1] = at(ys); ch.live = at(yl);
+  point.key = "vet"; desk(ch, %s, tok); drawPoint();
+  const r = { ys: [lastGeom.Y(ch.ema_fast[N - 1]), lastGeom.Y(ch.ema_slow[N - 1]), lastGeom.Y(ch.live)], h: lastGeom.h, ...names() };
+  canvas.clientHeight = 260; return r;
+};
+out.phone = [TOKS.day, TOKS.night].map((t) => geo(260, 145.2, 165.8, 181.4, t));
+out.laptop = [TOKS.day, TOKS.night].map((t) => geo(330, 198, 214, 234, t));""" % (json.dumps(H1), json.dumps(H1)))
+    for want, cases in (([145.2, 165.8, 181.4], o["phone"]), ([198, 214, 234], o["laptop"])):
+        for case in cases:
+            assert all(abs(a - b) < 0.01 for a, b in zip(case["ys"], want)), case
+            (yf, ys, yl), (bf, bs) = case["ys"], case["boxes"]
+            assert case["names"] == ["fast", "slow"], case
+            assert abs(bf - yf) < abs(bf - ys) and abs(bs - ys) < abs(bs - yf), case   # each nearer its own line
+            assert bf < bs, case                                                      # in the lines' order
+            for c in (bf, bs):
+                assert abs(c - yl) >= 17 - 1e-6 and min(abs(c - yf), abs(c - ys)) >= 9.5 - 1e-6, case
+    for case in o["phone"]:
+        (yf, ys, yl), (bf, bs) = case["ys"], case["boxes"]
+        assert bf < yf < bs < ys, case                                                # each just over its own line
+    for case in o["laptop"]:
+        (yf, ys, yl), (bf, bs) = case["ys"], case["boxes"]
+        assert bf < yf and bs > yl, case                                              # past the live line
+
+
+@node
+def test_scans_name_keeps_clear_of_its_lines_older_level_under_it():
+    """On the real board the 60-bar high was $84,295 until 4 bars before the bar decided on, and $84,090 since. Its name,
+    "60-bar high 84,090", 22 bars wide, sat 3 px over the 84,090 line, right on the older level and the step, so the
+    line seemed to run into the box at the old price. The 60-bar line is flat between its steps, and its levels under
+    the box count now: here the name goes under the line, clear of both levels. The averages slope, and count by their
+    ends as before: their names are 3 px over (or under) where they end."""
+    o = _run("""
+const ch = chartOf({ decided: N - 1 }); ch.don_hi = ch.don_hi.map((v, k) => (k < N - 5 ? 82700 : 82500));
+point.key = "scan"; desk(ch, %s, TOKS.day); drawPoint();
+out.scan = { ...names(), old: lastGeom.Y(82700), now: lastGeom.Y(82500), x: referent("scan", state)[0].x };
+point.key = "vet"; desk(chartOf(), %s, TOKS.day); drawPoint();
+out.vet = { ...names(), f: lastGeom.Y(chartOf().ema_fast[N - 1]), s: lastGeom.Y(chartOf().ema_slow[N - 1]) };
+out.step = lastGeom.X(N - 5); out.w = 0.6 * 10 * "60-bar high 82,500".length + 14;""" % (json.dumps(H1), json.dumps(H1)))
+    sc = o["scan"]
+    assert sc["names"] == ["60-bar high 82,500"] and sc["x"] - o["w"] < o["step"]  # the step is under its box
+    (b,) = sc["boxes"]
+    assert b > sc["now"] and min(abs(b - sc["old"]), abs(b - sc["now"])) >= 11 - 1e-6, sc   # under it, 3 px clear
+    v = o["vet"]
+    assert v["names"] == ["fast", "slow"] and abs(v["boxes"][0] - (v["f"] - 11)) < 1e-6 and abs(v["boxes"][1] - (v["s"] + 11)) < 1e-6, v
+
+
+@node
+def test_fills_points_at_the_one_fill_its_note_names():
+    """FILLS' note is about the broker's last fill, "bought 0.0362 @ $2,425, fee $0.04, net -2.50." (desk/board.py: the
+    exit of ETH's short, on the real board), but its mark rang every fill in the window, that short's entry too and any
+    older trade's, and the fills of a chart whose note said "no fills yet". It rings the newest fill drawn now, when
+    that is the note's price as the note gives it (whole dollars from $1,000, cents under it); "no fills yet", or a price
+    that is an older fill's, or a cent off, points at nothing."""
+    board = (ROOT / "desk" / "board.py").read_text()
+    assert "@ {_usd(lf['price'])}, " in board and '"no fills yet. taker in, taker out."' in board
+    assert "dp = 0 if abs(x) >= 1000 else 2" in board
+    o = _run("""
+const E1 = "bought 0.0100 BTC @ $80,200, fee $0.32.", none = "no fills yet. taker in, taker out.";
+out.exit = refs(pos(), %s); out.x20 = lastGeom.X(20);
+out.older = refs(pos(), %s, TOKS.day, E1);
+out.none = refs(pos(), %s, TOKS.day, none);
+const f = 113.39 / 82500, small = chartOf({ markers: [{ ts: T0 + 2 * H * 20, price: 81000 * f, kind: "exit", side: "long" }] });
+small.candles = small.candles.map(([t, ...p]) => [t, ...p.map((v) => v * f)]);
+["ema_fast", "ema_slow", "don_hi", "don_lo"].forEach((k) => { small[k] = small[k].map((v) => v * f); });
+out.sol = refs(small, "nothing yet.", TOKS.day, "sold 1.2000 SOL @ $111.33, fee $0.06, net +1.00.");
+out.solOff = refs(small, "nothing yet.", TOKS.day, "sold 1.2000 SOL @ $111.34, fee $0.06, net +1.00.");""" % ((json.dumps(H1),) * 3))
+    (dot,) = o["exit"]["fills"]
+    assert dot["r"] == 8 and abs(dot["x"] - o["x20"]) < 1e-6                     # the exit's dot, not the entry's pin
+    assert o["older"]["fills"] is None and o["none"]["fills"] is None
+    assert len(o["sol"]["fills"]) == 1 and o["solOff"]["fills"] is None
 
 
 @node

@@ -445,8 +445,8 @@
   // ---- an agent card pointing at what its note is about ------------------------------------------------------------
   // Hovering a card, tabbing to it or tapping it (a phone: for 3 s) marks on the chart the thing its note is about, and
   // only when the chart draws it: SCAN's 60-bar line (the high, or the low its note names) with its price, VET's fast
-  // and slow averages, RISK's and SIZE's stop and entry (a position only), FILLS' fills. CROWD, CHIEF and CRAWLER have
-  // nothing on the chart, nor has a card whose thing isn't drawn (flat, no fills on it, warming up): those point at
+  // and slow averages, RISK's and SIZE's stop and entry (a position only), FILLS' last fill. CROWD, CHIEF and CRAWLER
+  // have nothing on the chart, nor has a card whose thing isn't drawn (flat, no fill on it, warming up): those point at
   // nothing. key: (s, card) => what to mark, or null
   const POINTS = {
     scan: (s, a) => {
@@ -460,20 +460,25 @@
       // the next close's line (the BUY LINE's "next close"), named too when that has stepped
       const at = pointLine(xs, (v) => `${m[1]}-bar ${m[2]} ${m[3] || pxAxis(v)}`, color, [3, 4], s.chart.decided ?? Infinity);
       if (at && m[3] && Math.abs(+m[3].replace(/,/g, "") - at.v) > 0.5) return null;
+      if (at) at.steps = true;   // (drawPoint: its names keep clear of its older levels under them)
       const next = at && pointLine(xs, (v) => `next close ${pxAxis(v)}`, color);
       return next && pxAxis(next.v) !== pxAxis(at.v) ? [at, { x: next.x, y: next.y, name: next.name }] : at;
     },
     vet: (s) => [pointLine(s.chart.ema_fast, () => "fast", css("--cyan")), pointLine(s.chart.ema_slow, () => "slow", css("--blue"))],
     risk: (s) => [pointLevel(s.chart.stop, null, css("--orange"), [6, 4]),   // unnamed: its own STOP tag on the axis names it
       pointLevel(s.chart.entry, "entry", css("--entry") || "rgba(241,241,246,.6)", [2, 3])],
-    fills: (s) => {   // each fill as drawn: an entry's pin (or triangle) hangs off its price, an exit's dot is on it
-      const ch = s.chart, idx = new Map(ch.candles.map((c, k) => [c[0], k])), pin = css("--entry-mark") === "pin", { X, Y, w, padR } = lastGeom;
-      return (ch.markers || []).map((m) => {
-        const k = nearest(idx, m.ts, ch.bar_ms, ch.candles), d = m.side === "short" ? -1 : 1;
-        return k == null || !onPlot(Y(m.price)) ? null : m.kind === "entry"   // a pin's box where entryPin puts it
-          ? { mark: true, x: pin ? Math.min(X(k), w - padR - 4) : X(k), y: Y(m.price) + d * 9, r: pin ? 12 : 9 }
-          : { mark: true, x: X(k), y: Y(m.price), r: 8 };
-      });
+    fills: (s, a) => {
+      // the fill its note names, "bought 0.0362 @ $2,425, fee …" (the broker's last): the newest drawn, when that is its
+      // price as the note gives it (whole dollars from $1,000), as drawn: an entry's pin (or triangle) hangs off its
+      // price, an exit's dot is on it. "no fills yet", or an older fill: nothing
+      const p = /@ \$([\d,]+(?:\.\d+)?)/.exec(a.quote || ""), ch = s.chart, { X, Y, w, padR } = lastGeom;
+      const m = p && (ch.markers || []).reduce((b, x) => (!b || x.ts >= b.ts ? x : b), null);
+      if (!m || Math.abs(m.price - +p[1].replace(/,/g, "")) > (m.price >= 1000 ? 0.5 : 0.005) + 1e-9) return null;
+      const idx = new Map(ch.candles.map((c, j) => [c[0], j])), k = nearest(idx, m.ts, ch.bar_ms, ch.candles);
+      const d = m.side === "short" ? -1 : 1, pin = css("--entry-mark") === "pin";
+      return k == null || !onPlot(Y(m.price)) ? null : m.kind === "entry"   // a pin's box where entryPin puts it
+        ? { mark: true, x: pin ? Math.min(X(k), w - padR - 4) : X(k), y: Y(m.price) + d * 9, r: pin ? 12 : 9 }
+        : { mark: true, x: X(k), y: Y(m.price), r: 8 };
     },
   };
   POINTS.size = POINTS.risk;
@@ -498,8 +503,8 @@
   }
 
   // On #point, a canvas over the chart's: the plot washed pale but for the fills marked, the thing redrawn wider over a
-  // halo in the card's color, a line named at its end, never on the live line nor on another line's end: above its
-  // line, or under it when the live line runs just above or another line does (no room under: past the live line).
+  // halo in the card's color, a line named at its end, never on the live line nor on another line marked, and in the
+  // lines' order: beside its line (with no room there, past the live line), on the other side when one is in the way.
   // Last, the live line's own pixels (as drawn) are cut out of all of it, so the chart's gold line shows on top, as the
   // chart draws it. All of it inside the plot: the chart's own canvas, its values, lines and tags, and the price axis's
   // column (the live tag and its beat) aren't touched. It fades in and out (style.css .point; still under reduced
@@ -523,20 +528,38 @@
     g.beginPath(); g.rect(0, 0, pw, h - 18); g.clip();   // the plot: a ring at the newest candle stops at the axis line
     g.fillStyle = rgba("--panel", .6); g.fillRect(0, 0, pw, h - 18);
     const lines = ref.filter((r) => !r.mark), named = lines.filter((l) => l.name), yl = ch.live ? Y(ch.live) : null;
-    // a name's box (16 tall) above its line, else under it, where it covers no other line marked (so two lines close
-    // together, SCAN's stepping at the candle still forming or VET's averages, are named on their outer sides); else
-    // as near its line as it can be, on its side of the live line first. A place is on the plot (over the date axis),
-    // 9 px clear of the live line and of the names before it, and 3 px clear of each line marked where that line is
-    // named (the next close's runs only past the decided bar: of its own name alone, then). None: above. Then stacked
-    // with the live line as the anchor
-    const want = [], clear = (y, l, all) => y >= 8 && y <= h - 26 && (yl == null || Math.abs(y - yl) >= 17 - 1e-6)
+    // a name's box (16 tall) on its line's outer side (away from the nearest other line marked; with none, above it),
+    // else the other side, 3 px clear of every line marked: so two lines close together, SCAN's stepping at the candle
+    // still forming or VET's averages, are named on their outer sides. Else where it is clearest of the other lines
+    // marked, then of its own (1.5 px clear will do), on its side of the live line and as near its line as it can be
+    // first. A place is on the plot (over the date axis), 9 px clear of the live line and of the names before it, and
+    // never past another line marked or a name before it, so the names keep their lines' order (VET's "slow" beside its
+    // line, or past the live line, never over "fast"); past another line only when nothing else on the plot is left.
+    // (The next close's line runs only past the decided bar: the decided bar's name needn't be clear of it.) None:
+    // above. Then stacked, the live line the anchor
+    const want = [], fits = (y, l, past) => y >= 8 && y <= h - 26 && (yl == null || Math.abs(y - yl) >= 17 - 1e-6)
       && want.every((b) => Math.abs(y - b) >= 17 - 1e-6)
-      && lines.every((m) => (!all && m !== l && !m.xs && m.at == null) || Math.abs(y - m.y) >= 11 - 1e-6);
+      && (past || ![...lines.filter((m) => m !== l).map((m) => m.y), ...want].some((v) => (v - l.y) * (v - y) < 0));
+    g.font = "bold 10px JetBrains Mono, monospace";   // (pointTag's: how wide a name's box is)
     for (const l of named) {
-      const own = [l.y - 11, l.y + 11], far = (y) => yl != null && (y - yl) * (l.y - yl) < 0;
-      const more = [8, h - 26, ...(yl == null ? [] : [yl - 17, yl + 17]), ...lines.flatMap((m) => [m.y - 11, m.y + 11]),
-        ...want.flatMap((b) => [b - 17, b + 17])].sort((a, b) => far(a) - far(b) || Math.abs(a - l.y) - Math.abs(b - l.y));
-      want.push(own.find((y) => clear(y, l, true)) ?? [...own, ...more].find((y) => clear(y, l, false)) ?? own[0]);
+      // the y's each line takes under this name's box: its end, and the 60-bar line's levels there too (flat between
+      // its steps: a name keeps clear of an older level and the step to it; an average's slope isn't counted)
+      const x0 = Math.max(2, l.x - g.measureText(l.name).width - 14), levels = (m) => (m.steps ? m.xs : [])
+        .flatMap((v, k) => (v == null || X(k + 1) < x0 || X(k) > l.x ? [] : [Y(v)]));
+      const under = new Map(lines.map((m) => [m, [m.y, ...levels(m)]]));
+      const others = lines.filter((m) => m !== l), d = (y, m) => Math.min(...under.get(m).map((v) => Math.abs(y - v)));
+      const neighbor = others.reduce((a, m) => (a == null || Math.abs(m.y - l.y) < Math.abs(a.y - l.y) ? m : a), null);
+      const own = neighbor && neighbor.y < l.y ? [l.y + 11, l.y - 11] : [l.y - 11, l.y + 11];   // its outer side first
+      const far = (y) => yl != null && (y - yl) * (l.y - yl) < 0;
+      const room = (y) => 100 * Math.min(9.5, ...others.filter((m) => m.xs || m.at != null).map((m) => d(y, m) + 1e-6))
+        + Math.min(9.5, d(y, l) + 1e-6);
+      const more = [8, h - 26, ...(yl == null ? [] : [yl - 17, yl + 17]), ...want.flatMap((b) => [b - 17, b + 17]),
+        ...lines.flatMap((m) => [m.y - 11, m.y + 11, Math.min(...under.get(m)) - 11, Math.max(...under.get(m)) + 11])]
+        .sort((a, b) => far(a) - far(b) || Math.abs(a - l.y) - Math.abs(b - l.y));
+      const best = (past) => more.filter((y) => fits(y, l, past))
+        .reduce((a, y) => (a == null || room(y) > room(a) + 1e-9 ? y : a), null);
+      want.push(own.find((y) => fits(y, l) && lines.every((m) => d(y, m) >= 11 - 1e-6)) ?? best(false) ?? best(true)
+        ?? own[0]);
     }
     const tags = want.map((y) => ({ y, tie: 0 }));
     const at = yl == null ? stackTags(tags, 0, 8, h - 26) : stackTags([{ y: yl, tie: 0 }, ...tags], 0, 8, h - 26).slice(1);
